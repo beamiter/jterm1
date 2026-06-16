@@ -16,7 +16,7 @@ use gtk4::GestureClick;
 use relm4::gtk;
 use relm4::prelude::*;
 use gtk::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
@@ -215,6 +215,7 @@ pub(crate) fn spawn_shell(
     working_directory: Option<&str>,
     session_id: Option<&str>,
     initial_commands: Option<&str>,
+    probe: PaneProbe,
 ) {
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
     if let Some(sid) = session_id {
@@ -257,6 +258,11 @@ pub(crate) fn spawn_shell(
                 unsafe {
                     terminal_for_pid.set_data::<i32>("child-pid", pid_i32);
                 }
+                probe.shell_pid.set(pid_i32);
+                if let Some(pty) = terminal_for_pid.pty() {
+                    use std::os::fd::AsRawFd;
+                    probe.pty_fd.set(pty.fd().as_raw_fd());
+                }
             }
             if let Some(ref cmds) = init_cmds {
                 if !cmds.is_empty() {
@@ -285,6 +291,17 @@ pub struct VteInit {
     pub working_directory: Option<String>,
     pub session_id: Option<String>,
     pub initial_commands: Option<String>,
+    pub probe: PaneProbe,
+}
+
+/// Shared, cheaply-clonable handle exposing a pane's shell pid and PTY master fd
+/// to the app, so it can probe the foreground process (for restorable-command
+/// detection and close-confirmation) without a synchronous round-trip into the
+/// backend component. Both fields default to -1/0 until the shell is spawned.
+#[derive(Clone, Default)]
+pub struct PaneProbe {
+    pub shell_pid: Rc<Cell<i32>>,
+    pub pty_fd: Rc<Cell<i32>>,
 }
 
 #[derive(Debug)]
@@ -416,6 +433,7 @@ impl Component for VteTerminal {
             init.working_directory.as_deref(),
             init.session_id.as_deref(),
             init.initial_commands.as_deref(),
+            init.probe.clone(),
         );
 
         // Grab focus once the widget is realized.

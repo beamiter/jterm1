@@ -137,6 +137,16 @@ impl OwnedPty {
         self.pid.as_raw()
     }
 
+    /// Raw master-side fd, or -1 if already closed. Borrowed for the lifetime of
+    /// the PTY; used only for `tcgetpgrp`-style foreground-process probing.
+    pub fn master_fd_raw(&self) -> i32 {
+        self.master
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|fd| fd.as_raw_fd()))
+            .unwrap_or(-1)
+    }
+
     pub fn write_bytes(&self, data: &[u8]) {
         if let Ok(guard) = self.master.lock() {
             if let Some(fd) = guard.as_ref() {

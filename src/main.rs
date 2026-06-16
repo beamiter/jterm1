@@ -2,6 +2,7 @@
 
 mod config;
 mod dialogs;
+mod file_tree;
 mod keybindings;
 mod parser;
 mod process;
@@ -30,6 +31,9 @@ const OPACITY_STEP: f64 = 0.025;
 enum AppMsg {
     NewTab,
     CloseTab(u64),
+    /// Close without the running-process confirmation (dialog already approved).
+    ForceCloseTab(u64),
+    ForceClosePane(u64),
     SelectTab(u64),
     NextTab,
     PrevTab,
@@ -55,7 +59,15 @@ enum AppMsg {
     SearchClose,
     // Tab management.
     RenameTab(u64, String),
+    /// Drag-and-drop reorder: move the tab with this id to the target index.
+    ReorderTab(u64, usize),
     SetTabFilter(String),
+    /// File tree: insert a file's shell-quoted path into the active terminal.
+    FileTreeActivateFile(String),
+    /// File tree: reroot to the active tab's working directory.
+    FileTreeGotoCwd,
+    /// File tree: move the root up to its parent directory.
+    FileTreeGoUp,
     Ignore,
 }
 
@@ -86,6 +98,21 @@ struct Pane {
     terminal: TermCtl,
     id: u64,
     cwd: Option<String>,
+    mode: TerminalMode,
+    probe: terminal::PaneProbe,
+}
+
+impl Pane {
+    /// A restorable command running in this pane (ssh/nix develop/docker exec/…),
+    /// or None if just the shell is foreground.
+    fn restorable_command(&self) -> Option<String> {
+        process::restorable_command(self.probe.pty_fd.get(), self.probe.shell_pid.get())
+    }
+
+    /// Name of the foreground process for the close-confirmation prompt.
+    fn foreground_process(&self) -> Option<String> {
+        process::foreground_process_name(self.probe.pty_fd.get(), self.probe.shell_pid.get())
+    }
 }
 
 /// Saved tree position of the active pane while a tab is pane-zoomed.
@@ -129,6 +156,9 @@ struct AppModel {
     search_entry: gtk::SearchEntry,
     tab_filter_entry: gtk::SearchEntry,
     tab_filter: String,
+    file_tree_store: gtk::TreeStore,
+    file_tree_root_label: gtk::Label,
+    file_tree_root: Rc<RefCell<std::path::PathBuf>>,
     command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
@@ -145,12 +175,16 @@ fn create_pane(
     working_directory: Option<String>,
     sender: &ComponentSender<AppModel>,
 ) -> Pane {
+    let probe = terminal::PaneProbe::default();
+    // -1 means "no PTY yet"; foreground probing skips it (0 would alias stdin).
+    probe.pty_fd.set(-1);
     let init = VteInit {
         config: config.clone(),
         shell_argv: shell_argv.clone(),
         working_directory: working_directory.clone(),
         session_id: None,
         initial_commands,
+        probe: probe.clone(),
     };
     let forward = move |out| match out {
         VteOutput::Exited(_) => AppMsg::PaneExited(tab_id, pane_id),
@@ -176,6 +210,8 @@ fn create_pane(
         terminal,
         id: pane_id,
         cwd: working_directory,
+        mode,
+        probe,
     }
 }
 
@@ -189,6 +225,65 @@ impl AppModel {
             .get(self.active)
             .and_then(|t| t.panes.get(t.active_pane))
             .map(|p| &p.terminal)
+    }
+
+    /// Working directory of the active pane, if it reports one.
+    fn active_cwd(&self) -> Option<std::path::PathBuf> {
+        self.tabs
+            .get(self.active)
+            .and_then(|t| t.panes.get(t.active_pane))
+            .and_then(|p| p.cwd.clone())
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+    }
+
+    /// Rebuild the file tree with `root` at the top.
+    fn set_file_tree_root(&self, root: std::path::PathBuf) {
+        self.file_tree_store.clear();
+        self.file_tree_root_label.set_text(&file_tree::display_path(&root));
+        self.file_tree_root_label
+            .set_tooltip_text(Some(&root.to_string_lossy()));
+        file_tree::populate_dir(&self.file_tree_store, None, &root);
+        *self.file_tree_root.borrow_mut() = root;
+    }
+
+    /// Initialize the file tree to the active cwd, else `$HOME`, else `/`.
+    fn init_file_tree(&self) {
+        let start = self
+            .active_cwd()
+            .or_else(file_tree::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.set_file_tree_root(start);
+    }
+
+    /// Jump the file tree to the active tab's working directory.
+    fn file_tree_goto_current_cwd(&self) {
+        match self.active_cwd() {
+            Some(dir) => {
+                if *self.file_tree_root.borrow() != dir {
+                    self.set_file_tree_root(dir);
+                }
+            }
+            None => {
+                if self.file_tree_root.borrow().as_os_str().is_empty() {
+                    if let Some(home) = file_tree::home_dir() {
+                        self.set_file_tree_root(home);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move the file tree root up to its parent directory.
+    fn file_tree_go_up(&self) {
+        let parent = self
+            .file_tree_root
+            .borrow()
+            .parent()
+            .map(std::path::Path::to_path_buf);
+        if let Some(parent) = parent {
+            self.set_file_tree_root(parent);
+        }
     }
 
     fn add_tab(&mut self, initial_commands: Option<String>, sender: &ComponentSender<AppModel>) {
@@ -229,31 +324,21 @@ impl AppModel {
         self.select_tab(id, sender);
     }
 
-    /// Recreate a tab from a persisted snapshot (single pane; splits are not
-    /// restored — a known parity gap vs jterm4).
+    /// Recreate a tab from a persisted snapshot, rebuilding the full nested
+    /// `Paned` split tree and replaying any restorable command per pane.
     fn restore_tab(&mut self, saved: &session::SavedTab, sender: &ComponentSender<AppModel>) {
         let id = self.next_id;
         self.next_id += 1;
-        let pane_id = self.next_pane_id;
-        self.next_pane_id += 1;
-        let pane = create_pane(
-            &self.config,
-            &self.shell_argv,
-            id,
-            pane_id,
-            saved.terminal_mode(),
-            None,
-            saved.cwd.clone(),
-            sender,
-        );
+        let mut panes = Vec::new();
+        let root_widget = self.build_pane_layout(&saved.layout, id, &mut panes, sender);
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
         holder.set_vexpand(true);
-        holder.append(&pane.terminal.widget());
+        holder.append(&root_widget);
         self.stack.add_named(&holder, Some(&id.to_string()));
         let tab = Tab {
             holder,
-            panes: vec![pane],
+            panes,
             active_pane: 0,
             title: saved.title.clone(),
             custom_title: saved.custom_title,
@@ -266,21 +351,141 @@ impl AppModel {
         self.tabs.push(tab);
     }
 
-    /// Capture the current tab list as a persistable snapshot.
+    /// Recursively build the GTK widget tree for a persisted `PaneLayout`,
+    /// pushing each created leaf into `panes` in tree order.
+    fn build_pane_layout(
+        &mut self,
+        node: &session::PaneLayout,
+        tab_id: u64,
+        panes: &mut Vec<Pane>,
+        sender: &ComponentSender<AppModel>,
+    ) -> gtk::Widget {
+        match node {
+            session::PaneLayout::Leaf { mode, cwd, cmds } => {
+                let pane_id = self.next_pane_id;
+                self.next_pane_id += 1;
+                let pane = create_pane(
+                    &self.config,
+                    &self.shell_argv,
+                    tab_id,
+                    pane_id,
+                    session::PaneLayout::terminal_mode(mode),
+                    cmds.clone(),
+                    cwd.clone(),
+                    sender,
+                );
+                let widget = pane.terminal.widget();
+                panes.push(pane);
+                widget
+            }
+            session::PaneLayout::Split {
+                orientation,
+                position,
+                start,
+                end,
+            } => {
+                let o = if *orientation == 'v' {
+                    gtk::Orientation::Vertical
+                } else {
+                    gtk::Orientation::Horizontal
+                };
+                let paned = gtk::Paned::new(o);
+                paned.set_hexpand(true);
+                paned.set_vexpand(true);
+                let start_w = self.build_pane_layout(start, tab_id, panes, sender);
+                let end_w = self.build_pane_layout(end, tab_id, panes, sender);
+                paned.set_start_child(Some(&start_w));
+                paned.set_end_child(Some(&end_w));
+                paned.set_position(*position);
+                paned.upcast()
+            }
+        }
+    }
+
+    /// Serialize a tab's live `Paned` widget tree into a persistable `PaneLayout`.
+    /// When the tab is pane-zoomed the real tree is detached into `ZoomState`, so
+    /// we serialize from there and refill the removed pane's slot.
+    fn serialize_layout(&self, tab: &Tab) -> session::PaneLayout {
+        let root = tab
+            .zoom
+            .as_ref()
+            .map(|z| z.tree_root.clone())
+            .or_else(|| tab.holder.first_child());
+        match root {
+            Some(w) => self.serialize_widget(tab, &w),
+            None => session::PaneLayout::Leaf {
+                mode: "block".to_string(),
+                cwd: None,
+                cmds: None,
+            },
+        }
+    }
+
+    fn serialize_widget(&self, tab: &Tab, widget: &gtk::Widget) -> session::PaneLayout {
+        if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
+            let orientation = match paned.orientation() {
+                gtk::Orientation::Vertical => 'v',
+                _ => 'h',
+            };
+            let start = self.resolve_child(tab, paned, paned.start_child(), true);
+            let end = self.resolve_child(tab, paned, paned.end_child(), false);
+            session::PaneLayout::Split {
+                orientation,
+                position: paned.position(),
+                start: Box::new(start),
+                end: Box::new(end),
+            }
+        } else {
+            let pane = tab.panes.iter().find(|p| p.terminal.widget() == *widget);
+            let (mode, cwd, cmds) = match pane {
+                Some(p) => (
+                    match p.mode {
+                        TerminalMode::Vte => "vte",
+                        TerminalMode::Block => "block",
+                    }
+                    .to_string(),
+                    p.cwd.clone(),
+                    p.restorable_command(),
+                ),
+                None => ("block".to_string(), None, None),
+            };
+            session::PaneLayout::Leaf { mode, cwd, cmds }
+        }
+    }
+
+    /// A `Paned` child, substituting the zoomed-out pane when its slot is empty.
+    fn resolve_child(
+        &self,
+        tab: &Tab,
+        paned: &gtk::Paned,
+        child: Option<gtk::Widget>,
+        want_start: bool,
+    ) -> session::PaneLayout {
+        if let Some(c) = child {
+            return self.serialize_widget(tab, &c);
+        }
+        if let Some(z) = &tab.zoom {
+            if &z.parent == paned && z.was_start == want_start {
+                return self.serialize_widget(tab, &z.pane_widget);
+            }
+        }
+        session::PaneLayout::Leaf {
+            mode: "block".to_string(),
+            cwd: None,
+            cmds: None,
+        }
+    }
+
+    /// Capture the current tab list as a persistable snapshot, including each
+    /// tab's full split layout.
     fn snapshot_session(&self) -> session::SavedSession {
-        let default_mode = self.config.borrow().terminal_mode;
         let tabs = self
             .tabs
             .iter()
             .map(|t| session::SavedTab {
                 title: t.title.clone(),
                 custom_title: t.custom_title,
-                mode: match default_mode {
-                    TerminalMode::Vte => "vte",
-                    TerminalMode::Block => "block",
-                }
-                .to_string(),
-                cwd: t.panes.get(t.active_pane).and_then(|p| p.cwd.clone()),
+                layout: self.serialize_layout(t),
             })
             .collect();
         session::SavedSession {
@@ -408,6 +613,7 @@ impl AppModel {
         if let Some(pane) = tab.panes.get(tab.active_pane) {
             pane.terminal.emit(VteInput::GrabFocus);
         }
+        self.file_tree_goto_current_cwd();
         self.rebuild_tab_strip(sender);
     }
 
@@ -424,6 +630,53 @@ impl AppModel {
         let new_idx = if idx >= self.tabs.len() { self.tabs.len() - 1 } else { idx };
         let new_id = self.tabs[new_idx].id;
         self.select_tab(new_id, sender);
+    }
+
+    /// First restorable command running in any of a tab's panes, if any.
+    fn tab_running_command(&self, idx: usize) -> Option<String> {
+        self.tabs
+            .get(idx)?
+            .panes
+            .iter()
+            .find_map(|p| p.restorable_command())
+    }
+
+    /// Close a tab, first confirming if a process is still running in it.
+    fn request_close_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
+        if let Some(idx) = self.index_of(id) {
+            if let Some(cmd) = self.tab_running_command(idx) {
+                dialogs::confirm_close(&self.window, &cmd, AppMsg::ForceCloseTab(id), sender);
+                return;
+            }
+        }
+        self.close_tab(id, sender);
+    }
+
+    /// Close a pane, first confirming if a process is still running in it.
+    fn request_close_pane(&mut self, pane_id: u64, sender: &ComponentSender<AppModel>) {
+        if let Some((ti, pi)) = self.find_pane(pane_id) {
+            if let Some(cmd) = self.tabs[ti].panes[pi].restorable_command() {
+                dialogs::confirm_close(&self.window, &cmd, AppMsg::ForceClosePane(pane_id), sender);
+                return;
+            }
+        }
+        self.close_pane(pane_id, sender);
+    }
+
+    /// Move the tab with `src_id` to `to_idx`, preserving which tab is active.
+    fn reorder_tab(&mut self, src_id: u64, to_idx: usize, sender: &ComponentSender<AppModel>) {
+        let Some(from) = self.index_of(src_id) else { return };
+        let to = to_idx.min(self.tabs.len().saturating_sub(1));
+        if from == to {
+            return;
+        }
+        let active_id = self.tabs.get(self.active).map(|t| t.id);
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        if let Some(aid) = active_id {
+            self.active = self.index_of(aid).unwrap_or(0);
+        }
+        self.rebuild_tab_strip(sender);
     }
 
     fn switch_tab(&mut self, delta: i32, sender: &ComponentSender<AppModel>) {
@@ -863,7 +1116,7 @@ impl AppModel {
             Action::CloseTab => {
                 if let Some(tab) = self.tabs.get(self.active) {
                     let id = tab.id;
-                    self.close_tab(id, sender);
+                    self.request_close_tab(id, sender);
                 }
             }
             Action::ClosePaneOrTab => {
@@ -871,9 +1124,9 @@ impl AppModel {
                     let tab_id = tab.id;
                     if tab.panes.len() > 1 {
                         let pane_id = tab.panes[tab.active_pane].id;
-                        self.close_pane(pane_id, sender);
+                        self.request_close_pane(pane_id, sender);
                     } else {
-                        self.close_tab(tab_id, sender);
+                        self.request_close_tab(tab_id, sender);
                     }
                 }
             }
@@ -1227,6 +1480,28 @@ impl AppModel {
             let s2 = sender.clone();
             close_btn.connect_clicked(move |_| s2.input(AppMsg::CloseTab(id2)));
 
+            // Drag-and-drop reorder: drag a tab button, drop onto another row.
+            let drag = gtk::DragSource::new();
+            drag.set_actions(gtk::gdk::DragAction::MOVE);
+            let drag_id = tab.id;
+            drag.connect_prepare(move |_, _, _| {
+                Some(gtk::gdk::ContentProvider::for_value(&drag_id.to_value()))
+            });
+            select_btn.add_controller(drag);
+
+            let drop = gtk::DropTarget::new(glib::Type::U64, gtk::gdk::DragAction::MOVE);
+            let target_idx = idx;
+            let s_d = sender.clone();
+            drop.connect_drop(move |_, value, _, _| {
+                if let Ok(src_id) = value.get::<u64>() {
+                    s_d.input(AppMsg::ReorderTab(src_id, target_idx));
+                    true
+                } else {
+                    false
+                }
+            });
+            row.add_controller(drop);
+
             row.append(&select_btn);
             row.append(&close_btn);
             self.tab_strip.append(&row);
@@ -1312,6 +1587,37 @@ impl SimpleComponent for AppModel {
                         #[local_ref]
                         tab_strip -> gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
+                            set_vexpand: false,
+                            set_hexpand: false,
+                        },
+
+                        gtk::Separator {
+                            set_orientation: gtk::Orientation::Horizontal,
+                        },
+
+                        // File browser header: root label + up / goto-cwd.
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 2,
+
+                            gtk::Button {
+                                set_icon_name: "go-up-symbolic",
+                                set_tooltip_text: Some("Parent directory"),
+                                connect_clicked[sender] => move |_| sender.input(AppMsg::FileTreeGoUp),
+                            },
+                            gtk::Button {
+                                set_icon_name: "go-home-symbolic",
+                                set_tooltip_text: Some("Go to current directory"),
+                                connect_clicked[sender] => move |_| sender.input(AppMsg::FileTreeGotoCwd),
+                            },
+                            #[local_ref]
+                            file_tree_root_label -> gtk::Label {
+                                set_hexpand: true,
+                            },
+                        },
+
+                        #[local_ref]
+                        file_tree_scroll -> gtk::ScrolledWindow {
                             set_vexpand: true,
                             set_hexpand: false,
                         },
@@ -1406,6 +1712,50 @@ impl SimpleComponent for AppModel {
             });
         }
 
+        // File tree browser (lower half of the sidebar).
+        let file_tree_store = file_tree::new_store();
+        let file_tree_view = file_tree::new_view(&file_tree_store);
+        let file_tree_root_label = gtk::Label::new(Some("~"));
+        file_tree_root_label.set_xalign(0.0);
+        file_tree_root_label.set_ellipsize(gtk::pango::EllipsizeMode::Start);
+        {
+            // Lazy directory expansion: fill children on first expand.
+            let store = file_tree_store.clone();
+            file_tree_view.connect_row_expanded(move |_tv, iter, _path| {
+                file_tree::on_expand(&store, iter);
+            });
+        }
+        {
+            // Activate: toggle directories, insert file paths into the terminal.
+            let store = file_tree_store.clone();
+            let sender = sender.clone();
+            file_tree_view.connect_row_activated(move |tv, path, _col| {
+                let Some(iter) = store.iter(path) else { return };
+                let is_dir: bool = store
+                    .get_value(&iter, file_tree::COL_IS_DIR as i32)
+                    .get()
+                    .unwrap_or(false);
+                if is_dir {
+                    if tv.row_expanded(path) {
+                        tv.collapse_row(path);
+                    } else {
+                        tv.expand_row(path, false);
+                    }
+                    return;
+                }
+                let file_path: String = store
+                    .get_value(&iter, file_tree::COL_PATH as i32)
+                    .get()
+                    .unwrap_or_default();
+                if !file_path.is_empty() {
+                    sender.input(AppMsg::FileTreeActivateFile(file_path));
+                }
+            });
+        }
+        let file_tree_scroll = gtk::ScrolledWindow::new();
+        file_tree_scroll.set_vexpand(true);
+        file_tree_scroll.set_child(Some(&file_tree_view));
+
         let mut model = AppModel {
             config,
             themes: Rc::new(themes),
@@ -1426,6 +1776,9 @@ impl SimpleComponent for AppModel {
             search_entry: search_entry.clone(),
             tab_filter_entry: tab_filter_entry.clone(),
             tab_filter: String::new(),
+            file_tree_store: file_tree_store.clone(),
+            file_tree_root_label: file_tree_root_label.clone(),
+            file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
             command_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
@@ -1504,6 +1857,8 @@ impl SimpleComponent for AppModel {
             None => model.add_tab(startup, &sender),
         }
 
+        model.init_file_tree();
+
         ComponentParts { model, widgets }
     }
 
@@ -1513,7 +1868,9 @@ impl SimpleComponent for AppModel {
                 let startup = self.config.borrow().startup_commands.clone();
                 self.add_tab(startup, &sender);
             }
-            AppMsg::CloseTab(id) => self.close_tab(id, &sender),
+            AppMsg::CloseTab(id) => self.request_close_tab(id, &sender),
+            AppMsg::ForceCloseTab(id) => self.close_tab(id, &sender),
+            AppMsg::ForceClosePane(pane_id) => self.close_pane(pane_id, &sender),
             AppMsg::SelectTab(id) => self.select_tab(id, &sender),
             AppMsg::NextTab => self.switch_tab(1, &sender),
             AppMsg::PrevTab => self.switch_tab(-1, &sender),
@@ -1642,10 +1999,20 @@ impl SimpleComponent for AppModel {
                     self.rebuild_tab_strip(&sender);
                 }
             }
+            AppMsg::ReorderTab(src_id, to_idx) => self.reorder_tab(src_id, to_idx, &sender),
             AppMsg::SetTabFilter(text) => {
                 self.tab_filter = text;
                 self.rebuild_tab_strip(&sender);
             }
+            AppMsg::FileTreeActivateFile(path) => {
+                if let Some(term) = self.active_terminal() {
+                    let snippet = format!("{} ", file_tree::shell_quote(&path));
+                    term.emit(VteInput::WriteInput(snippet.into_bytes()));
+                    term.emit(VteInput::GrabFocus);
+                }
+            }
+            AppMsg::FileTreeGotoCwd => self.file_tree_goto_current_cwd(),
+            AppMsg::FileTreeGoUp => self.file_tree_go_up(),
             AppMsg::Ignore => {}
         }
     }

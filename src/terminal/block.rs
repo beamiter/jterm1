@@ -191,6 +191,8 @@ impl Component for BlockTerminal {
         let pty = OwnedPty::spawn(&argv, cwd.as_deref(), &[])
             .expect("failed to spawn block-view PTY");
         let pty = Rc::new(pty);
+        init.probe.shell_pid.set(pty.pid_i32());
+        init.probe.pty_fd.set(pty.master_fd_raw());
 
         let ctx = Rc::new(Ctx {
             config: init.config.clone(),
@@ -289,6 +291,9 @@ impl Component for BlockTerminal {
                 glib::ControlFlow::Continue
             });
         }
+
+        // Restore previously-persisted finished blocks (if history is configured).
+        load_block_history(&ctx);
 
         // Install the reader: parser events drive the block state machine.
         {
@@ -576,7 +581,105 @@ fn finalize_block(ctx: &Rc<Ctx>) {
     block.set_visible(passes_filter(ctx.filter.get(), &meta));
     ctx.finished.borrow_mut().push(meta);
 
+    append_block_history(ctx, &command, &output, exit_code, &cwd, duration_ms);
+
     reset_active(ctx);
+}
+
+/// One persisted finished block. Stores raw (ANSI-bearing) output so a reloaded
+/// block renders identically to when it was first produced.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HistoryRecord {
+    command: String,
+    output: String,
+    exit_code: i32,
+    cwd: String,
+    duration_ms: u64,
+}
+
+/// Append a finished block to the configured history file (JSON Lines). No-op
+/// when `block_history_path` is unset. `block_history_compress` is not honored
+/// in jterm1 (jterm4's rkyv+zstd format is not portable here); records are
+/// written as plain newline-delimited JSON.
+fn append_block_history(
+    ctx: &Rc<Ctx>,
+    command: &str,
+    output: &str,
+    exit_code: i32,
+    cwd: &str,
+    duration_ms: u64,
+) {
+    let Some(path) = ctx.config.borrow().block_history_path.clone() else {
+        return;
+    };
+    let record = HistoryRecord {
+        command: command.to_string(),
+        output: output.to_string(),
+        exit_code,
+        cwd: cwd.to_string(),
+        duration_ms,
+    };
+    let Ok(line) = serde_json::to_string(&record) else {
+        return;
+    };
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            let _ = writeln!(file, "{line}");
+        }
+        Err(err) => log::warn!("Failed to append block history to {path}: {err}"),
+    }
+}
+
+/// Render the tail of the persisted history into the block list at startup, so a
+/// fresh session resumes with prior finished blocks visible.
+fn load_block_history(ctx: &Rc<Ctx>) {
+    const MAX_RESTORED: usize = 200;
+    let Some(path) = ctx.config.borrow().block_history_path.clone() else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(MAX_RESTORED);
+    for line in &lines[start..] {
+        let Ok(rec) = serde_json::from_str::<HistoryRecord>(line) else {
+            continue;
+        };
+        let duration = if rec.duration_ms > 0 {
+            Some(Duration::from_millis(rec.duration_ms))
+        } else {
+            None
+        };
+        let block = build_finished_block(
+            ctx,
+            &rec.command,
+            &rec.output,
+            rec.exit_code,
+            &rec.cwd,
+            duration,
+        );
+        ctx.block_list.append(&block);
+        ctx.block_list
+            .reorder_child_after(&ctx.active_holder, Some(&block));
+        let meta = FinishedBlock {
+            widget: block.clone(),
+            command: rec.command.clone(),
+            plain_output: strip_ansi(rec.output.as_bytes()),
+            exit_code: rec.exit_code,
+            duration_ms: rec.duration_ms,
+        };
+        block.set_visible(passes_filter(ctx.filter.get(), &meta));
+        ctx.finished.borrow_mut().push(meta);
+    }
 }
 
 fn passes_filter(filter: BlockFilter, block: &FinishedBlock) -> bool {

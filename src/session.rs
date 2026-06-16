@@ -1,10 +1,9 @@
-//! Session persistence: a pragmatic subset of jterm4's tabs.state.
+//! Session persistence: jterm1's tabs.state.
 //!
-//! jterm4 serializes a full nested split tree (`PaneLayout`) per tab. jterm1's
-//! model keeps panes in a flat `Vec`, and nested-split restoration is deferred
-//! (a known P10 parity gap), so here we persist only what restores cleanly: per
-//! tab the title, whether it was user-renamed, the terminal mode and the active
-//! pane's cwd, plus the active tab index. The snapshot is written as JSON and
+//! Each tab stores its title, whether it was user-renamed, and a `PaneLayout`
+//! tree mirroring the live GTK `Paned` structure — so nested splits, each pane's
+//! working directory, terminal mode and any restorable command (ssh / nix
+//! develop / docker exec …) are restored. The snapshot is written as JSON and
 //! consumed (deleted) on load, matching jterm4's consume-on-start semantics.
 
 use gtk4::glib;
@@ -14,29 +13,49 @@ use std::path::PathBuf;
 
 use crate::config::TerminalMode;
 
+/// One node of a tab's pane tree: either a terminal leaf or a split of two
+/// subtrees. Mirrors jterm4's `PaneLayout`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub(crate) enum PaneLayout {
+    Leaf {
+        /// "vte" or "block".
+        mode: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// Restorable command to replay on restore (e.g. "ssh host").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cmds: Option<String>,
+    },
+    Split {
+        /// 'h' = horizontal (left/right), 'v' = vertical (top/bottom).
+        orientation: char,
+        position: i32,
+        start: Box<PaneLayout>,
+        end: Box<PaneLayout>,
+    },
+}
+
+impl PaneLayout {
+    pub(crate) fn terminal_mode(mode: &str) -> TerminalMode {
+        match mode {
+            "vte" => TerminalMode::Vte,
+            _ => TerminalMode::Block,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct SavedTab {
     pub title: String,
     pub custom_title: bool,
-    /// "vte" or "block".
-    pub mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
+    pub layout: PaneLayout,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub(crate) struct SavedSession {
     pub active: usize,
     pub tabs: Vec<SavedTab>,
-}
-
-impl SavedTab {
-    pub(crate) fn terminal_mode(&self) -> TerminalMode {
-        match self.mode.as_str() {
-            "vte" => TerminalMode::Vte,
-            _ => TerminalMode::Block,
-        }
-    }
 }
 
 pub(crate) fn state_file_path() -> PathBuf {
