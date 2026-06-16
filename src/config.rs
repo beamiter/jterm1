@@ -16,6 +16,53 @@ pub enum TerminalMode {
     Vte,
 }
 
+/// Where the tab strip lives: down the left sidebar (vertical) or along the top
+/// bar (horizontal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabPlacement {
+    Sidebar,
+    TopBar,
+}
+
+impl TabPlacement {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            TabPlacement::Sidebar => "sidebar",
+            TabPlacement::TopBar => "top",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> TabPlacement {
+        match s.to_lowercase().as_str() {
+            "top" | "topbar" | "top_bar" => TabPlacement::TopBar,
+            _ => TabPlacement::Sidebar,
+        }
+    }
+}
+
+/// Which single view the sidebar shows (tab list vs file tree).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarView {
+    Tabs,
+    Files,
+}
+
+impl SidebarView {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SidebarView::Tabs => "tabs",
+            SidebarView::Files => "files",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> SidebarView {
+        match s.to_lowercase().as_str() {
+            "files" | "file" | "filetree" | "file_tree" => SidebarView::Files,
+            _ => SidebarView::Tabs,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Remote host
 // ---------------------------------------------------------------------------
@@ -34,6 +81,27 @@ pub struct RemoteHost {
     pub session: Option<String>,
     /// Extra flags inserted before the target (e.g. ["-p", "2222"]).
     pub ssh_args: Vec<String>,
+    /// Run the remote command through a login shell (`bash -lc 'exec ...'`) so the
+    /// user's profile (PATH, ~/.cargo/env, etc.) is loaded. ssh's plain command
+    /// channel runs a non-login, non-interactive shell, which leaves tools like
+    /// cargo off PATH. Defaults to true.
+    pub login_shell: bool,
+    /// Reuse one ssh connection for repeat tabs to this host (ControlMaster), so
+    /// the 2nd+ tab skips the handshake/auth. Defaults to true.
+    pub multiplex: bool,
+}
+
+/// Directory for ssh ControlMaster sockets. Prefers `$XDG_RUNTIME_DIR`, falls
+/// back to `~/.cache/jterm1`. Created if missing.
+fn control_socket_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/jterm1")))?;
+    if let Err(err) = fs::create_dir_all(&base) {
+        log::warn!("Failed to create ssh control socket dir {}: {err}", base.display());
+        return None;
+    }
+    Some(base)
 }
 
 /// Build the local argv that connects to a remote host via ssh.
@@ -48,7 +116,25 @@ pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
         remote_cmd.push_str(" --session ");
         remote_cmd.push_str(sid);
     }
+    if host.login_shell {
+        // Wrap in a login shell so the remote profile populates PATH before exec.
+        // Single-quote the payload and escape any embedded quotes.
+        let escaped = remote_cmd.replace('\'', "'\\''");
+        remote_cmd = format!("bash -lc 'exec {escaped}'");
+    }
     let mut argv = vec!["ssh".to_string(), "-t".to_string()];
+    if host.multiplex {
+        if let Some(dir) = control_socket_dir() {
+            // %C is ssh's hash of (local user, host, port, user) — a safe filename.
+            let ctl_path = dir.join("cm-%C");
+            argv.push("-o".to_string());
+            argv.push("ControlMaster=auto".to_string());
+            argv.push("-o".to_string());
+            argv.push("ControlPersist=120".to_string());
+            argv.push("-o".to_string());
+            argv.push(format!("ControlPath={}", ctl_path.display()));
+        }
+    }
     argv.extend(host.ssh_args.iter().cloned());
     argv.push(target);
     argv.push(remote_cmd);
@@ -76,6 +162,12 @@ pub struct Config {
     /// Commands to feed to new shells on startup (comma-separated).
     pub(crate) startup_commands: Option<String>,
     pub(crate) terminal_mode: TerminalMode,
+    /// Where the tab strip is shown (left sidebar vs top bar).
+    pub(crate) tab_placement: TabPlacement,
+    /// Which single view the sidebar shows (tab list vs file tree).
+    pub(crate) sidebar_view: SidebarView,
+    /// Sidebar width in pixels.
+    pub(crate) sidebar_width: u32,
     // Block view optimizations
     pub(crate) ansi_cache_capacity: u32,
     pub(crate) max_visible_blocks: u32,
@@ -272,6 +364,9 @@ struct FileConfig {
     /// Commands to run when a new tab opens (comma-separated, e.g. "cd ~/project, nix develop").
     startup_commands: Option<String>,
     terminal_mode: Option<String>,
+    tab_placement: Option<String>,
+    sidebar_view: Option<String>,
+    sidebar_width: Option<u32>,
     // Block view optimizations
     ansi_cache_capacity: Option<u32>,
     max_visible_blocks: Option<u32>,
@@ -314,6 +409,9 @@ fn load_file_config() -> FileConfig {
         shell: table.get("shell").and_then(|v| v.as_str()).map(|s| s.to_string()),
         startup_commands: table.get("startup_commands").and_then(|v| v.as_str()).map(|s| s.to_string()),
         terminal_mode: table.get("terminal_mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        tab_placement: table.get("tab_placement").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        sidebar_view: table.get("sidebar_view").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        sidebar_width: table.get("sidebar_width").and_then(|v| v.as_integer()).map(|v| v as u32),
         ansi_cache_capacity: table.get("ansi_cache_capacity").and_then(|v| v.as_integer()).map(|v| v as u32),
         max_visible_blocks: table.get("max_visible_blocks").and_then(|v| v.as_integer()).map(|v| v as u32),
         output_batch_min_ms: table.get("output_batch_min_ms").and_then(|v| v.as_integer()).map(|v| v as u32),
@@ -349,7 +447,9 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
             let ssh_args = t.get("ssh_args").and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
-            Some(RemoteHost { name, host, user, remote_shell, session, ssh_args })
+            let login_shell = t.get("login_shell").and_then(|v| v.as_bool()).unwrap_or(true);
+            let multiplex = t.get("multiplex").and_then(|v| v.as_bool()).unwrap_or(true);
+            Some(RemoteHost { name, host, user, remote_shell, session, ssh_args, login_shell, multiplex })
         })
         .collect()
 }
@@ -359,14 +459,16 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
 fn default_remote_hosts() -> Vec<RemoteHost> {
     vec![
         RemoteHost {
-            name: "cloud-dev".into(),
-            host: "10.21.31.17".into(),
-            user: Some("root".into()),
+            name: "home-dev".into(),
+            host: "100.99.153.18".into(),
+            user: Some("yj".into()),
             // Full path: a non-interactive ssh PATH resolves bare `rsh` to the
             // system ssh-alternative, not the block-mode rsh in ~/.cargo/bin.
-            remote_shell: "/root/.cargo/bin/rsh".into(),
+            remote_shell: "/home/yj/.cargo/bin/rsh".into(),
             session: Some("cloud-test".into()),
             ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
         },
         RemoteHost {
             name: "localhost-test".into(),
@@ -375,6 +477,8 @@ fn default_remote_hosts() -> Vec<RemoteHost> {
             remote_shell: "rsh".into(),
             session: Some("local-test".into()),
             ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
         },
     ]
 }
@@ -467,6 +571,14 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         _ => TerminalMode::Block,
     };
 
+    let tab_placement = TabPlacement::parse(
+        &env_string("JTERM1_TAB_PLACEMENT")
+            .or(fc.tab_placement)
+            .unwrap_or_else(|| "sidebar".to_string()),
+    );
+    let sidebar_view = SidebarView::parse(&fc.sidebar_view.unwrap_or_else(|| "tabs".to_string()));
+    let sidebar_width = fc.sidebar_width.unwrap_or(220).clamp(120, 800);
+
     let config = Config {
         window_opacity,
         terminal_scrollback_lines,
@@ -481,6 +593,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         shell,
         startup_commands: fc.startup_commands,
         terminal_mode,
+        tab_placement,
+        sidebar_view,
+        sidebar_width,
         ansi_cache_capacity,
         max_visible_blocks,
         output_batch_min_ms,
@@ -538,6 +653,9 @@ pub(crate) fn save_config(config: &Config) {
         TerminalMode::Block => "block",
         TerminalMode::Vte => "vte",
     }.to_string()));
+    table.insert("tab_placement".into(), toml::Value::String(config.tab_placement.as_str().to_string()));
+    table.insert("sidebar_view".into(), toml::Value::String(config.sidebar_view.as_str().to_string()));
+    table.insert("sidebar_width".into(), toml::Value::Integer(config.sidebar_width as i64));
 
     let mut colors = toml::Table::new();
     colors.insert("foreground".into(), toml::Value::String(rgba_to_hex(&config.foreground)));

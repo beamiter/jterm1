@@ -46,6 +46,8 @@ pub(crate) enum Action {
     MoveTabRight,
     DuplicateTab,
     ToggleTabMarked,
+    ToggleTabPinned,
+    ToggleTabPlacement,
     FilterFailedBlocks,
     FilterSlowBlocks,
     ClearBlockFilter,
@@ -106,6 +108,8 @@ impl Action {
             Action::MoveTabRight => "Move tab right",
             Action::DuplicateTab => "Duplicate tab",
             Action::ToggleTabMarked => "Toggle tab marked",
+            Action::ToggleTabPinned => "Toggle tab pinned",
+            Action::ToggleTabPlacement => "Toggle tab placement (sidebar/top)",
             Action::FilterFailedBlocks => "Filter failed blocks",
             Action::FilterSlowBlocks => "Filter slow blocks",
             Action::ClearBlockFilter => "Clear block filter",
@@ -155,6 +159,8 @@ impl Action {
             Action::MoveTabRight => Some("move_tab_right"),
             Action::DuplicateTab => Some("duplicate_tab"),
             Action::ToggleTabMarked => Some("toggle_tab_marked"),
+            Action::ToggleTabPinned => Some("toggle_tab_pinned"),
+            Action::ToggleTabPlacement => Some("toggle_tab_placement"),
             Action::FilterFailedBlocks => Some("filter_failed_blocks"),
             Action::FilterSlowBlocks => Some("filter_slow_blocks"),
             Action::ClearBlockFilter => Some("clear_block_filter"),
@@ -202,6 +208,8 @@ impl Action {
             Action::MoveTabRight,
             Action::DuplicateTab,
             Action::ToggleTabMarked,
+            Action::ToggleTabPinned,
+            Action::ToggleTabPlacement,
             Action::FilterFailedBlocks,
             Action::FilterSlowBlocks,
             Action::ClearBlockFilter,
@@ -427,6 +435,7 @@ impl KeybindingMap {
         bind("Ctrl+Alt+Right", Action::ResizePaneRight);
         bind("Ctrl+Alt+Up", Action::ResizePaneUp);
         bind("Ctrl+Alt+Down", Action::ResizePaneDown);
+        bind("Ctrl+Shift+B", Action::ToggleTabPlacement);
         bind("Ctrl+Shift+Z", Action::TogglePaneZoom);
         bind("Ctrl+Shift+!", Action::MovePaneToNewTab);
         bind("F12", Action::ToggleDebugDashboard);

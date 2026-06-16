@@ -40,8 +40,12 @@ enum AppMsg {
     ToggleSidebar,
     Action(Action),
     ReloadConfig,
-    PaneExited(u64, u64),
+    PaneExited(u64, u64, i32),
     PaneCwdChanged(u64, u64, String),
+    /// Reconnect-countdown tick for a remote tab (id, seconds remaining).
+    RemoteReconnectTick(u64, u64),
+    /// Backoff elapsed: respawn the remote connection (id, attempt to seed).
+    RemoteReconnectNow(u64, u32),
     PaneFocused(u64, u64),
     TitleChanged(u64, String),
     Bell(u64),
@@ -68,6 +72,8 @@ enum AppMsg {
     FileTreeGotoCwd,
     /// File tree: move the root up to its parent directory.
     FileTreeGoUp,
+    /// Sidebar: switch between the tab list and the file tree view.
+    SetSidebarView(config::SidebarView),
     Ignore,
 }
 
@@ -115,6 +121,25 @@ impl Pane {
     }
 }
 
+/// Connection state of a remote (ssh) tab, shown as a status dot in the strip.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnStatus {
+    Connecting,
+    Connected,
+    Disconnected,
+}
+
+/// Per-tab ssh connection record: drives the status badge and auto-reconnect.
+#[derive(Clone)]
+struct RemoteConn {
+    host: config::RemoteHost,
+    status: ConnStatus,
+    /// Reconnect-backoff attempt counter.
+    attempt: u32,
+    /// When the current connection attempt was spawned (for backoff reset).
+    spawn_at: std::time::Instant,
+}
+
 /// Saved tree position of the active pane while a tab is pane-zoomed.
 struct ZoomState {
     tree_root: gtk::Widget,
@@ -132,8 +157,11 @@ struct Tab {
     bell: bool,
     activity: bool,
     marked: bool,
+    pinned: bool,
     id: u64,
     zoom: Option<ZoomState>,
+    /// Set when this tab is an ssh connection (status badge + auto-reconnect).
+    remote: Option<RemoteConn>,
 }
 
 struct AppModel {
@@ -159,6 +187,14 @@ struct AppModel {
     file_tree_store: gtk::TreeStore,
     file_tree_root_label: gtk::Label,
     file_tree_root: Rc<RefCell<std::path::PathBuf>>,
+    tab_strip_scroll: gtk::ScrolledWindow,
+    top_tab_scroll: gtk::ScrolledWindow,
+    top_tab_bar: gtk::Box,
+    sidebar_stack: gtk::Stack,
+    sidebar_tabs_btn: gtk::ToggleButton,
+    sidebar_files_btn: gtk::ToggleButton,
+    tab_placement: std::cell::Cell<config::TabPlacement>,
+    sidebar_view: std::cell::Cell<config::SidebarView>,
     command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
@@ -187,7 +223,7 @@ fn create_pane(
         probe: probe.clone(),
     };
     let forward = move |out| match out {
-        VteOutput::Exited(_) => AppMsg::PaneExited(tab_id, pane_id),
+        VteOutput::Exited(code) => AppMsg::PaneExited(tab_id, pane_id, code),
         VteOutput::CwdChanged(p) => AppMsg::PaneCwdChanged(tab_id, pane_id, p),
         VteOutput::TitleChanged(t) => AppMsg::TitleChanged(tab_id, t),
         VteOutput::Bell => AppMsg::Bell(tab_id),
@@ -317,8 +353,10 @@ impl AppModel {
             bell: false,
             activity: false,
             marked: false,
+            pinned: false,
             id,
             zoom: None,
+            remote: None,
         };
         self.tabs.push(tab);
         self.select_tab(id, sender);
@@ -345,8 +383,10 @@ impl AppModel {
             bell: false,
             activity: false,
             marked: false,
+            pinned: false,
             id,
             zoom: None,
+            remote: None,
         };
         self.tabs.push(tab);
     }
@@ -593,11 +633,144 @@ impl AppModel {
             bell: false,
             activity: false,
             marked: false,
+            pinned: false,
             id,
             zoom: None,
+            remote: Some(RemoteConn {
+                host: host.clone(),
+                status: ConnStatus::Connecting,
+                attempt: 0,
+                spawn_at: std::time::Instant::now(),
+            }),
         };
         self.tabs.push(tab);
         self.select_tab(id, sender);
+    }
+
+    /// Flip a Connecting remote tab to Connected (first output/cwd seen).
+    fn mark_remote_connected(&mut self, idx: usize, sender: &ComponentSender<AppModel>) {
+        if let Some(conn) = self.tabs[idx].remote.as_mut() {
+            if conn.status != ConnStatus::Connected {
+                conn.status = ConnStatus::Connected;
+                self.rebuild_tab_strip(sender);
+            }
+        }
+    }
+
+    /// If `tab_id` is a single-pane remote tab that died abnormally, start a
+    /// backoff countdown and reconnect in place; returns true when handled (the
+    /// caller should NOT close the tab). A clean exit (code 0) returns false so
+    /// the tab closes normally.
+    fn schedule_remote_reconnect(
+        &mut self,
+        tab_id: u64,
+        code: i32,
+        sender: &ComponentSender<AppModel>,
+    ) -> bool {
+        const MAX_ATTEMPT: u32 = 6;
+        let Some(idx) = self.index_of(tab_id) else { return false };
+        if self.tabs[idx].panes.len() != 1 {
+            return false;
+        }
+        let Some(conn) = self.tabs[idx].remote.clone() else { return false };
+        if code == 0 {
+            // User logged out cleanly — drop the connection record, close normally.
+            self.tabs[idx].remote = None;
+            return false;
+        }
+        // A link that stayed up a while is treated as a healthy drop (reset
+        // backoff); a short-lived one (failed handshake/auth) grows it.
+        let stable = conn.spawn_at.elapsed() >= std::time::Duration::from_secs(10);
+        let next_attempt = if stable { 0 } else { conn.attempt + 1 };
+        if next_attempt > MAX_ATTEMPT {
+            log::warn!(
+                "[remote] giving up reconnect for '{}' after {} attempts",
+                conn.host.name, conn.attempt
+            );
+            if let Some(c) = self.tabs[idx].remote.as_mut() {
+                c.status = ConnStatus::Disconnected;
+            }
+            self.tabs[idx].title = format!("{} — disconnected", conn.host.name);
+            self.rebuild_tab_strip(sender);
+            return true;
+        }
+        let delay = if next_attempt == 0 {
+            1u64
+        } else {
+            (1u64 << next_attempt.min(5)).min(30)
+        };
+        if let Some(c) = self.tabs[idx].remote.as_mut() {
+            c.status = ConnStatus::Disconnected;
+            c.attempt = next_attempt;
+        }
+        self.tabs[idx].title = format!("{} — reconnect {delay}s", conn.host.name);
+        self.rebuild_tab_strip(sender);
+        log::info!(
+            "[remote] '{}' disconnected (exit {code}); reconnecting in {delay}s (attempt {next_attempt})",
+            conn.host.name
+        );
+
+        let remaining = Rc::new(std::cell::Cell::new(delay));
+        let s = sender.clone();
+        glib::timeout_add_seconds_local(1, move || {
+            let left = remaining.get();
+            if left > 1 {
+                remaining.set(left - 1);
+                s.input(AppMsg::RemoteReconnectTick(tab_id, left - 1));
+                glib::ControlFlow::Continue
+            } else {
+                s.input(AppMsg::RemoteReconnectNow(tab_id, next_attempt));
+                glib::ControlFlow::Break
+            }
+        });
+        true
+    }
+
+    /// Respawn a dead remote tab's connection in place (same tab id / position).
+    fn do_remote_reconnect(&mut self, tab_id: u64, attempt: u32, sender: &ComponentSender<AppModel>) {
+        let Some(idx) = self.index_of(tab_id) else { return };
+        let Some(conn) = self.tabs[idx].remote.clone() else { return };
+        // Swap the dead pane widget for a fresh remote pane.
+        let old_widget = self.tabs[idx].panes[0].terminal.widget();
+        self.tabs[idx].holder.remove(&old_widget);
+        let pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        let argv = Rc::new(config::build_remote_argv(&conn.host));
+        let pane = create_pane(
+            &self.config,
+            &argv,
+            tab_id,
+            pane_id,
+            TerminalMode::Vte,
+            None,
+            None,
+            sender,
+        );
+        self.tabs[idx].holder.append(&pane.terminal.widget());
+        self.tabs[idx].panes = vec![pane];
+        self.tabs[idx].active_pane = 0;
+        self.tabs[idx].title = conn.host.name.clone();
+        if let Some(c) = self.tabs[idx].remote.as_mut() {
+            c.status = ConnStatus::Connecting;
+            c.attempt = attempt;
+            c.spawn_at = std::time::Instant::now();
+        }
+        if self.active == idx {
+            self.tabs[idx].panes[0].terminal.emit(VteInput::GrabFocus);
+        }
+        self.rebuild_tab_strip(sender);
+    }
+
+    /// Stable-partition the tab list so pinned tabs sort to the front, keeping
+    /// `self.active` pointing at the same tab.
+    fn reorder_pinned_first(&mut self) {
+        let active_id = self.tabs.get(self.active).map(|t| t.id);
+        self.tabs.sort_by_key(|t| !t.pinned);
+        if let Some(id) = active_id {
+            if let Some(idx) = self.index_of(id) {
+                self.active = idx;
+            }
+        }
     }
 
     fn select_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
@@ -743,8 +916,10 @@ impl AppModel {
             bell: false,
             activity: false,
             marked: false,
+            pinned: false,
             id,
             zoom: None,
+            remote: None,
         };
         self.tabs.push(tab);
         self.select_tab(id, sender);
@@ -1064,8 +1239,10 @@ impl AppModel {
             bell: false,
             activity: false,
             marked: false,
+            pinned: false,
             id: new_id,
             zoom: None,
+            remote: None,
         };
         self.tabs.push(new_tab);
         self.select_tab(new_id, sender);
@@ -1203,11 +1380,19 @@ impl AppModel {
                 }
                 self.rebuild_tab_strip(sender);
             }
+            Action::ToggleTabPinned => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.pinned = !tab.pinned;
+                }
+                self.reorder_pinned_first();
+                self.rebuild_tab_strip(sender);
+            }
+            Action::ToggleTabPlacement => self.toggle_tab_placement(),
             Action::CloseSelectedTabs => self.close_marked_tabs(sender),
             Action::FilterTabs => {
-                if !self.sidebar_visible {
-                    self.sidebar_visible = true;
-                    self.tab_strip.set_visible(true);
+                self.sidebar_visible = true;
+                if self.tab_placement.get() == config::TabPlacement::Sidebar {
+                    self.apply_sidebar_view(config::SidebarView::Tabs, true);
                 }
                 self.tab_filter_entry.grab_focus();
             }
@@ -1334,10 +1519,120 @@ impl AppModel {
         self.dyn_css.load_from_data(&css);
     }
 
+    /// Move the tab strip into the holder matching the current placement and
+    /// flip its orientation; sidebar = vertical list, top bar = horizontal.
+    fn apply_tab_placement(&self) {
+        use config::{SidebarView, TabPlacement};
+        let placement = self.tab_placement.get();
+
+        self.tab_strip_scroll.set_child(None::<&gtk::Widget>);
+        self.top_tab_scroll.set_child(None::<&gtk::Widget>);
+
+        match placement {
+            TabPlacement::Sidebar => {
+                self.tab_strip.set_orientation(gtk::Orientation::Vertical);
+                self.tab_strip.set_valign(gtk::Align::Start);
+                self.tab_strip.set_hexpand(false);
+                self.tab_strip.set_vexpand(true);
+                self.tab_strip.remove_css_class("top-tabs");
+                self.tab_strip_scroll.set_child(Some(&self.tab_strip));
+            }
+            TabPlacement::TopBar => {
+                self.tab_strip.set_orientation(gtk::Orientation::Horizontal);
+                self.tab_strip.set_valign(gtk::Align::Center);
+                self.tab_strip.set_hexpand(true);
+                self.tab_strip.set_vexpand(false);
+                self.tab_strip.add_css_class("top-tabs");
+                self.top_tab_scroll.set_child(Some(&self.tab_strip));
+            }
+        }
+
+        // Resize each existing strip row for the new orientation.
+        let mut child = self.tab_strip.first_child();
+        while let Some(c) = child {
+            self.apply_strip_row_placement(&c);
+            child = c.next_sibling();
+        }
+
+        // The Tabs sidebar view only makes sense when tabs live in the sidebar.
+        match placement {
+            TabPlacement::Sidebar => {
+                self.sidebar_tabs_btn.set_sensitive(true);
+                self.apply_sidebar_view(self.sidebar_view.get(), false);
+            }
+            TabPlacement::TopBar => {
+                self.sidebar_tabs_btn.set_sensitive(false);
+                self.apply_sidebar_view(SidebarView::Files, false);
+            }
+        }
+
+        self.sync_tab_bar_visibility();
+    }
+
+    /// Show one sidebar view (tab list vs file tree) and reflect it in the
+    /// segmented buttons. When `persist`, remember the choice in config.
+    fn apply_sidebar_view(&self, view: config::SidebarView, persist: bool) {
+        use config::SidebarView;
+        match view {
+            SidebarView::Tabs => self.sidebar_stack.set_visible_child_name("tabs"),
+            SidebarView::Files => self.sidebar_stack.set_visible_child_name("files"),
+        }
+        // set_active does not refire `clicked`, so this won't recurse.
+        self.sidebar_tabs_btn.set_active(view == SidebarView::Tabs);
+        self.sidebar_files_btn.set_active(view == SidebarView::Files);
+
+        if persist {
+            self.sidebar_view.set(view);
+            self.config.borrow_mut().sidebar_view = view;
+            config::save_config(&self.config.borrow());
+        }
+    }
+
+    /// Size a single strip row for the active placement: fill width in the
+    /// sidebar, hug content in the top bar.
+    fn apply_strip_row_placement(&self, row: &gtk::Widget) {
+        match self.tab_placement.get() {
+            config::TabPlacement::Sidebar => row.set_hexpand(true),
+            config::TabPlacement::TopBar => row.set_hexpand(false),
+        }
+    }
+
+    /// Show the top tab bar only when tabs live there.
+    fn sync_tab_bar_visibility(&self) {
+        match self.tab_placement.get() {
+            config::TabPlacement::Sidebar => self.top_tab_bar.set_visible(false),
+            config::TabPlacement::TopBar => self.top_tab_bar.set_visible(true),
+        }
+    }
+
+    /// Flip the tab strip between the sidebar and the top bar, then persist.
+    fn toggle_tab_placement(&self) {
+        use config::TabPlacement;
+        let next = match self.tab_placement.get() {
+            TabPlacement::Sidebar => TabPlacement::TopBar,
+            TabPlacement::TopBar => TabPlacement::Sidebar,
+        };
+        self.tab_placement.set(next);
+        self.config.borrow_mut().tab_placement = next;
+        self.apply_tab_placement();
+        config::save_config(&self.config.borrow());
+    }
+
     fn rebuild_tab_strip(&self, sender: &ComponentSender<AppModel>) {
         while let Some(child) = self.tab_strip.first_child() {
             self.tab_strip.remove(&child);
         }
+        // Saved remote hosts, surfaced as "Remote: <name>" items in the tab
+        // context menu (parity with jterm4).
+        let remote_list: Vec<(u8, String)> = self
+            .config
+            .borrow()
+            .remote_hosts
+            .iter()
+            .take(u8::MAX as usize)
+            .enumerate()
+            .map(|(i, h)| (i as u8, h.name.clone()))
+            .collect();
         let filter = self.tab_filter.to_lowercase();
         for (idx, tab) in self.tabs.iter().enumerate() {
             if !filter.is_empty() && !tab.title.to_lowercase().contains(&filter) {
@@ -1345,6 +1640,18 @@ impl AppModel {
             }
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             row.add_css_class("tab-row");
+
+            // Remote connection status dot (Connecting / Connected / Disconnected).
+            if let Some(conn) = tab.remote.as_ref() {
+                let dot = gtk::Label::new(Some("\u{25CF}"));
+                dot.add_css_class("conn-dot");
+                dot.add_css_class(match conn.status {
+                    ConnStatus::Connecting => "conn-connecting",
+                    ConnStatus::Connected => "conn-connected",
+                    ConnStatus::Disconnected => "conn-disconnected",
+                });
+                row.append(&dot);
+            }
 
             let select_btn = gtk::ToggleButton::with_label(&tab.title);
             select_btn.set_hexpand(true);
@@ -1358,6 +1665,9 @@ impl AppModel {
             }
             if tab.marked {
                 select_btn.add_css_class("tab-marked");
+            }
+            if tab.pinned {
+                select_btn.add_css_class("tab-pinned");
             }
             let id = tab.id;
             let s = sender.clone();
@@ -1399,7 +1709,9 @@ impl AppModel {
             ctx.set_button(gtk::gdk::ffi::GDK_BUTTON_SECONDARY as u32);
             let id_c = tab.id;
             let marked_c = tab.marked;
+            let pinned_c = tab.pinned;
             let title_c = tab.title.clone();
+            let remote_list_c = remote_list.clone();
             let s_c = sender.clone();
             let btn_c = select_btn.clone();
             ctx.connect_pressed(move |g, _, x, y| {
@@ -1421,12 +1733,16 @@ impl AppModel {
                     b
                 };
 
-                let entries: [(&str, AppMsg); 5] = [
+                let entries: [(&str, AppMsg); 6] = [
                     ("New Tab", AppMsg::NewTab),
                     ("Duplicate", AppMsg::Action(Action::DuplicateTab)),
                     (
                         if marked_c { "Unmark" } else { "Mark Important" },
                         AppMsg::Action(Action::ToggleTabMarked),
+                    ),
+                    (
+                        if pinned_c { "Unpin Tab" } else { "Pin Tab" },
+                        AppMsg::Action(Action::ToggleTabPinned),
                     ),
                     ("Rename", AppMsg::Ignore),
                     ("Close", AppMsg::CloseTab(id_c)),
@@ -1468,6 +1784,25 @@ impl AppModel {
                     });
                     vbox.append(&b);
                 }
+
+                // One "Remote: <name>" item per saved host; opens a new remote
+                // tab. Separated from the tab-management items above.
+                if !remote_list_c.is_empty() {
+                    let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+                    vbox.append(&sep);
+                    for (n, name) in remote_list_c.iter() {
+                        let b = item(&format!("Remote: {name}"));
+                        let pop = popover.clone();
+                        let s = s_c.clone();
+                        let n = *n;
+                        b.connect_clicked(move |_| {
+                            pop.popdown();
+                            s.input(AppMsg::Action(Action::ConnectRemote(n)));
+                        });
+                        vbox.append(&b);
+                    }
+                }
+
                 popover.set_child(Some(&vbox));
                 popover.connect_closed(|p| p.unparent());
                 popover.popup();
@@ -1504,8 +1839,10 @@ impl AppModel {
 
             row.append(&select_btn);
             row.append(&close_btn);
+            self.apply_strip_row_placement(row.upcast_ref::<gtk::Widget>());
             self.tab_strip.append(&row);
         }
+        self.sync_tab_bar_visibility();
         self.persist_session();
     }
 }
@@ -1513,16 +1850,27 @@ impl AppModel {
 fn install_static_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
-        ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; margin-bottom: 2px; }
+        ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; margin-bottom: 2px; color: #ffffff; }
          .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }
-         .tab-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
-         .tab-strip { min-width: 140px; padding: 2px 4px; }
+         .tab-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; color: #ffffff; }
+         .tab-strip { min-width: 140px; padding: 2px 4px; color: #ffffff; }
+         .tab-strip treeview { color: #ffffff; }
+         .sidebar-toggle { color: #ffffff; }
          .top-bar { padding: 2px 4px; }
          .terminal-box scrollbar slider { min-width: 6px; border-radius: 3px; }
          .terminal-box scrollbar { padding: 0; }
          .tab-activity { font-style: italic; }
          .tab-bell { color: #f1fa8c; }
-         .tab-marked { background-color: rgba(80,160,255,0.22); font-weight: bold; }",
+         .tab-marked { background-color: rgba(80,160,255,0.22); font-weight: bold; }
+         .tab-pinned { background-color: rgba(255,200,80,0.18); }
+         .conn-dot { margin: 0 4px; font-size: 9px; }
+         .conn-connecting { color: #f1fa8c; }
+         .conn-connected { color: #50fa7b; }
+         .conn-disconnected { color: #ff5555; }
+         .top-tab-bar { padding: 2px 4px; }
+         .top-tabs { } .top-tabs .tab-row { margin-right: 2px; }
+         .sidebar-toggle-row { margin-bottom: 2px; }
+         .sidebar-toggle { padding: 2px 6px; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
@@ -1563,6 +1911,14 @@ impl SimpleComponent for AppModel {
                     },
                 },
 
+                // Top tab bar: holds the horizontal tab strip when tab
+                // placement is TopBar. Hidden in Sidebar mode.
+                #[local_ref]
+                top_tab_bar -> gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    add_css_class: "top-tab-bar",
+                },
+
                 #[local_ref]
                 search_bar -> gtk::SearchBar {},
 
@@ -1570,57 +1926,13 @@ impl SimpleComponent for AppModel {
                     set_orientation: gtk::Orientation::Horizontal,
                     set_vexpand: true,
 
-                    // Sidebar: filter entry above the tab strip. Pin it
-                    // non-expanding (width 160) so it does not compete 50/50
-                    // with the terminal stack via hexpand propagation.
-                    gtk::Box {
-                        set_orientation: gtk::Orientation::Vertical,
-                        set_width_request: 160,
-                        set_hexpand: false,
-                        add_css_class: "tab-strip",
+                    // Sidebar holds the view toggle (tabs / files) plus the
+                    // stack switching between them. Pinned non-expanding so it
+                    // does not compete with the terminal stack.
+                    #[local_ref]
+                    sidebar_box -> gtk::Box {
                         #[watch]
                         set_visible: model.sidebar_visible,
-
-                        #[local_ref]
-                        tab_filter_entry -> gtk::SearchEntry {},
-
-                        #[local_ref]
-                        tab_strip -> gtk::Box {
-                            set_orientation: gtk::Orientation::Vertical,
-                            set_vexpand: false,
-                            set_hexpand: false,
-                        },
-
-                        gtk::Separator {
-                            set_orientation: gtk::Orientation::Horizontal,
-                        },
-
-                        // File browser header: root label + up / goto-cwd.
-                        gtk::Box {
-                            set_orientation: gtk::Orientation::Horizontal,
-                            set_spacing: 2,
-
-                            gtk::Button {
-                                set_icon_name: "go-up-symbolic",
-                                set_tooltip_text: Some("Parent directory"),
-                                connect_clicked[sender] => move |_| sender.input(AppMsg::FileTreeGoUp),
-                            },
-                            gtk::Button {
-                                set_icon_name: "go-home-symbolic",
-                                set_tooltip_text: Some("Go to current directory"),
-                                connect_clicked[sender] => move |_| sender.input(AppMsg::FileTreeGotoCwd),
-                            },
-                            #[local_ref]
-                            file_tree_root_label -> gtk::Label {
-                                set_hexpand: true,
-                            },
-                        },
-
-                        #[local_ref]
-                        file_tree_scroll -> gtk::ScrolledWindow {
-                            set_vexpand: true,
-                            set_hexpand: false,
-                        },
                     },
 
                     #[local_ref]
@@ -1756,6 +2068,89 @@ impl SimpleComponent for AppModel {
         file_tree_scroll.set_vexpand(true);
         file_tree_scroll.set_child(Some(&file_tree_view));
 
+        let sidebar_width = config.borrow().sidebar_width as i32;
+        let tab_placement = config.borrow().tab_placement;
+        let sidebar_view = config.borrow().sidebar_view;
+
+        // Scroll holders the tab strip can be reparented between (sidebar vs
+        // top bar). apply_tab_placement() owns which one holds tab_strip.
+        let tab_strip_scroll = gtk::ScrolledWindow::new();
+        tab_strip_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        tab_strip_scroll.set_vexpand(true);
+        let top_tab_scroll = gtk::ScrolledWindow::new();
+        top_tab_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+        top_tab_scroll.set_hexpand(true);
+        let top_tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        top_tab_bar.append(&top_tab_scroll);
+
+        // Segmented view toggle: Tabs | Files, driving sidebar_stack.
+        let sidebar_tabs_btn = gtk::ToggleButton::with_label("Tabs");
+        sidebar_tabs_btn.add_css_class("sidebar-toggle");
+        let sidebar_files_btn = gtk::ToggleButton::with_label("Files");
+        sidebar_files_btn.add_css_class("sidebar-toggle");
+        sidebar_files_btn.set_group(Some(&sidebar_tabs_btn));
+        {
+            let sender = sender.clone();
+            sidebar_tabs_btn.connect_clicked(move |b| {
+                if b.is_active() {
+                    sender.input(AppMsg::SetSidebarView(config::SidebarView::Tabs));
+                }
+            });
+        }
+        {
+            let sender = sender.clone();
+            sidebar_files_btn.connect_clicked(move |b| {
+                if b.is_active() {
+                    sender.input(AppMsg::SetSidebarView(config::SidebarView::Files));
+                }
+            });
+        }
+        let toggle_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        toggle_row.add_css_class("sidebar-toggle-row");
+        sidebar_tabs_btn.set_hexpand(true);
+        sidebar_files_btn.set_hexpand(true);
+        toggle_row.append(&sidebar_tabs_btn);
+        toggle_row.append(&sidebar_files_btn);
+
+        // "tabs" page: filter entry + the tab strip's sidebar holder.
+        let tabs_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        tabs_page.append(&tab_filter_entry);
+        tabs_page.append(&tab_strip_scroll);
+
+        // "files" page: root header (up / goto-cwd / path) + file tree.
+        let files_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let file_header = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        let up_btn = gtk::Button::from_icon_name("go-up-symbolic");
+        up_btn.set_tooltip_text(Some("Parent directory"));
+        {
+            let sender = sender.clone();
+            up_btn.connect_clicked(move |_| sender.input(AppMsg::FileTreeGoUp));
+        }
+        let home_btn = gtk::Button::from_icon_name("go-home-symbolic");
+        home_btn.set_tooltip_text(Some("Go to current directory"));
+        {
+            let sender = sender.clone();
+            home_btn.connect_clicked(move |_| sender.input(AppMsg::FileTreeGotoCwd));
+        }
+        file_tree_root_label.set_hexpand(true);
+        file_header.append(&up_btn);
+        file_header.append(&home_btn);
+        file_header.append(&file_tree_root_label);
+        files_page.append(&file_header);
+        files_page.append(&file_tree_scroll);
+
+        let sidebar_stack = gtk::Stack::new();
+        sidebar_stack.add_named(&tabs_page, Some("tabs"));
+        sidebar_stack.add_named(&files_page, Some("files"));
+        sidebar_stack.set_vexpand(true);
+
+        let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        sidebar_box.set_width_request(sidebar_width);
+        sidebar_box.set_hexpand(false);
+        sidebar_box.add_css_class("tab-strip");
+        sidebar_box.append(&toggle_row);
+        sidebar_box.append(&sidebar_stack);
+
         let mut model = AppModel {
             config,
             themes: Rc::new(themes),
@@ -1779,12 +2174,23 @@ impl SimpleComponent for AppModel {
             file_tree_store: file_tree_store.clone(),
             file_tree_root_label: file_tree_root_label.clone(),
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
+            tab_strip_scroll: tab_strip_scroll.clone(),
+            top_tab_scroll: top_tab_scroll.clone(),
+            top_tab_bar: top_tab_bar.clone(),
+            sidebar_stack: sidebar_stack.clone(),
+            sidebar_tabs_btn: sidebar_tabs_btn.clone(),
+            sidebar_files_btn: sidebar_files_btn.clone(),
+            tab_placement: std::cell::Cell::new(tab_placement),
+            sidebar_view: std::cell::Cell::new(sidebar_view),
             command_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
         };
 
         let widgets = view_output!();
+
+        // Place the tab strip (sidebar vs top bar) and select the sidebar view.
+        model.apply_tab_placement();
 
         // Window-level key controller: intercept shortcuts before VTE.
         let key_controller = gtk::EventControllerKey::new();
@@ -1879,10 +2285,27 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::Action(action) => self.execute_action(action, &sender),
             AppMsg::ReloadConfig => self.reload_config(),
-            AppMsg::PaneExited(_, pane_id) => self.close_pane(pane_id, &sender),
+            AppMsg::PaneExited(tab_id, pane_id, code) => {
+                // A remote single-pane tab that died abnormally is reconnected in
+                // place instead of closed; everything else closes normally.
+                if self.schedule_remote_reconnect(tab_id, code, &sender) {
+                    return;
+                }
+                self.close_pane(pane_id, &sender);
+            }
+            AppMsg::RemoteReconnectTick(id, secs) => {
+                if let Some(idx) = self.index_of(id) {
+                    if let Some(conn) = self.tabs[idx].remote.as_ref() {
+                        self.tabs[idx].title = format!("{} — reconnect {secs}s", conn.host.name);
+                        self.rebuild_tab_strip(&sender);
+                    }
+                }
+            }
+            AppMsg::RemoteReconnectNow(id, attempt) => self.do_remote_reconnect(id, attempt, &sender),
             AppMsg::PaneCwdChanged(_, pane_id, path) => {
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
                     self.tabs[ti].panes[pi].cwd = Some(path.clone());
+                    self.mark_remote_connected(ti, &sender);
                     if self.tabs[ti].active_pane == pi && !self.tabs[ti].custom_title {
                         let number = ti as u32 + 1;
                         self.tabs[ti].title = default_tab_title(number, Some(&path));
@@ -1906,6 +2329,7 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::Activity(id) => {
                 if let Some(idx) = self.index_of(id) {
+                    self.mark_remote_connected(idx, &sender);
                     if idx != self.active && !self.tabs[idx].activity {
                         self.tabs[idx].activity = true;
                         self.rebuild_tab_strip(&sender);
@@ -2013,6 +2437,7 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::FileTreeGotoCwd => self.file_tree_goto_current_cwd(),
             AppMsg::FileTreeGoUp => self.file_tree_go_up(),
+            AppMsg::SetSidebarView(view) => self.apply_sidebar_view(view, true),
             AppMsg::Ignore => {}
         }
     }
