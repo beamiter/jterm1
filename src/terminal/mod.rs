@@ -1,3 +1,4 @@
+pub mod alt;
 pub mod ansi;
 pub mod block;
 pub mod select;

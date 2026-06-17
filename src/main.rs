@@ -164,6 +164,9 @@ struct Tab {
     remote: Option<RemoteConn>,
 }
 
+// `file_tree_store: gtk::TreeStore` uses the GTK4 TreeStore family deprecated in
+// 4.10; it stays functional and a ColumnView rewrite is out of scope.
+#[allow(deprecated)]
 struct AppModel {
     config: Rc<RefCell<Config>>,
     themes: Rc<Vec<Theme>>,
@@ -274,6 +277,7 @@ impl AppModel {
     }
 
     /// Rebuild the file tree with `root` at the top.
+    #[allow(deprecated)]
     fn set_file_tree_root(&self, root: std::path::PathBuf) {
         self.file_tree_store.clear();
         self.file_tree_root_label.set_text(&file_tree::display_path(&root));
@@ -1495,6 +1499,7 @@ impl AppModel {
         log::info!("Configuration reloaded from disk");
     }
 
+    #[allow(deprecated)]
     fn apply_dynamic_css(&self) {
         let config = self.config.borrow();
         let bg = &config.background;
@@ -1847,6 +1852,7 @@ impl AppModel {
     }
 }
 
+#[allow(deprecated)]
 fn install_static_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
@@ -1945,6 +1951,7 @@ impl SimpleComponent for AppModel {
         }
     }
 
+    #[allow(deprecated)]
     fn init(
         _init: Self::Init,
         root: Self::Root,

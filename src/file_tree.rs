@@ -2,6 +2,11 @@
 //! working directory (falling back to `$HOME`). Directories expand on demand;
 //! activating a file inserts its shell-quoted path into the active terminal.
 //! Ports jterm4's `ui/file_tree.rs` to jterm1's relm4 structure.
+//!
+//! GTK4 deprecated the TreeView/TreeStore family in 4.10 in favor of the new
+//! list/column views, but they remain fully functional and a ColumnView rewrite
+//! is out of scope; suppress the deprecation lints module-wide.
+#![allow(deprecated)]
 
 use relm4::gtk;
 
