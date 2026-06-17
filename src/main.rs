@@ -1645,6 +1645,9 @@ impl AppModel {
             }
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             row.add_css_class("tab-row");
+            if idx == self.active {
+                row.add_css_class("active-tab");
+            }
 
             // Remote connection status dot (Connecting / Connected / Disconnected).
             if let Some(conn) = tab.remote.as_ref() {
@@ -1858,7 +1861,9 @@ fn install_static_css() {
     provider.load_from_data(
         ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; margin-bottom: 2px; color: #ffffff; }
          .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }
-         .tab-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; color: #ffffff; }
+         .tab-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; color: #ffffff; opacity: 0; }
+         .tab-row:hover .tab-close { opacity: 1; }
+         .tab-row.active-tab .tab-close { opacity: 1; }
          .tab-strip { min-width: 140px; padding: 2px 4px; color: #ffffff; }
          .tab-strip treeview { color: #ffffff; }
          .sidebar-toggle { color: #ffffff; }
