@@ -45,6 +45,10 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
         .build();
 
     terminal.set_mouse_autohide(true);
+    // Backspace must send DEL (0x7f), not BS (0x08); readline/most shells only
+    // erase on DEL, so the default binding leaves Backspace unable to delete.
+    terminal.set_backspace_binding(vte4::EraseBinding::AsciiDelete);
+    terminal.set_delete_binding(vte4::EraseBinding::DeleteSequence);
 
     let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
     terminal.set_colors(Some(&config.foreground), Some(&config.background), &palette_refs);

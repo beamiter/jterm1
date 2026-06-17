@@ -58,7 +58,7 @@ enum BlockFilter {
     Slow,
 }
 
-/// Metadata + widget for one finished block, used by filtering, breadcrumb,
+/// Metadata + widget for one finished block, used by filtering,
 /// the right-click context menu, and export.
 struct FinishedBlock {
     /// Stable identity (monotonic), so context-menu closures can find this block
@@ -112,12 +112,9 @@ struct Ctx {
     has_command: Cell<bool>,
     /// Monotonic id source for finished blocks (stable across deletions).
     next_block_id: Cell<u64>,
-    /// Finished blocks in display order (top→bottom), for filtering + breadcrumb.
+    /// Finished blocks in display order (top→bottom), for filtering.
     finished: RefCell<Vec<FinishedBlock>>,
     filter: Cell<BlockFilter>,
-    breadcrumb: gtk::Button,
-    /// Index into `finished` of the block the breadcrumb currently names.
-    breadcrumb_target: Cell<Option<usize>>,
     /// Indices into `finished` matching the current search query, plus a cursor
     /// into that list for next/prev cycling.
     search_matches: RefCell<Vec<usize>>,
@@ -180,25 +177,7 @@ impl Component for BlockTerminal {
             .child(&block_list)
             .build();
         scroll.add_css_class("block-scroll");
-
-        // Floating breadcrumb: names the command whose output fills the viewport
-        // top once it has scrolled past. Overlaid on the scroll area.
-        let breadcrumb = gtk::Button::with_label("");
-        breadcrumb.add_css_class("block-breadcrumb");
-        breadcrumb.set_halign(gtk::Align::Fill);
-        breadcrumb.set_valign(gtk::Align::Start);
-        breadcrumb.set_visible(false);
-        if let Some(lbl) = breadcrumb.child().and_downcast::<gtk::Label>() {
-            lbl.set_xalign(0.0);
-            lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        }
-
-        let overlay = gtk::Overlay::new();
-        overlay.set_hexpand(true);
-        overlay.set_vexpand(true);
-        overlay.set_child(Some(&scroll));
-        overlay.add_overlay(&breadcrumb);
-        root.append(&overlay);
+        root.append(&scroll);
 
         // The persistent active card. `input_enabled` must stay true so VTE emits
         // the `commit` signal we forward to our PTY; it has no child PTY of its
@@ -248,8 +227,6 @@ impl Component for BlockTerminal {
             next_block_id: Cell::new(0),
             finished: RefCell::new(Vec::new()),
             filter: Cell::new(BlockFilter::None),
-            breadcrumb: breadcrumb.clone(),
-            breadcrumb_target: Cell::new(None),
             search_matches: RefCell::new(Vec::new()),
             search_idx: Cell::new(0),
             selected_block: Cell::new(None),
@@ -259,36 +236,19 @@ impl Component for BlockTerminal {
             fullscreen: Cell::new(false),
         });
 
-        // Track which finished block fills the viewport top → breadcrumb.
-        // Update on both value and range changes: while blocks stream in, the
-        // adjustment's `upper` grows after the final value-changed fires (the
-        // active card relayouts), shifting visible content without moving value.
+        // Keep the active card pinned to the viewport height. `vexpand` is inert
+        // along the scroll axis (the viewport hands the child its natural height),
+        // so without this the active card collapses to ~1 row once finished blocks
+        // fill the viewport — and that 1-row allocation is what gets forwarded to
+        // the PTY, so pagers/`git log` render into a single line. Pinning the card
+        // to `page_size` keeps the live VTE at a full screen of rows, like a normal
+        // terminal with history above.
         {
             let ctx = ctx.clone();
-            scroll
-                .vadjustment()
-                .connect_value_changed(move |adj| update_breadcrumb(&ctx, adj.value()));
-        }
-        {
-            let ctx = ctx.clone();
-            scroll
-                .vadjustment()
-                .connect_changed(move |adj| update_breadcrumb(&ctx, adj.value()));
-        }
-        // Clicking the breadcrumb jumps to the top of the block it names.
-        {
-            let ctx = ctx.clone();
-            breadcrumb.connect_clicked(move |_| {
-                if let Some(idx) = ctx.breadcrumb_target.get() {
-                    if let Some(block) = ctx.finished.borrow().get(idx) {
-                        let adj = ctx.scroll.vadjustment();
-                        if let Some(p) = block.widget.compute_point(
-                            &ctx.scroll,
-                            &gtk::graphene::Point::new(0.0, 0.0),
-                        ) {
-                            adj.set_value(adj.value() + p.y() as f64);
-                        }
-                    }
+            scroll.vadjustment().connect_changed(move |adj| {
+                let page = adj.page_size();
+                if page > 1.0 {
+                    ctx.active_holder.set_height_request(page as i32);
                 }
             });
         }
@@ -673,8 +633,8 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             );
             eprintln!("[altdbg] ENTER: pre_clear baseline =\n===\n{}\n===", ctx.pager_preclear.borrow());
             // Give the alt-screen app the full viewport: hide the finished blocks
-            // (and breadcrumb) so the active card fills the scroll area, matching a
-            // normal terminal. Restored on leave.
+            // so the active card fills the scroll area, matching a normal
+            // terminal. Restored on leave.
             enter_fullscreen(ctx);
             ctx.active_vte.feed(b"\x1b[?1049h");
         }
@@ -720,15 +680,14 @@ fn autoscroll(ctx: &Rc<Ctx>) {
     adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
 }
 
-/// Hand the viewport to an alt-screen app: hide every finished block and the
-/// breadcrumb so the active card (which is `vexpand`) fills the scroll area like
-/// a normal full-screen terminal. The active VTE's row/column count then matches
-/// the window, so the PTY resize tick reports the full size to the app.
+/// Hand the viewport to an alt-screen app: hide every finished block so the
+/// active card fills the scroll area like a normal full-screen terminal. The
+/// active VTE's row/column count then matches the window, so the PTY resize tick
+/// reports the full size to the app.
 fn enter_fullscreen(ctx: &Rc<Ctx>) {
     if ctx.fullscreen.replace(true) {
         return;
     }
-    ctx.breadcrumb.set_visible(false);
     for block in ctx.finished.borrow().iter() {
         block.widget.set_visible(false);
     }
@@ -994,7 +953,6 @@ fn apply_filter(ctx: &Rc<Ctx>, filter: BlockFilter) {
     for block in ctx.finished.borrow().iter() {
         block.widget.set_visible(passes_filter(filter, block));
     }
-    update_breadcrumb(ctx, ctx.scroll.vadjustment().value());
 }
 
 /// Move the keyboard block-selection highlight to `target` (an index into
@@ -1062,56 +1020,19 @@ fn clear_visible_blocks(ctx: &Rc<Ctx>) {
         ctx.block_list.remove(&block.widget);
     }
     drop(finished);
-    ctx.breadcrumb.set_visible(false);
-    ctx.breadcrumb_target.set(None);
     ctx.search_matches.borrow_mut().clear();
     ctx.search_idx.set(0);
     ctx.pty.write_bytes(b"\x0c");
 }
 
-/// Refresh the floating breadcrumb to name the last visible block whose top has
-/// scrolled above the viewport.
-fn update_breadcrumb(ctx: &Rc<Ctx>, scroll_top: f64) {
-    if ctx.fullscreen.get() {
-        return;
-    }
-    if scroll_top <= 8.0 {
-        ctx.breadcrumb.set_visible(false);
-        ctx.breadcrumb_target.set(None);
-        return;
-    }
-    let finished = ctx.finished.borrow();
-    let mut found: Option<usize> = None;
-    for (idx, block) in finished.iter().enumerate().rev() {
-        if !block.widget.is_visible() {
-            continue;
-        }
-        if let Some(p) = block
-            .widget
-            .compute_point(&ctx.scroll, &gtk::graphene::Point::new(0.0, 0.0))
-        {
-            if p.y() as f64 <= 0.0 {
-                found = Some(idx);
-                break;
-            }
-        }
-    }
-    match found {
-        Some(idx) => {
-            let cmd = finished[idx].command.lines().next().unwrap_or("").to_string();
-            ctx.breadcrumb.set_label(&format!("\u{276f}  {cmd}"));
-            ctx.breadcrumb_target.set(Some(idx));
-            ctx.breadcrumb.set_visible(true);
-        }
-        None => {
-            ctx.breadcrumb.set_visible(false);
-            ctx.breadcrumb_target.set(None);
-        }
-    }
-}
-
 fn reset_active(ctx: &Rc<Ctx>) {
     ctx.active_vte.reset(true, true);
+    // `reset()` acts on the emulator state immediately, but `feed()` bytes are
+    // parsed asynchronously: the just-finished command's output is still queued
+    // and would replay onto the cleared grid, leaving stale lines above the next
+    // prompt. Feed an in-stream clear (home + erase screen + erase scrollback) so
+    // it is ordered *after* that queued output and wipes it.
+    ctx.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
     ctx.cmd_buf.borrow_mut().clear();
     ctx.typed_cmd.borrow_mut().clear();
     ctx.out_buf.borrow_mut().clear();
@@ -1402,7 +1323,7 @@ fn export_block_markdown(ctx: &Rc<Ctx>, id: u64) {
 }
 
 /// Remove a finished block from the list. Index-based caches (search results,
-/// selection, breadcrumb) are reset since deletion shifts positions.
+/// selection) are reset since deletion shifts positions.
 fn delete_block(ctx: &Rc<Ctx>, id: u64) {
     let mut finished = ctx.finished.borrow_mut();
     if let Some(pos) = finished.iter().position(|b| b.id == id) {
@@ -1413,7 +1334,6 @@ fn delete_block(ctx: &Rc<Ctx>, id: u64) {
     ctx.selected_block.set(None);
     ctx.search_matches.borrow_mut().clear();
     ctx.search_idx.set(0);
-    update_breadcrumb(ctx, ctx.scroll.vadjustment().value());
 }
 
 fn ansi_output_view(runs: &[AnsiTextRun], css_class: &str) -> gtk::TextView {
@@ -1726,22 +1646,6 @@ fn install_block_css(config: &Config) {
         .block-selected {{
             border-color: {accent};
             box-shadow: 0 0 0 1px {accent}, 0 4px 14px rgba(0,0,0,0.28);
-        }}
-        .block-breadcrumb {{
-            color: {dim_fg};
-            background-color: {block_bg_hex};
-            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.28);
-            border-left: 3px solid {accent};
-            border-radius: 999px;
-            margin: 8px 14px;
-            padding: 4px 14px;
-            font-family: "{font_family}";
-            font-size: 0.85em;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.32);
-        }}
-        .block-breadcrumb:hover {{
-            color: {fg_hex};
-            background-color: rgba({acc_r},{acc_g},{acc_b},0.10);
         }}
         .block-active {{
             border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.22);
