@@ -56,6 +56,7 @@ enum BlockFilter {
     None,
     Failed,
     Slow,
+    Pinned,
 }
 
 /// Metadata + widget for one finished block, used by filtering,
@@ -65,6 +66,28 @@ struct FinishedBlock {
     /// after deletions have shifted vector positions.
     id: u64,
     widget: gtk::Box,
+    /// The command TextView, kept for in-block search highlighting.
+    command_view: gtk::TextView,
+    /// The output TextView (None when the command produced no output), kept for
+    /// search highlight, error-jump, and lazy/collapse re-rendering.
+    output_view: Option<gtk::TextView>,
+    /// The "show N more lines" button, when output was truncated.
+    show_more: Option<gtk::Button>,
+    /// Full styled output runs, cached so the output view can be re-truncated
+    /// (reversible collapse) or rendered on demand (lazy load).
+    full_runs: Rc<Vec<AnsiTextRun>>,
+    /// Whether the output area is currently collapsed (hidden).
+    collapsed: Rc<Cell<bool>>,
+    /// Whether the truncated head (vs. full output) is currently shown.
+    truncated: Rc<Cell<bool>>,
+    /// User-pinned (bookmarked): stays visible under any filter, visually marked.
+    pinned: bool,
+    /// Header pin glyph, toggled with `pinned`.
+    pin_icon: gtk::Label,
+    /// Buffer char offsets of detected error lines in the output, for n/N jump.
+    error_offsets: Vec<i32>,
+    /// Cursor into `error_offsets` for n/N cycling.
+    error_idx: Cell<usize>,
     /// Last line of the captured shell prompt (best-effort), for Copy/export.
     prompt: String,
     command: String,
@@ -79,6 +102,10 @@ struct FinishedBlock {
 
 /// A command slower than this (ms) counts as "slow" for the slow filter.
 const SLOW_THRESHOLD_MS: u64 = 1000;
+
+/// A command taking at least this long (ms) triggers a completion notification
+/// (tab highlight) when the user isn't looking at this terminal.
+const NOTIFY_THRESHOLD_MS: u64 = 3000;
 
 // ─── Shared reader/handler context ──────────────────────────────────────────
 
@@ -132,6 +159,11 @@ struct Ctx {
     pager_preclear: Rc<RefCell<String>>,
     /// True while an alt-screen app owns the viewport (finished blocks hidden).
     fullscreen: Cell<bool>,
+    /// Sticky command header floating over the viewport top.
+    sticky_header: gtk::Box,
+    sticky_label: gtk::Label,
+    /// Index into `finished` the sticky header currently points at (for click).
+    sticky_idx: Cell<Option<usize>>,
 }
 
 // ─── Component ──────────────────────────────────────────────────────────────
@@ -177,7 +209,27 @@ impl Component for BlockTerminal {
             .child(&block_list)
             .build();
         scroll.add_css_class("block-scroll");
-        root.append(&scroll);
+
+        // Sticky command header: floats at the top of the viewport, showing the
+        // command of the finished block currently scrolled under the top edge.
+        let overlay = gtk::Overlay::new();
+        overlay.set_hexpand(true);
+        overlay.set_vexpand(true);
+        overlay.set_child(Some(&scroll));
+
+        let sticky_header = gtk::Box::new(Orientation::Horizontal, 0);
+        sticky_header.add_css_class("block-sticky-header");
+        sticky_header.set_halign(gtk::Align::Fill);
+        sticky_header.set_valign(gtk::Align::Start);
+        sticky_header.set_visible(false);
+        let sticky_label = gtk::Label::new(None);
+        sticky_label.set_halign(gtk::Align::Start);
+        sticky_label.set_hexpand(true);
+        sticky_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        sticky_label.add_css_class("block-sticky-label");
+        sticky_header.append(&sticky_label);
+        overlay.add_overlay(&sticky_header);
+        root.append(&overlay);
 
         // The persistent active card. `input_enabled` must stay true so VTE emits
         // the `commit` signal we forward to our PTY; it has no child PTY of its
@@ -234,6 +286,9 @@ impl Component for BlockTerminal {
             pager_generation: Rc::new(Cell::new(0)),
             pager_preclear: Rc::new(RefCell::new(String::new())),
             fullscreen: Cell::new(false),
+            sticky_header: sticky_header.clone(),
+            sticky_label: sticky_label.clone(),
+            sticky_idx: Cell::new(None),
         });
 
         // Keep the active card pinned to the viewport height. `vexpand` is inert
@@ -251,6 +306,26 @@ impl Component for BlockTerminal {
                     ctx.active_holder.set_height_request(page as i32);
                 }
             });
+        }
+
+        // Sticky command header: as the user scrolls, show the command of the
+        // finished block currently passing under the viewport's top edge.
+        {
+            let ctx = ctx.clone();
+            scroll.vadjustment().connect_value_changed(move |_adj| {
+                update_sticky_header(&ctx);
+            });
+        }
+        // Click the sticky header to jump back to the top of that block.
+        {
+            let ctx = ctx.clone();
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |_g, _n, _x, _y| {
+                if let Some(idx) = ctx.sticky_idx.get() {
+                    scroll_to_block(&ctx, idx);
+                }
+            });
+            sticky_header.add_controller(click);
         }
 
         // Forward keystrokes from the active VTE to our PTY, and reconstruct the
@@ -341,6 +416,8 @@ impl Component for BlockTerminal {
         // window-root key controller passes them through to here.
         {
             let ctx = ctx.clone();
+            // Tracks the time of the last bare `g` press for `gg` chord detection.
+            let last_g: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
             let key_ctl = gtk::EventControllerKey::new();
             key_ctl.set_propagation_phase(gtk::PropagationPhase::Capture);
             key_ctl.connect_key_pressed(move |_c, keyval, _kc, state| {
@@ -364,6 +441,60 @@ impl Component for BlockTerminal {
                 if shift && !ctrl && !alt && matches!(keyval, Key::Up | Key::Down) {
                     step_block_selection(&ctx, if keyval == Key::Up { -1 } else { 1 });
                     return glib::Propagation::Stop;
+                }
+
+                // Selection-mode single-key navigation (vim-style). Only active
+                // while a block is already selected, so normal shell typing is
+                // never intercepted.
+                if ctx.selected_block.get().is_some() && !ctrl && !alt {
+                    match keyval {
+                        Key::j | Key::Down => {
+                            step_block_selection(&ctx, 1);
+                            return glib::Propagation::Stop;
+                        }
+                        Key::k | Key::Up => {
+                            step_block_selection(&ctx, -1);
+                            return glib::Propagation::Stop;
+                        }
+                        Key::Home => {
+                            jump_block_edge(&ctx, true);
+                            return glib::Propagation::Stop;
+                        }
+                        Key::End | Key::G => {
+                            jump_block_edge(&ctx, false);
+                            return glib::Propagation::Stop;
+                        }
+                        Key::g => {
+                            let now = Instant::now();
+                            let dbl = last_g
+                                .get()
+                                .map(|t| now.duration_since(t) < Duration::from_millis(500))
+                                .unwrap_or(false);
+                            if dbl {
+                                jump_block_edge(&ctx, true);
+                                last_g.set(None);
+                            } else {
+                                last_g.set(Some(now));
+                            }
+                            return glib::Propagation::Stop;
+                        }
+                        Key::n => {
+                            jump_to_error(&ctx, 1);
+                            return glib::Propagation::Stop;
+                        }
+                        Key::N => {
+                            jump_to_error(&ctx, -1);
+                            return glib::Propagation::Stop;
+                        }
+                        _ => {
+                            if let Some(c) = keyval.to_unicode() {
+                                if ('1'..='9').contains(&c) {
+                                    jump_to_nth_visible(&ctx, c as usize - '1' as usize);
+                                    return glib::Propagation::Stop;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Enter while a block is selected: recall its command into the
@@ -453,11 +584,13 @@ impl Component for BlockTerminal {
             VteInput::Kill => self.ctx.pty.kill(),
             VteInput::FilterFailedBlocks => apply_filter(&self.ctx, BlockFilter::Failed),
             VteInput::FilterSlowBlocks => apply_filter(&self.ctx, BlockFilter::Slow),
+            VteInput::FilterPinnedBlocks => apply_filter(&self.ctx, BlockFilter::Pinned),
             VteInput::ClearBlockFilter => apply_filter(&self.ctx, BlockFilter::None),
             VteInput::SearchSet(query, use_regex) => search_set(&self.ctx, &query, use_regex),
             VteInput::SearchNext => search_step(&self.ctx, 1),
             VteInput::SearchPrev => search_step(&self.ctx, -1),
             VteInput::SearchClear => {
+                clear_search_highlights(&self.ctx);
                 self.ctx.search_matches.borrow_mut().clear();
                 self.ctx.search_idx.set(0);
             }
@@ -465,9 +598,15 @@ impl Component for BlockTerminal {
     }
 }
 
-/// Compute the set of finished blocks matching `query` and jump to the first.
+/// Compute the set of finished blocks matching `query`, highlight the matches in
+/// each block's command/output views, and jump to the first.
 fn search_set(ctx: &Rc<Ctx>, query: &str, use_regex: bool) {
-    let mut matches = Vec::new();
+    clear_search_highlights(ctx);
+    if query.is_empty() {
+        ctx.search_matches.borrow_mut().clear();
+        ctx.search_idx.set(0);
+        return;
+    }
     let re = if use_regex {
         regex::RegexBuilder::new(query)
             .case_insensitive(true)
@@ -476,7 +615,15 @@ fn search_set(ctx: &Rc<Ctx>, query: &str, use_regex: bool) {
     } else {
         None
     };
+    let accent = ctx.config.borrow().palette[3];
+    let bg = format!(
+        "rgba({},{},{},0.40)",
+        (accent.red() * 255.0) as u8,
+        (accent.green() * 255.0) as u8,
+        (accent.blue() * 255.0) as u8,
+    );
     let needle = query.to_lowercase();
+    let mut matches = Vec::new();
     for (idx, block) in ctx.finished.borrow().iter().enumerate() {
         let hay = format!("{}\n{}", block.command, block.plain_output);
         let hit = match &re {
@@ -485,12 +632,91 @@ fn search_set(ctx: &Rc<Ctx>, query: &str, use_regex: bool) {
         };
         if hit {
             matches.push(idx);
+            highlight_matches_in_view(&block.command_view, re.as_ref(), &needle, &bg);
+            if let Some(view) = &block.output_view {
+                highlight_matches_in_view(view, re.as_ref(), &needle, &bg);
+            }
         }
     }
     *ctx.search_matches.borrow_mut() = matches;
     ctx.search_idx.set(0);
     if let Some(&first) = ctx.search_matches.borrow().first() {
         scroll_to_block(ctx, first);
+    }
+}
+
+/// Remove the search-highlight tag from every block's command/output buffers.
+fn clear_search_highlights(ctx: &Rc<Ctx>) {
+    for block in ctx.finished.borrow().iter() {
+        remove_tag(&block.command_view, "jterm-search");
+        if let Some(view) = &block.output_view {
+            remove_tag(view, "jterm-search");
+        }
+    }
+}
+
+fn remove_tag(view: &gtk::TextView, tag_name: &str) {
+    let buffer = view.buffer();
+    if buffer.tag_table().lookup(tag_name).is_some() {
+        let (s, e) = (buffer.start_iter(), buffer.end_iter());
+        buffer.remove_tag_by_name(tag_name, &s, &e);
+    }
+}
+
+/// Highlight every occurrence of the query within a view's *current* buffer text
+/// (so truncated output highlights only what's shown). ASCII case-insensitive for
+/// literal queries; regex find for regex queries.
+fn highlight_matches_in_view(
+    view: &gtk::TextView,
+    re: Option<&regex::Regex>,
+    needle_lower: &str,
+    bg: &str,
+) {
+    let buffer = view.buffer();
+    let text = buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .to_string();
+    let mut ranges: Vec<(i32, i32)> = Vec::new();
+    match re {
+        Some(re) => {
+            for m in re.find_iter(&text) {
+                let s = text[..m.start()].chars().count() as i32;
+                let e = text[..m.end()].chars().count() as i32;
+                if e > s {
+                    ranges.push((s, e));
+                }
+            }
+        }
+        None => {
+            if needle_lower.is_empty() {
+                return;
+            }
+            let hay: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+            let pat: Vec<char> = needle_lower.chars().collect();
+            let mut i = 0;
+            while i + pat.len() <= hay.len() {
+                if hay[i..i + pat.len()] == pat[..] {
+                    ranges.push((i as i32, (i + pat.len()) as i32));
+                    i += pat.len();
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return;
+    }
+    let table = buffer.tag_table();
+    let tag = table.lookup("jterm-search").unwrap_or_else(|| {
+        let t = gtk::TextTag::builder().name("jterm-search").background(bg).build();
+        table.add(&t);
+        t
+    });
+    for (s, e) in ranges {
+        let si = buffer.iter_at_offset(s);
+        let ei = buffer.iter_at_offset(e);
+        buffer.apply_tag(&tag, &si, &ei);
     }
 }
 
@@ -508,6 +734,78 @@ fn search_step(ctx: &Rc<Ctx>, delta: i32) {
 }
 
 /// Scroll the block list so finished block `idx` is at the viewport top.
+/// True when the user is plausibly looking at this terminal: its toplevel
+/// window is active AND the view is scrolled near the bottom (the live output).
+fn user_is_watching(ctx: &Rc<Ctx>) -> bool {
+    let window_active = ctx
+        .scroll
+        .root()
+        .and_downcast::<gtk::Window>()
+        .map(|w| w.is_active())
+        .unwrap_or(false);
+    if !window_active {
+        return false;
+    }
+    let adj = ctx.scroll.vadjustment();
+    let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
+    adj.value() >= max_val - 4.0
+}
+
+/// Refresh the floating sticky header: find the finished block whose vertical
+/// span contains the viewport's top edge and show its command there. Hidden when
+/// the top edge is over the active card, an empty area, or in fullscreen.
+fn update_sticky_header(ctx: &Rc<Ctx>) {
+    if ctx.fullscreen.get() {
+        ctx.sticky_header.set_visible(false);
+        return;
+    }
+    let top = ctx.scroll.vadjustment().value();
+    let finished = ctx.finished.borrow();
+    let mut found: Option<usize> = None;
+    for (idx, block) in finished.iter().enumerate() {
+        if !block.widget.get_visible() {
+            continue;
+        }
+        let Some(p) = block
+            .widget
+            .compute_point(&ctx.block_list, &gtk::graphene::Point::new(0.0, 0.0))
+        else {
+            continue;
+        };
+        let y = p.y() as f64;
+        let h = block.widget.height() as f64;
+        // Header shows only once a block's top has scrolled above the viewport
+        // edge (i.e. its command line is no longer visible).
+        if y < top && top < y + h {
+            found = Some(idx);
+        }
+    }
+    match found {
+        Some(idx) => {
+            let block = &finished[idx];
+            let label = if block.command.is_empty() {
+                block.prompt.clone()
+            } else {
+                block.command.clone()
+            };
+            ctx.sticky_label.set_text(&label);
+            ctx.sticky_header.remove_css_class("sticky-ok");
+            ctx.sticky_header.remove_css_class("sticky-bad");
+            if block.exit_code == 0 {
+                ctx.sticky_header.add_css_class("sticky-ok");
+            } else {
+                ctx.sticky_header.add_css_class("sticky-bad");
+            }
+            ctx.sticky_idx.set(Some(idx));
+            ctx.sticky_header.set_visible(true);
+        }
+        None => {
+            ctx.sticky_idx.set(None);
+            ctx.sticky_header.set_visible(false);
+        }
+    }
+}
+
 fn scroll_to_block(ctx: &Rc<Ctx>, idx: usize) {
     let finished = ctx.finished.borrow();
     let Some(block) = finished.get(idx) else { return };
@@ -519,6 +817,63 @@ fn scroll_to_block(ctx: &Rc<Ctx>, idx: usize) {
         let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
         adj.set_value((p.y() as f64).clamp(adj.lower(), max_val));
     }
+}
+
+/// Cycle to the next/previous detected error line within the selected block,
+/// expanding its output first, and scroll that line into view. No-op when no
+/// block is selected or the selected block has no detected errors.
+fn jump_to_error(ctx: &Rc<Ctx>, delta: i32) {
+    let Some(sel) = ctx.selected_block.get() else { return };
+    let err_bg = error_highlight_bg(ctx);
+    let finished = ctx.finished.borrow();
+    let Some(block) = finished.get(sel) else { return };
+    if block.error_offsets.is_empty() {
+        return;
+    }
+    // Ensure the full output is rendered + visible so every error is reachable.
+    if let Some(view) = &block.output_view {
+        if block.truncated.get() || block.collapsed.get() {
+            render_block_output(view, &block.full_runs, &block.full_runs, false, &block.error_offsets, &err_bg);
+            block.truncated.set(false);
+            block.collapsed.set(false);
+            view.set_visible(true);
+            if let Some(b) = &block.show_more {
+                b.set_visible(false);
+            }
+        }
+    }
+    let n = block.error_offsets.len() as i32;
+    let cur = block.error_idx.get() as i32;
+    let next = ((cur + delta) % n + n) % n;
+    block.error_idx.set(next as usize);
+    let off = block.error_offsets[next as usize];
+    scroll_to_offset(ctx, block, off);
+}
+
+/// Scroll the outer list so the given char offset inside a block's output view is
+/// near the top of the viewport.
+fn scroll_to_offset(ctx: &Rc<Ctx>, block: &FinishedBlock, offset: i32) {
+    let Some(view) = &block.output_view else { return };
+    let iter = view.buffer().iter_at_offset(offset);
+    let loc = view.iter_location(&iter);
+    let (_wx, wy) = view.buffer_to_window_coords(gtk::TextWindowType::Widget, loc.x(), loc.y());
+    if let Some(p) = view.compute_point(&ctx.block_list, &gtk::graphene::Point::new(0.0, wy as f32)) {
+        let adj = ctx.scroll.vadjustment();
+        let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
+        let target = (p.y() as f64 - 8.0).clamp(adj.lower(), max_val);
+        adj.set_value(target);
+    }
+}
+
+/// Background color string for error-line highlight, derived from palette red.
+fn error_highlight_bg(ctx: &Rc<Ctx>) -> String {
+    let err = ctx.config.borrow().palette[1];
+    format!(
+        "rgba({},{},{},0.28)",
+        (err.red() * 255.0) as u8,
+        (err.green() * 255.0) as u8,
+        (err.blue() * 255.0) as u8,
+    )
 }
 
 // ─── Reader event handling ──────────────────────────────────────────────────
@@ -560,7 +915,6 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                     // so paged-through content (e.g. `git log` over many commits) is
                     // preserved instead of being overwritten.
                     if super::alt::contains_clear_screen(&bytes) {
-                        eprintln!("[altdbg] clear-screen in stream → record before clear");
                         super::alt::record_pager_snapshot(
                             &ctx.active_vte,
                             &ctx.pager_snapshots,
@@ -610,9 +964,18 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
         }
         ParserEvent::CommandEnd(code) => {
             ctx.exit_code.set(code);
-            ctx.duration.set(ctx.start_time.get().map(|t| t.elapsed()));
+            let elapsed = ctx.start_time.get().map(|t| t.elapsed());
+            ctx.duration.set(elapsed);
             ctx.end_time_ms.set(Some(now_ms()));
             ctx.state.set(BlockState::PostCommand);
+
+            // In-app completion notice: only when the command was slow enough to
+            // matter AND the user isn't watching (tab inactive or scrolled away
+            // from the bottom). Routed to the existing tab-highlight mechanism.
+            let slow = elapsed.map(|d| d.as_millis() as u64).unwrap_or(0) >= NOTIFY_THRESHOLD_MS;
+            if slow && !user_is_watching(ctx) {
+                let _ = sender.output(VteOutput::CommandFinished(code == 0));
+            }
         }
         ParserEvent::CwdUpdate(path) => {
             *ctx.cwd.borrow_mut() = path.clone();
@@ -631,7 +994,6 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             *ctx.pager_preclear.borrow_mut() = super::alt::normalize_pager_snapshot(
                 &super::alt::visible_vte_text(&ctx.active_vte),
             );
-            eprintln!("[altdbg] ENTER: pre_clear baseline =\n===\n{}\n===", ctx.pager_preclear.borrow());
             // Give the alt-screen app the full viewport: hide the finished blocks
             // so the active card fills the scroll area, matching a normal
             // terminal. Restored on leave.
@@ -643,7 +1005,6 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             // to the normal buffer. The deferred idle captures race with the VTE's
             // paint and frequently never land (leaving an empty block), so this is
             // the reliable snapshot of the app's last screen.
-            eprintln!("[altdbg] LEAVE: capturing final frame");
             super::alt::record_pager_snapshot(
                 &ctx.active_vte,
                 &ctx.pager_snapshots,
@@ -691,6 +1052,7 @@ fn enter_fullscreen(ctx: &Rc<Ctx>) {
     for block in ctx.finished.borrow().iter() {
         block.widget.set_visible(false);
     }
+    ctx.sticky_header.set_visible(false);
 }
 
 /// Restore the block list when the alt-screen app exits, re-applying the active
@@ -735,28 +1097,21 @@ fn finalize_block(ctx: &Rc<Ctx>) {
     let id = ctx.next_block_id.get();
     ctx.next_block_id.set(id + 1);
 
-    let block = build_finished_block(ctx, id, &command, &output, exit_code, &cwd, duration, end_time_ms);
-    ctx.block_list.append(&block);
+    let meta = build_finished_block(
+        ctx, id, &prompt, &command, &output, exit_code, &cwd, duration, end_time_ms, false,
+    );
+    let widget = meta.widget.clone();
+    let duration_ms = meta.duration_ms;
+    ctx.block_list.append(&widget);
     ctx.block_list
-        .reorder_child_after(&ctx.active_holder, Some(&block));
+        .reorder_child_after(&ctx.active_holder, Some(&widget));
 
-    let duration_ms = duration.map(|d| d.as_millis() as u64).unwrap_or(0);
-    let meta = FinishedBlock {
-        id,
-        widget: block.clone(),
-        prompt: prompt.clone(),
-        command: command.clone(),
-        plain_output: strip_ansi(output.as_bytes()),
-        exit_code,
-        cwd: cwd.clone(),
-        duration_ms,
-        end_time_ms,
-    };
-    block.set_visible(passes_filter(ctx.filter.get(), &meta));
+    widget.set_visible(passes_filter(ctx.filter.get(), &meta));
     ctx.finished.borrow_mut().push(meta);
 
-    append_block_history(ctx, &prompt, &command, &output, exit_code, &cwd, duration_ms, end_time_ms);
+    append_block_history(ctx, &prompt, &command, &output, exit_code, &cwd, duration_ms, end_time_ms, false);
 
+    enforce_max_blocks(ctx);
     reset_active(ctx);
 }
 
@@ -773,6 +1128,8 @@ struct HistoryRecord {
     duration_ms: u64,
     #[serde(default)]
     end_time_ms: Option<u64>,
+    #[serde(default)]
+    pinned: bool,
 }
 
 /// Export shape mirroring jterm4's `BlockData` (field names + order), so the
@@ -854,6 +1211,7 @@ fn append_block_history(
     cwd: &str,
     duration_ms: u64,
     end_time_ms: Option<u64>,
+    pinned: bool,
 ) {
     let Some(path) = ctx.config.borrow().block_history_path.clone() else {
         return;
@@ -866,6 +1224,7 @@ fn append_block_history(
         cwd: cwd.to_string(),
         duration_ms,
         end_time_ms,
+        pinned,
     };
     let Ok(line) = serde_json::to_string(&record) else {
         return;
@@ -909,40 +1268,61 @@ fn load_block_history(ctx: &Rc<Ctx>) {
         };
         let id = ctx.next_block_id.get();
         ctx.next_block_id.set(id + 1);
-        let block = build_finished_block(
+        let meta = build_finished_block(
             ctx,
             id,
+            &rec.prompt,
             &rec.command,
             &rec.output,
             rec.exit_code,
             &rec.cwd,
             duration,
             rec.end_time_ms,
+            rec.pinned,
         );
-        ctx.block_list.append(&block);
+        let widget = meta.widget.clone();
+        ctx.block_list.append(&widget);
         ctx.block_list
-            .reorder_child_after(&ctx.active_holder, Some(&block));
-        let meta = FinishedBlock {
-            id,
-            widget: block.clone(),
-            prompt: rec.prompt.clone(),
-            command: rec.command.clone(),
-            plain_output: strip_ansi(rec.output.as_bytes()),
-            exit_code: rec.exit_code,
-            cwd: rec.cwd.clone(),
-            duration_ms: rec.duration_ms,
-            end_time_ms: rec.end_time_ms,
-        };
-        block.set_visible(passes_filter(ctx.filter.get(), &meta));
+            .reorder_child_after(&ctx.active_holder, Some(&widget));
+        widget.set_visible(passes_filter(ctx.filter.get(), &meta));
         ctx.finished.borrow_mut().push(meta);
     }
+    enforce_max_blocks(ctx);
 }
 
 fn passes_filter(filter: BlockFilter, block: &FinishedBlock) -> bool {
     match filter {
         BlockFilter::None => true,
-        BlockFilter::Failed => block.exit_code != 0,
-        BlockFilter::Slow => block.duration_ms >= SLOW_THRESHOLD_MS,
+        // Pinned blocks stay visible under any content filter.
+        BlockFilter::Failed => block.pinned || block.exit_code != 0,
+        BlockFilter::Slow => block.pinned || block.duration_ms >= SLOW_THRESHOLD_MS,
+        BlockFilter::Pinned => block.pinned,
+    }
+}
+
+/// Enforce `max_visible_blocks`: evict the oldest non-pinned finished blocks once
+/// the live count exceeds the cap (0 = unlimited). History on disk is unaffected.
+fn enforce_max_blocks(ctx: &Rc<Ctx>) {
+    let max = ctx.config.borrow().max_visible_blocks as usize;
+    if max == 0 {
+        return;
+    }
+    let mut evicted = false;
+    loop {
+        let len = ctx.finished.borrow().len();
+        if len <= max {
+            break;
+        }
+        let pos = ctx.finished.borrow().iter().position(|b| !b.pinned);
+        let Some(pos) = pos else { break };
+        let block = ctx.finished.borrow_mut().remove(pos);
+        ctx.block_list.remove(&block.widget);
+        evicted = true;
+    }
+    if evicted {
+        select_block(ctx, None);
+        ctx.search_matches.borrow_mut().clear();
+        ctx.search_idx.set(0);
     }
 }
 
@@ -978,18 +1358,41 @@ fn select_block(ctx: &Rc<Ctx>, target: Option<usize>) {
     }
 }
 
-/// Step the block selection by `delta` (+1 = next/down, -1 = prev/up) over the
-/// currently *visible* finished blocks, clamping at the ends. With no current
-/// selection, Up selects the last visible block and Down selects the first.
-fn step_block_selection(ctx: &Rc<Ctx>, delta: i32) {
-    let visible: Vec<usize> = ctx
-        .finished
+/// Indices into `finished` of the currently visible blocks, in display order.
+fn visible_indices(ctx: &Rc<Ctx>) -> Vec<usize> {
+    ctx.finished
         .borrow()
         .iter()
         .enumerate()
         .filter(|(_, b)| b.widget.is_visible())
         .map(|(i, _)| i)
-        .collect();
+        .collect()
+}
+
+/// Select the first (or last) currently-visible block.
+fn jump_block_edge(ctx: &Rc<Ctx>, first: bool) {
+    let visible = visible_indices(ctx);
+    let target = if first { visible.first() } else { visible.last() };
+    if let Some(&idx) = target {
+        select_block(ctx, Some(idx));
+    }
+}
+
+/// Select the `n`th (0-based) currently-visible block, clamped to the last.
+fn jump_to_nth_visible(ctx: &Rc<Ctx>, n: usize) {
+    let visible = visible_indices(ctx);
+    if visible.is_empty() {
+        return;
+    }
+    let idx = visible[n.min(visible.len() - 1)];
+    select_block(ctx, Some(idx));
+}
+
+/// Step the block selection by `delta` (+1 = next/down, -1 = prev/up) over the
+/// currently *visible* finished blocks, clamping at the ends. With no current
+/// selection, Up selects the last visible block and Down selects the first.
+fn step_block_selection(ctx: &Rc<Ctx>, delta: i32) {
+    let visible = visible_indices(ctx);
     if visible.is_empty() {
         return;
     }
@@ -1049,13 +1452,15 @@ fn reset_active(ctx: &Rc<Ctx>) {
 fn build_finished_block(
     ctx: &Rc<Ctx>,
     id: u64,
+    prompt: &str,
     command: &str,
     output: &str,
     exit_code: i32,
     cwd: &str,
     duration: Option<Duration>,
     end_time_ms: Option<u64>,
-) -> gtk::Box {
+    pinned: bool,
+) -> FinishedBlock {
     let outer = gtk::Box::new(Orientation::Vertical, 0);
     outer.add_css_class("block-finished");
     if exit_code == 0 {
@@ -1063,13 +1468,23 @@ fn build_finished_block(
     } else {
         outer.add_css_class("block-failed");
     }
+    if pinned {
+        outer.add_css_class("block-pinned");
+    }
     outer.set_hexpand(true);
 
     // Parse ANSI output into styled runs once; `plain_output` is the de-styled
     // text used for the empty check and clipboard copy.
     let palette = ctx.config.borrow().palette;
-    let runs = ansi::ansi_text_runs(output, &palette);
+    let runs: Rc<Vec<AnsiTextRun>> = Rc::new(ansi::ansi_text_runs(output, &palette));
     let plain_output: String = runs.iter().map(|r| r.text.as_str()).collect();
+
+    // Detect error-line offsets (only meaningful for failed commands).
+    let error_offsets = if exit_code != 0 {
+        detect_error_offsets(&plain_output)
+    } else {
+        Vec::new()
+    };
 
     // Header row.
     let header = gtk::Box::new(Orientation::Horizontal, 6);
@@ -1083,6 +1498,13 @@ fn build_finished_block(
         "block-status-bad"
     });
     header.append(&status);
+
+    // Pin indicator (Nerd Font thumbtack ), shown only when the block is pinned.
+    let pin_icon = gtk::Label::new(Some("\u{f08d}"));
+    pin_icon.add_css_class("block-pin-icon");
+    pin_icon.set_visible(pinned);
+    header.append(&pin_icon);
+    let pin_icon_ret = pin_icon.clone();
 
     let cwd_label = gtk::Label::new(Some(&shorten_path(cwd)));
     cwd_label.add_css_class("block-header-label");
@@ -1185,60 +1607,114 @@ fn build_finished_block(
     url::attach_url_handlers(&command_view);
     outer.append(&command_view);
 
-    // Output view (with collapse-on-overflow), ANSI-colored. Handles are kept so
-    // the header chevron can toggle the whole output area's visibility.
+    // Background for error-line highlight, derived from the palette red.
+    let err_bg = error_highlight_bg(ctx);
+    let error_offsets_rc: Rc<Vec<i32>> = Rc::new(error_offsets.clone());
+
+    // Output view with reversible truncation + lazy rendering. `truncated` tracks
+    // whether the head (vs. full output) is shown; `collapsed` whether the output
+    // area is hidden; `rendered` guards lazy first-render.
+    let truncate_lines = ctx.config.borrow().max_collapsed_output_lines as usize;
+    let lazy_threshold = ctx.config.borrow().lazy_load_threshold as usize;
+    let total_lines = ansi::count_lines(&runs);
+    let do_truncate = truncate_lines > 0 && total_lines > truncate_lines;
+    let lazy = lazy_threshold > 0 && total_lines > lazy_threshold;
+    let has_output = !plain_output.is_empty();
+
+    let collapsed = Rc::new(Cell::new(!has_output || lazy));
+    let truncated = Rc::new(Cell::new(do_truncate));
+    let rendered = Rc::new(Cell::new(false));
+
+    let head_runs: Rc<Vec<AnsiTextRun>> = if do_truncate {
+        let head_chars = ansi::char_offset_after_lines(&runs, truncate_lines);
+        Rc::new(ansi::truncate_runs(&runs, head_chars))
+    } else {
+        runs.clone()
+    };
+
     let mut output_view: Option<gtk::TextView> = None;
     let mut show_more: Option<gtk::Button> = None;
-    if !plain_output.is_empty() {
-        let max_lines = ctx.config.borrow().max_collapsed_output_lines as usize;
-        let total_lines = ansi::count_lines(&runs);
-        if max_lines > 0 && total_lines > max_lines {
-            let head_chars = ansi::char_offset_after_lines(&runs, max_lines);
-            let head_runs = ansi::truncate_runs(&runs, head_chars);
-            let view = ansi_output_view(&head_runs, "block-output-view");
-            outer.append(&view);
+    if has_output {
+        let view = gtk::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .build();
+        view.add_css_class("block-output-view");
+        url::attach_url_handlers(&view);
+        view.set_visible(!collapsed.get());
+        // Render eagerly unless this block starts collapsed (lazy/no-output);
+        // collapsed blocks render on first expand.
+        if !collapsed.get() {
+            render_block_output(&view, &head_runs, &runs, truncated.get(), &error_offsets_rc, &err_bg);
+            rendered.set(true);
+        }
+        outer.append(&view);
 
-            let hidden = total_lines - max_lines;
+        if do_truncate {
+            let hidden = total_lines - truncate_lines;
             let btn = gtk::Button::with_label(&format!("▼ show {hidden} more lines"));
             btn.add_css_class("block-show-more");
             btn.set_halign(gtk::Align::Start);
+            btn.set_visible(!collapsed.get());
             {
-                let full = runs.clone();
                 let view = view.clone();
+                let head_runs = head_runs.clone();
+                let full = runs.clone();
+                let truncated = truncated.clone();
+                let errors = error_offsets_rc.clone();
+                let err_bg = err_bg.clone();
                 btn.connect_clicked(move |btn| {
-                    render_ansi_runs(&view, &full);
-                    btn.set_visible(false);
+                    let now_truncated = !truncated.get();
+                    truncated.set(now_truncated);
+                    render_block_output(&view, &head_runs, &full, now_truncated, &errors, &err_bg);
+                    let label = if now_truncated {
+                        format!("▼ show {hidden} more lines")
+                    } else {
+                        "▲ show less".to_string()
+                    };
+                    btn.set_label(&label);
                 });
             }
             outer.append(&btn);
-            output_view = Some(view);
             show_more = Some(btn);
-        } else {
-            let view = ansi_output_view(&runs, "block-output-view");
-            outer.append(&view);
-            output_view = Some(view);
         }
+        output_view = Some(view);
     }
 
-    // Wire the collapse chevron to toggle the output area. Blocks with no output
-    // start collapsed (chevron pointing right), matching jterm4.
-    let has_output = output_view.is_some();
+    // Wire the collapse chevron to toggle the output area. Blocks that start
+    // collapsed (no output / lazy) render their content on first expand.
     {
         let output_view = output_view.clone();
         let show_more = show_more.clone();
+        let collapsed = collapsed.clone();
+        let rendered = rendered.clone();
+        let truncated = truncated.clone();
+        let head_runs = head_runs.clone();
+        let full = runs.clone();
+        let errors = error_offsets_rc.clone();
+        let err_bg = err_bg.clone();
+        let do_truncate_c = do_truncate;
         collapse_btn.connect_clicked(move |btn| {
-            let collapsed = btn.label().map(|l| l == "\u{f054}").unwrap_or(false);
-            let show = collapsed;
+            let now_collapsed = !collapsed.get();
+            collapsed.set(now_collapsed);
+            if !now_collapsed && !rendered.get() {
+                if let Some(v) = &output_view {
+                    render_block_output(v, &head_runs, &full, truncated.get(), &errors, &err_bg);
+                }
+                rendered.set(true);
+            }
             if let Some(v) = &output_view {
-                v.set_visible(show);
+                v.set_visible(!now_collapsed);
             }
             if let Some(b) = &show_more {
-                b.set_visible(show);
+                b.set_visible(!now_collapsed && do_truncate_c);
             }
-            btn.set_label(if show { "\u{f078}" } else { "\u{f054}" });
+            btn.set_label(if now_collapsed { "\u{f054}" } else { "\u{f078}" });
         });
     }
-    if !has_output {
+    if collapsed.get() {
         collapse_btn.set_label("\u{f054}");
     }
 
@@ -1255,7 +1731,90 @@ fn build_finished_block(
         outer.add_controller(right_click);
     }
 
-    outer
+    let duration_ms = duration.map(|d| d.as_millis() as u64).unwrap_or(0);
+    FinishedBlock {
+        id,
+        widget: outer,
+        command_view,
+        output_view,
+        show_more,
+        full_runs: runs,
+        collapsed,
+        truncated,
+        pinned,
+        error_offsets,
+        error_idx: Cell::new(0),
+        pin_icon: pin_icon_ret,
+        prompt: prompt.to_string(),
+        command: command.to_string(),
+        plain_output,
+        exit_code,
+        cwd: cwd.to_string(),
+        duration_ms,
+        end_time_ms,
+    }
+}
+
+/// Render the output view with either the truncated head or the full runs, then
+/// re-apply the error-line highlight (offsets that fall outside the rendered text
+/// are skipped).
+fn render_block_output(
+    view: &gtk::TextView,
+    head_runs: &[AnsiTextRun],
+    full_runs: &[AnsiTextRun],
+    truncated: bool,
+    error_offsets: &[i32],
+    err_bg: &str,
+) {
+    let runs = if truncated { head_runs } else { full_runs };
+    render_ansi_runs(view, runs);
+    apply_line_highlight(view, error_offsets, "jterm-error", err_bg);
+}
+
+/// Apply a named background tag from each given char offset to its line end.
+fn apply_line_highlight(view: &gtk::TextView, offsets: &[i32], tag_name: &str, bg: &str) {
+    if offsets.is_empty() {
+        return;
+    }
+    let buffer = view.buffer();
+    let table = buffer.tag_table();
+    let tag = table.lookup(tag_name).unwrap_or_else(|| {
+        let t = gtk::TextTag::builder().name(tag_name).background(bg).build();
+        table.add(&t);
+        t
+    });
+    let char_count = buffer.char_count();
+    for &off in offsets {
+        if off >= char_count {
+            continue;
+        }
+        let start = buffer.iter_at_offset(off);
+        let mut end = start;
+        if !end.ends_line() {
+            end.forward_to_line_end();
+        }
+        buffer.apply_tag(&tag, &start, &end);
+    }
+}
+
+/// Scan plain output for lines that look like errors, returning the char offset
+/// of the start of each such line (for failed-block error highlighting + n/N).
+fn detect_error_offsets(plain: &str) -> Vec<i32> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(error|errors|panic|traceback|fatal|exception|failed|failure)\b")
+            .expect("valid error regex")
+    });
+    let mut offsets = Vec::new();
+    let mut char_off: i32 = 0;
+    for line in plain.split_inclusive('\n') {
+        if re.is_match(line) {
+            offsets.push(char_off);
+        }
+        char_off += line.chars().count() as i32;
+    }
+    offsets
 }
 
 /// Build and pop up the per-block right-click context menu. Uses a plain
@@ -1281,7 +1840,16 @@ fn show_block_menu(ctx: &Rc<Ctx>, id: u64, anchor: &gtk::Box, x: f64, y: f64) {
         btn
     };
 
-    let items: [(&str, fn(&Rc<Ctx>, u64)); 4] = [
+    let is_pinned = ctx
+        .finished
+        .borrow()
+        .iter()
+        .find(|b| b.id == id)
+        .map(|b| b.pinned)
+        .unwrap_or(false);
+    let pin_label = if is_pinned { "Unpin Block" } else { "Pin Block" };
+    let items: [(&str, fn(&Rc<Ctx>, u64)); 5] = [
+        (pin_label, toggle_pin),
         ("Copy Block", copy_block_by_id),
         ("Export as JSON", export_block_json),
         ("Export as Markdown", export_block_markdown),
@@ -1301,6 +1869,58 @@ fn show_block_menu(ctx: &Rc<Ctx>, id: u64, anchor: &gtk::Box, x: f64, y: f64) {
     popover.set_child(Some(&vbox));
     popover.connect_closed(|p| p.unparent());
     popover.popup();
+}
+
+/// Toggle a block's pinned state: update its widget styling + pin glyph, keep it
+/// visible if the current filter would hide it, and persist the change.
+fn toggle_pin(ctx: &Rc<Ctx>, id: u64) {
+    let mut changed: Option<(String, Option<u64>, bool)> = None;
+    {
+        let mut finished = ctx.finished.borrow_mut();
+        if let Some(b) = finished.iter_mut().find(|b| b.id == id) {
+            b.pinned = !b.pinned;
+            if b.pinned {
+                b.widget.add_css_class("block-pinned");
+            } else {
+                b.widget.remove_css_class("block-pinned");
+            }
+            b.pin_icon.set_visible(b.pinned);
+            b.widget.set_visible(passes_filter(ctx.filter.get(), b));
+            changed = Some((b.command.clone(), b.end_time_ms, b.pinned));
+        }
+    }
+    if let Some((command, end_time_ms, pinned)) = changed {
+        update_history_pin(ctx, &command, end_time_ms, pinned);
+    }
+}
+
+/// Rewrite the persisted history file to reflect a pin toggle, matching the
+/// record by command + end time. No-op when no history file is configured.
+fn update_history_pin(ctx: &Rc<Ctx>, command: &str, end_time_ms: Option<u64>, pinned: bool) {
+    let Some(path) = ctx.config.borrow().block_history_path.clone() else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut out = String::with_capacity(content.len());
+    for line in content.lines() {
+        match serde_json::from_str::<HistoryRecord>(line) {
+            Ok(mut rec) if rec.command == command && rec.end_time_ms == end_time_ms => {
+                rec.pinned = pinned;
+                if let Ok(s) = serde_json::to_string(&rec) {
+                    out.push_str(&s);
+                } else {
+                    out.push_str(line);
+                }
+            }
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    if let Err(err) = std::fs::write(&path, out) {
+        log::warn!("Failed to persist pin state to {path}: {err}");
+    }
 }
 
 /// Copy a finished block (prompt + command + output) to the clipboard.
@@ -1758,6 +2378,30 @@ fn install_block_css(config: &Config) {
             transition: background-color 120ms ease;
         }}
         .block-show-more:hover {{ background-color: rgba({acc_r},{acc_g},{acc_b},0.18); }}
+        .block-pinned {{
+            border-left-color: {accent};
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.06);
+        }}
+        .block-pin-icon {{
+            color: {accent};
+            font-family: "{font_family}";
+            font-size: 0.82em;
+            margin-left: 6px;
+        }}
+        .block-sticky-header {{
+            background-color: rgba({bg_r},{bg_g},{bg_b},0.92);
+            border-bottom: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
+            border-left: 3px solid {accent};
+            padding: 4px 12px;
+            margin: 0;
+        }}
+        .block-sticky-header.sticky-bad {{ border-left-color: {err_stripe}; }}
+        .block-sticky-header.sticky-ok {{ border-left-color: {ok_stripe}; }}
+        .block-sticky-label {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+        }}
         "#,
     );
 

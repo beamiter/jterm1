@@ -321,9 +321,10 @@ pub enum VteInput {
     ScrollLines(i32),
     ApplyTheme,
     Kill,
-    /// Block-view only: show only failed / only slow / all finished blocks.
+    /// Block-view only: show only failed / only slow / only pinned / all blocks.
     FilterFailedBlocks,
     FilterSlowBlocks,
+    FilterPinnedBlocks,
     ClearBlockFilter,
     /// Search: set the query and jump to the first match. `use_regex` treats the
     /// query as a regex; otherwise it is matched literally (case-insensitive).
@@ -341,6 +342,10 @@ pub enum VteOutput {
     TitleChanged(String),
     Activity,
     Focused,
+    /// A command finished while the user wasn't looking (tab inactive or
+    /// scrolled away from the bottom). `true` = success, `false` = failure.
+    /// Only emitted by BlockTerminal.
+    CommandFinished(bool),
 }
 
 pub struct VteTerminal {
@@ -519,6 +524,7 @@ impl Component for VteTerminal {
             // Block-view only; no-op for the bare VTE backend.
             VteInput::FilterFailedBlocks
             | VteInput::FilterSlowBlocks
+            | VteInput::FilterPinnedBlocks
             | VteInput::ClearBlockFilter => {}
             VteInput::SearchSet(query, use_regex) => {
                 let pattern = if use_regex {

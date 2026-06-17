@@ -23,8 +23,7 @@ pub(crate) fn visible_vte_text(vte: &Terminal) -> String {
     }
     use gtk4::prelude::{AdjustmentExt, ScrollableExt};
     let adj = vte.vadjustment().expect("vte has vadjustment");
-    let (av, al, au, ap) = (adj.value(), adj.lower(), adj.upper(), adj.page_size());
-    let top = av.floor() as i64;
+    let top = adj.value().floor() as i64;
     let (text0, _) = vte.text_range_format(
         vte4::Format::Text,
         0,
@@ -41,12 +40,6 @@ pub(crate) fn visible_vte_text(vte: &Terminal) -> String {
         cols.saturating_sub(1),
     );
     let s1 = text1.map(|s| s.to_string()).unwrap_or_default();
-    eprintln!(
-        "[altdbg] visible: adj(val={} low={} up={} page={}) top={} | s0={}ch nonblank={} | s1@top={}ch nonblank={}",
-        av, al, au, ap, top,
-        s0.len(), s0.chars().filter(|c| !c.is_whitespace()).count(),
-        s1.len(), s1.chars().filter(|c| !c.is_whitespace()).count(),
-    );
     if s0.chars().any(|c| !c.is_whitespace()) {
         s0
     } else {
@@ -158,21 +151,15 @@ pub(crate) fn record_pager_snapshot(
     let raw = visible_vte_text(vte);
     let snapshot = normalize_pager_snapshot(&raw);
     if snapshot.is_empty() {
-        let sample: String = raw.chars().take(120).collect();
-        eprintln!("[altdbg] record: EMPTY after normalize (raw {} chars, rows={} cols={}): {:?}",
-            raw.len(), vte.row_count(), vte.column_count(), sample);
         return;
     }
     if pre_clear.borrow().as_str() == snapshot {
-        eprintln!("[altdbg] record: SUPPRESSED (== pre_clear)");
         return;
     }
     let mut snapshots = snapshots.borrow_mut();
     if snapshots.last().map(|last| last == &snapshot).unwrap_or(false) {
-        eprintln!("[altdbg] record: SUPPRESSED (dup of last)");
         return;
     }
-    eprintln!("[altdbg] record: PUSH frame ({} lines):\n---\n{}\n---", snapshot.lines().count(), snapshot);
     snapshots.push(snapshot);
     pre_clear.borrow_mut().clear();
 }
@@ -200,10 +187,7 @@ pub(crate) fn schedule_pager_snapshot(
 /// Take all captured frames and return the merged document, clearing the buffer.
 pub(crate) fn drain_pager_snapshots(snapshots: &Rc<RefCell<Vec<String>>>) -> String {
     let pages = std::mem::take(&mut *snapshots.borrow_mut());
-    eprintln!("[altdbg] drain: {} pages", pages.len());
-    let merged = merge_pager_snapshots(pages);
-    eprintln!("[altdbg] drain: merged {} lines", merged.lines().count());
-    merged
+    merge_pager_snapshots(pages)
 }
 
 #[cfg(test)]

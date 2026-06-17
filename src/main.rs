@@ -232,6 +232,10 @@ fn create_pane(
         VteOutput::Bell => AppMsg::Bell(tab_id),
         VteOutput::Activity => AppMsg::Activity(tab_id),
         VteOutput::Focused => AppMsg::PaneFocused(tab_id, pane_id),
+        // Slow command finished while unattended: failure draws the bell
+        // (attention) style, success the lighter activity style.
+        VteOutput::CommandFinished(true) => AppMsg::Activity(tab_id),
+        VteOutput::CommandFinished(false) => AppMsg::Bell(tab_id),
     };
     let terminal = match mode {
         TerminalMode::Block => TermCtl::Block(
@@ -1420,6 +1424,11 @@ impl AppModel {
             Action::FilterSlowBlocks => {
                 if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::FilterSlowBlocks);
+                }
+            }
+            Action::FilterPinnedBlocks => {
+                if let Some(t) = self.active_terminal() {
+                    t.emit(VteInput::FilterPinnedBlocks);
                 }
             }
             Action::ClearBlockFilter => {

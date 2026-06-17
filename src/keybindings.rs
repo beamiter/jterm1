@@ -50,6 +50,7 @@ pub(crate) enum Action {
     ToggleTabPlacement,
     FilterFailedBlocks,
     FilterSlowBlocks,
+    FilterPinnedBlocks,
     ClearBlockFilter,
     ToggleDebugDashboard,
 }
@@ -112,6 +113,7 @@ impl Action {
             Action::ToggleTabPlacement => "Toggle tab placement (sidebar/top)",
             Action::FilterFailedBlocks => "Filter failed blocks",
             Action::FilterSlowBlocks => "Filter slow blocks",
+            Action::FilterPinnedBlocks => "Filter pinned blocks",
             Action::ClearBlockFilter => "Clear block filter",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
         }
@@ -163,6 +165,7 @@ impl Action {
             Action::ToggleTabPlacement => Some("toggle_tab_placement"),
             Action::FilterFailedBlocks => Some("filter_failed_blocks"),
             Action::FilterSlowBlocks => Some("filter_slow_blocks"),
+            Action::FilterPinnedBlocks => Some("filter_pinned_blocks"),
             Action::ClearBlockFilter => Some("clear_block_filter"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
         }
@@ -212,6 +215,7 @@ impl Action {
             Action::ToggleTabPlacement,
             Action::FilterFailedBlocks,
             Action::FilterSlowBlocks,
+            Action::FilterPinnedBlocks,
             Action::ClearBlockFilter,
             Action::ToggleDebugDashboard,
         ]
@@ -408,6 +412,7 @@ impl KeybindingMap {
         bind("Ctrl+Shift+L", Action::FilterTabs);
         bind("Ctrl+Shift+X", Action::FilterFailedBlocks);
         bind("Ctrl+Shift+S", Action::FilterSlowBlocks);
+        bind("Ctrl+Shift+M", Action::FilterPinnedBlocks);
         bind("Ctrl+Shift+N", Action::ClearBlockFilter);
         bind("Ctrl+Shift+E", Action::SplitHorizontal);
         bind("Ctrl+Shift+D", Action::SplitVertical);
