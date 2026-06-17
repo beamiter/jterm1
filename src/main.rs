@@ -2456,6 +2456,38 @@ impl SimpleComponent for AppModel {
 }
 
 fn main() {
+    init_input_method_env();
     let app = RelmApp::new("app.jterm1");
     app.run::<AppModel>(());
+}
+
+/// Make the fcitx5 GTK4 input-method module discoverable before GTK initializes,
+/// so CJK (Chinese) preedit/commit works even when the binary is launched
+/// outside the nix dev shell.
+///
+/// The flake bakes the module directory into `FCITX5_GTK_PATH` at build time. The
+/// nix-built GTK4 only searches its own store path plus `GTK_PATH`, so without
+/// re-exporting that directory it never finds `libim-fcitx5.so` and IME silently
+/// falls back to raw keysyms. Each var is only filled in when the environment
+/// hasn't already set it, so an existing (e.g. ibus) setup is left untouched.
+fn init_input_method_env() {
+    let is_unset = |k: &str| std::env::var_os(k).map_or(true, |v| v.is_empty());
+
+    if let Some(fcitx_gtk_path) = option_env!("FCITX5_GTK_PATH") {
+        if !fcitx_gtk_path.is_empty() {
+            let combined = match std::env::var_os("GTK_PATH") {
+                Some(existing) if !existing.is_empty() => {
+                    format!("{fcitx_gtk_path}:{}", existing.to_string_lossy())
+                }
+                _ => fcitx_gtk_path.to_string(),
+            };
+            unsafe { std::env::set_var("GTK_PATH", combined) };
+        }
+    }
+    if is_unset("GTK_IM_MODULE") {
+        unsafe { std::env::set_var("GTK_IM_MODULE", "fcitx") };
+    }
+    if is_unset("XMODIFIERS") {
+        unsafe { std::env::set_var("XMODIFIERS", "@im=fcitx") };
+    }
 }
