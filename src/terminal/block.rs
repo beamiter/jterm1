@@ -306,13 +306,28 @@ impl Component for BlockTerminal {
         // the `commit` signal we forward to our PTY; it has no child PTY of its
         // own, so VTE's own write goes nowhere — only our forward matters.
         let active_vte = super::vte::create_terminal(&init.config.borrow());
-        active_vte.set_vexpand(true);
+        // The active cell's height is driven explicitly via `set_size`/height_request
+        // in `update_active_height`, so the VTE must NOT vexpand — otherwise it (and,
+        // by inherited compute_expand, its holder) would stretch to fill the viewport
+        // and fight the size we set, leaving the cell stuck full-height.
+        active_vte.set_vexpand(false);
         active_vte.set_hexpand(true);
 
+        // NB: the holder must NOT vexpand. block_list fills the viewport, so a
+        // vexpanding holder would eat all leftover space and grow the active cell
+        // to full height whenever content is shorter than the viewport —
+        // overriding its height_request (which is only a minimum). Without
+        // vexpand the holder is sized exactly to its height_request, and the
+        // inner VTE (which keeps vexpand) fills that. Blank space below the active
+        // cell stays part of block_list (warp-style: history stacked at top,
+        // compact input below, empty room beneath).
         let active_holder = gtk::Box::new(Orientation::Vertical, 0);
         active_holder.add_css_class("block-active");
         active_holder.set_hexpand(true);
-        active_holder.set_vexpand(true);
+        // Explicit false (not merely unset): an unset vexpand makes GtkBox inherit
+        // expand from its children, so the holder must pin it off to stay sized to
+        // its content height rather than filling the viewport.
+        active_holder.set_vexpand(false);
         active_holder.append(&active_vte);
         block_list.append(&active_holder);
 
@@ -371,19 +386,26 @@ impl Component for BlockTerminal {
             filter_entry: filter_entry.clone(),
         });
 
-        // Size the active card to its content (warp-style): compact while typing,
-        // growing as a command streams output, full-screen only for alt-screen
-        // apps / no-OSC133 shells. Re-clamp whenever the viewport changes (resize).
-        // `changed` fires after layout with a fresh `upper`, so this is also where
-        // we re-pin to the bottom (keeping the active input cell visible) once the
-        // grown/shrunk content is laid out — the immediate scroll in `autoscroll`
-        // runs against a stale `upper` and would otherwise land short.
+        // `changed` fires during the viewport's size-allocate, after layout, so
+        // `upper`/`page_size` here are final for this frame — the right place to
+        // re-pin to the bottom and keep the active input cell visible. We must NOT
+        // call `update_active_height` (which does `set_height_request`/queue_resize)
+        // on the content path here: queuing a resize from inside size-allocate is
+        // deferred to a later frame, and if the frame clock then idles the pin
+        // never lands (the view only settled after an unrelated relayout such as a
+        // mouse move). Active-cell sizing is driven from `handle_data` instead; we
+        // only re-clamp here when the viewport itself was resized (page_size moved).
         {
             let ctx = ctx.clone();
+            let last_page = Rc::new(Cell::new(0.0f64));
             scroll.vadjustment().connect_changed(move |adj| {
-                update_active_height(&ctx);
+                let page = adj.page_size();
                 if ctx.stick_bottom.get() && !ctx.fullscreen.get() {
-                    adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
+                    adj.set_value((adj.upper() - page).max(adj.lower()));
+                }
+                if (page - last_page.get()).abs() > 0.5 {
+                    last_page.set(page);
+                    update_active_height(&ctx);
                 }
             });
         }
@@ -434,16 +456,9 @@ impl Component for BlockTerminal {
             });
         }
 
-        // Track size changes and resize the PTY accordingly. Also re-pin the
-        // scroll to the bottom each frame while stuck there: the active cell's
-        // height_request resize lands a frame or two after the data arrives, and
-        // the vadjustment `changed` signal can fire against a stale `upper`, so a
-        // per-frame pin is what reliably keeps the active input cell visible
-        // (without it the view only settled after an unrelated relayout, e.g. a
-        // mouse move).
+        // Track size changes and resize the PTY accordingly.
         {
             let pty = pty.clone();
-            let ctx = ctx.clone();
             let last = Rc::new(Cell::new((0i64, 0i64)));
             active_vte.add_tick_callback(move |term, _clock| {
                 let cols = term.column_count();
@@ -451,13 +466,6 @@ impl Component for BlockTerminal {
                 if (cols, rows) != last.get() && cols > 0 && rows > 0 {
                     last.set((cols, rows));
                     pty.resize(cols as u16, rows as u16);
-                }
-                if ctx.stick_bottom.get() && !ctx.fullscreen.get() {
-                    let adj = ctx.scroll.vadjustment();
-                    let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
-                    if (adj.value() - max_val).abs() > 0.5 {
-                        adj.set_value(max_val);
-                    }
                 }
                 glib::ControlFlow::Continue
             });
@@ -1305,10 +1313,10 @@ fn update_active_height(ctx: &Rc<Ctx>) {
     }
     let page_rows = (page_px as i64 / ch).max(1);
 
+    let cols = ctx.active_vte.column_count().max(1);
     let target_rows = if ctx.fullscreen.get() || ctx.state.get() == BlockState::RawFallback {
         page_rows
     } else {
-        let cols = ctx.active_vte.column_count().max(1);
         let cmd_rows = count_wrapped_rows(ctx.typed_cmd.borrow().as_bytes(), cols, page_rows);
         let content = match ctx.state.get() {
             BlockState::CollectingOutput | BlockState::PostCommand => {
@@ -1318,6 +1326,14 @@ fn update_active_height(ctx: &Rc<Ctx>) {
         };
         content.clamp(MIN_ACTIVE_ROWS, page_rows)
     };
+    // Drive the VTE grid directly. `set_height_request` only sets a *minimum*, so
+    // it cannot shrink a VTE whose natural height (row_count * char_height) is
+    // larger — the cell would stay full-height. `set_size` sets the preferred
+    // grid, shrinking the VTE's natural height so the (non-expanding) holder
+    // collapses to it. The PTY-resize tick then follows row_count down/up.
+    if ctx.active_vte.row_count() != target_rows {
+        ctx.active_vte.set_size(cols, target_rows);
+    }
     ctx.active_holder
         .set_height_request((target_rows * ch) as i32);
 }

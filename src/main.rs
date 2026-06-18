@@ -337,6 +337,13 @@ impl AppModel {
         self.next_pane_id += 1;
         let number = self.tabs.len() as u32 + 1;
         let mode = self.config.borrow().terminal_mode;
+        // New tabs inherit the active pane's working directory (matches
+        // DuplicateTab / jterm4), so Ctrl+Shift+T opens where you already are.
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.panes.get(t.active_pane))
+            .and_then(|p| p.cwd.clone());
         let pane = create_pane(
             &self.config,
             &self.shell_argv,
@@ -344,7 +351,7 @@ impl AppModel {
             pane_id,
             mode,
             initial_commands,
-            None,
+            cwd,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
