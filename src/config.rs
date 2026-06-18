@@ -179,6 +179,8 @@ pub struct Config {
     pub(crate) virtual_scroll_margin: u32,
     pub(crate) block_history_path: Option<String>,
     pub(crate) block_history_compress: bool,
+    /// Compact (denser) block-mode spacing, matching Warp's compact density.
+    pub(crate) block_compact: bool,
     pub(crate) editor_input: bool,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
@@ -378,6 +380,7 @@ struct FileConfig {
     virtual_scroll_margin: Option<u32>,
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
+    block_compact: Option<bool>,
     editor_input: Option<bool>,
     remote_hosts: Vec<RemoteHost>,
 }
@@ -422,6 +425,7 @@ fn load_file_config() -> FileConfig {
         virtual_scroll_margin: table.get("virtual_scroll_margin").and_then(|v| v.as_integer()).map(|v| v as u32),
         block_history_path: table.get("block_history_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
         block_history_compress: table.get("block_history_compress").and_then(|v| v.as_bool()),
+        block_compact: table.get("block_compact").and_then(|v| v.as_bool()),
         editor_input: table.get("editor_input").and_then(|v| v.as_bool()),
         remote_hosts,
     }
@@ -560,6 +564,13 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let block_history_path = std::env::var("JTERM1_HISTORY_PATH").ok()
         .or(fc.block_history_path);
     let block_history_compress = fc.block_history_compress.unwrap_or(true);
+    let block_compact = match std::env::var("JTERM1_BLOCK_COMPACT").ok().as_deref() {
+        Some("1") | Some("true") => Some(true),
+        Some("0") | Some("false") => Some(false),
+        _ => None,
+    }
+    .or(fc.block_compact)
+    .unwrap_or(false);
     let shell = std::env::var("JTERM1_SHELL").ok().or(fc.shell);
 
     // Parse terminal mode (default: block)
@@ -606,6 +617,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         virtual_scroll_margin,
         block_history_path,
         block_history_compress,
+        block_compact,
         editor_input: fc.editor_input.unwrap_or(true),
         remote_hosts: fc.remote_hosts,
     };

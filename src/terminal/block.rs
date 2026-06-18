@@ -102,6 +102,8 @@ struct FinishedBlock {
     plain_output: String,
     exit_code: i32,
     cwd: String,
+    /// Git branch captured at command end (header chip), if cwd was in a repo.
+    git_branch: Option<String>,
     duration_ms: u64,
     /// Wall-clock command-end time (ms since epoch), for export parity.
     end_time_ms: Option<u64>,
@@ -128,6 +130,8 @@ struct Ctx {
     active_vte: vte4::Terminal,
     block_list: gtk::Box,
     active_holder: gtk::Box,
+    /// Warp-style prompt chip row above the live input (cwd · git branch).
+    active_prompt: gtk::Box,
     scroll: gtk::ScrolledWindow,
     parser: RefCell<Parser>,
     state: Cell<BlockState>,
@@ -249,8 +253,10 @@ impl Component for BlockTerminal {
         root.set_hexpand(true);
         root.set_vexpand(true);
 
-        // Scroll → viewport → block_list (vertical stack of blocks).
-        let block_list = gtk::Box::new(Orientation::Vertical, 6);
+        // Scroll → viewport → block_list (vertical stack of blocks). Compact density
+        // tightens the inter-block gap to match Warp's compact spacing.
+        let block_gap = if init.config.borrow().block_compact { 2 } else { 6 };
+        let block_list = gtk::Box::new(Orientation::Vertical, block_gap);
         block_list.add_css_class("block-list");
         block_list.set_hexpand(true);
         block_list.set_vexpand(true);
@@ -351,6 +357,11 @@ impl Component for BlockTerminal {
         // expand from its children, so the holder must pin it off to stay sized to
         // its content height rather than filling the viewport.
         active_holder.set_vexpand(false);
+        // Warp-style prompt chip row (cwd · git branch) above the live input.
+        let active_prompt = gtk::Box::new(Orientation::Horizontal, 6);
+        active_prompt.add_css_class("block-active-prompt");
+        active_prompt.set_hexpand(true);
+        active_holder.append(&active_prompt);
         active_holder.append(&active_vte);
         block_list.append(&active_holder);
 
@@ -370,6 +381,7 @@ impl Component for BlockTerminal {
             active_vte: active_vte.clone(),
             block_list: block_list.clone(),
             active_holder: active_holder.clone(),
+            active_prompt: active_prompt.clone(),
             scroll: scroll.clone(),
             parser: RefCell::new(Parser::new()),
             state: Cell::new(BlockState::Idle),
@@ -514,6 +526,7 @@ impl Component for BlockTerminal {
         // Restore previously-persisted finished blocks (if history is configured).
         load_block_history(&ctx);
         rebuild_minimap(&ctx);
+        update_active_prompt(&ctx);
 
         // Live command filter: typing narrows the block list by command substring.
         {
@@ -1305,6 +1318,7 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
         }
         ParserEvent::CwdUpdate(path) => {
             *ctx.cwd.borrow_mut() = path.clone();
+            update_active_prompt(ctx);
             let _ = sender.output(VteOutput::CwdChanged(path));
         }
         ParserEvent::AltScreenEnter => {
@@ -1616,11 +1630,13 @@ fn finalize_block(ctx: &Rc<Ctx>) {
     let prompt = ctx.prompt.borrow().clone();
     let duration = ctx.duration.get();
     let end_time_ms = ctx.end_time_ms.get();
+    let git_branch = git_branch(&cwd);
     let id = ctx.next_block_id.get();
     ctx.next_block_id.set(id + 1);
 
     let meta = build_finished_block(
-        ctx, id, &prompt, &command, &output, exit_code, &cwd, duration, end_time_ms, false,
+        ctx, id, &prompt, &command, &output, exit_code, &cwd, git_branch.as_deref(),
+        duration, end_time_ms, false,
     );
     let widget = meta.widget.clone();
     let duration_ms = meta.duration_ms;
@@ -1631,7 +1647,7 @@ fn finalize_block(ctx: &Rc<Ctx>) {
     widget.set_visible(block_visible(ctx, &meta));
     ctx.finished.borrow_mut().push(meta);
 
-    append_block_history(ctx, &prompt, &command, &output, exit_code, &cwd, duration_ms, end_time_ms, false);
+    append_block_history(ctx, &prompt, &command, &output, exit_code, &cwd, duration_ms, end_time_ms, false, git_branch.as_deref());
 
     let new_idx = ctx.finished.borrow().len() - 1;
     pulse_block(ctx, new_idx, exit_code == 0);
@@ -1664,6 +1680,8 @@ struct HistoryRecord {
     end_time_ms: Option<u64>,
     #[serde(default)]
     pinned: bool,
+    #[serde(default)]
+    git_branch: Option<String>,
 }
 
 /// Export shape mirroring jterm4's `BlockData` (field names + order), so the
@@ -1746,6 +1764,7 @@ fn append_block_history(
     duration_ms: u64,
     end_time_ms: Option<u64>,
     pinned: bool,
+    git_branch: Option<&str>,
 ) {
     let Some(path) = ctx.config.borrow().block_history_path.clone() else {
         return;
@@ -1759,6 +1778,7 @@ fn append_block_history(
         duration_ms,
         end_time_ms,
         pinned,
+        git_branch: git_branch.map(|s| s.to_string()),
     };
     let Ok(line) = serde_json::to_string(&record) else {
         return;
@@ -1847,6 +1867,7 @@ fn load_block_history(ctx: &Rc<Ctx>) {
             &rec.output,
             rec.exit_code,
             &rec.cwd,
+            rec.git_branch.as_deref(),
             duration,
             rec.end_time_ms,
             rec.pinned,
@@ -2089,6 +2110,7 @@ fn build_finished_block(
     output: &str,
     exit_code: i32,
     cwd: &str,
+    git_branch: Option<&str>,
     duration: Option<Duration>,
     end_time_ms: Option<u64>,
     pinned: bool,
@@ -2145,12 +2167,11 @@ fn build_finished_block(
     header.append(&pin_icon);
     let pin_icon_ret = pin_icon.clone();
 
-    let cwd_label = gtk::Label::new(Some(&shorten_path(cwd)));
-    cwd_label.add_css_class("block-header-label");
-    cwd_label.add_css_class("block-cwd-label");
-    cwd_label.set_xalign(0.0);
-    cwd_label.set_tooltip_text(Some("Click to cd here"));
+    // Context chips (Warp-style): cwd · git branch · venv. The cwd chip stays
+    // clickable to `cd` back into that directory.
     if !cwd.is_empty() {
+        let cwd_chip = make_chip(&shorten_path(cwd), Some("\u{f07c}"), "block-chip-cwd");
+        cwd_chip.set_tooltip_text(Some("Click to cd here"));
         let click = gtk::GestureClick::new();
         let ctx_cd = ctx.clone();
         let cwd_owned = cwd.to_string();
@@ -2160,9 +2181,21 @@ fn build_finished_block(
                 .pty
                 .write_bytes(format!("cd {}\r", shell_quote(&cwd_owned)).as_bytes());
         });
-        cwd_label.add_controller(click);
+        cwd_chip.add_controller(click);
+        header.append(&cwd_chip);
     }
-    header.append(&cwd_label);
+
+    if let Some(branch) = git_branch {
+        // Nerd Font git-branch glyph .
+        let git_chip = make_chip(branch, Some("\u{e0a0}"), "block-chip-git");
+        header.append(&git_chip);
+    }
+
+    if let Some(venv) = venv_name(prompt) {
+        // Nerd Font python glyph .
+        let venv_chip = make_chip(&venv, Some("\u{e73c}"), "block-chip-venv");
+        header.append(&venv_chip);
+    }
 
     let spacer = gtk::Box::new(Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
@@ -2191,75 +2224,62 @@ fn build_finished_block(
         header.append(&exit_badge);
     }
 
-    // Action buttons: copy command, copy output, rerun. Hidden until the block
-    // is hovered. Nerd Font glyphs: copy (), clipboard (), refresh ().
+    // Warp-style toolbelt: a hover-revealed icon cluster anchored at the right of
+    // the header. Four icons — bookmark, copy, rerun, overflow (⋯). Granular copy
+    // / recall / error-report actions live in the overflow menu (show_block_menu).
     let action_box = gtk::Box::new(Orientation::Horizontal, 2);
+    action_box.add_css_class("block-toolbelt");
     action_box.set_visible(false);
 
-    let copy_cmd = gtk::Button::with_label("\u{f0c5}");
-    copy_cmd.add_css_class("block-action-btn");
-    copy_cmd.add_css_class("flat");
-    copy_cmd.set_tooltip_text(Some("Copy command"));
+    // Bookmark (Nerd Font thumbtack ): toggles the pinned state. The persistent
+    // pinned indicator is the header pin_icon; this is the toggle control.
+    let bookmark = gtk::Button::with_label("\u{f08d}");
+    bookmark.add_css_class("block-action-btn");
+    bookmark.add_css_class("flat");
+    bookmark.set_tooltip_text(Some("Bookmark (pin) block"));
     {
-        let cmd = command.to_string();
-        copy_cmd.connect_clicked(move |_| set_clipboard(&cmd));
+        let ctx = ctx.clone();
+        bookmark.connect_clicked(move |_| toggle_pin(&ctx, id));
     }
-    action_box.append(&copy_cmd);
+    action_box.append(&bookmark);
 
-    let copy_out = gtk::Button::with_label("\u{f0ea}");
-    copy_out.add_css_class("block-action-btn");
-    copy_out.add_css_class("flat");
-    copy_out.set_tooltip_text(Some("Copy output"));
+    // Copy whole block (command + output). Nerd Font copy ().
+    let copy_btn = gtk::Button::with_label("\u{f0c5}");
+    copy_btn.add_css_class("block-action-btn");
+    copy_btn.add_css_class("flat");
+    copy_btn.set_tooltip_text(Some("Copy command + output"));
     {
-        let out = plain_output.clone();
-        copy_out.connect_clicked(move |_| set_clipboard(&out));
+        let ctx = ctx.clone();
+        copy_btn.connect_clicked(move |_| copy_block_by_id(&ctx, id));
     }
-    action_box.append(&copy_out);
+    action_box.append(&copy_btn);
 
+    // Rerun the command. Nerd Font refresh ().
     let rerun = gtk::Button::with_label("\u{f021}");
     rerun.add_css_class("block-action-btn");
     rerun.add_css_class("flat");
     rerun.set_tooltip_text(Some("Rerun command"));
     {
-        let pty = ctx.pty.clone();
-        let cmd = command.to_string();
-        rerun.connect_clicked(move |_| {
-            pty.write_bytes(format!("{cmd}\r").as_bytes());
-        });
+        let ctx = ctx.clone();
+        rerun.connect_clicked(move |_| rerun_block_by_id(&ctx, id));
     }
     action_box.append(&rerun);
 
-    // Recall: load the command into the live input line (Ctrl+U to clear, then
-    // type it) without running it, so it can be edited first. Nerd Font pencil ().
-    let recall = gtk::Button::with_label("\u{f044}");
-    recall.add_css_class("block-action-btn");
-    recall.add_css_class("flat");
-    recall.set_tooltip_text(Some("Recall command into input"));
+    // Overflow (⋯): the full context menu (recall, granular copy, error report,
+    // export, delete). Nerd Font ellipsis ().
+    let overflow = gtk::Button::with_label("\u{f142}");
+    overflow.add_css_class("block-action-btn");
+    overflow.add_css_class("flat");
+    overflow.set_tooltip_text(Some("More actions"));
     {
         let ctx = ctx.clone();
-        let cmd = command.to_string();
-        recall.connect_clicked(move |_| {
-            ctx.pty.write_bytes(b"\x15");
-            ctx.pty.write_bytes(cmd.as_bytes());
-            ctx.typed_cmd.borrow_mut().clear();
+        let anchor = action_box.clone();
+        overflow.connect_clicked(move |btn| {
+            let _ = btn;
+            show_block_menu(&ctx, id, &anchor, 0.0, 24.0);
         });
     }
-    action_box.append(&recall);
-
-    // Copy error report (failed blocks only): command + exit code + error lines,
-    // formatted for pasting into an AI assistant or bug report. Nerd Font bug ().
-    if exit_code != 0 {
-        let copy_err = gtk::Button::with_label("\u{f188}");
-        copy_err.add_css_class("block-action-btn");
-        copy_err.add_css_class("block-action-err");
-        copy_err.add_css_class("flat");
-        copy_err.set_tooltip_text(Some("Copy error report"));
-        {
-            let report = build_error_report(command, cwd, exit_code, &plain_output);
-            copy_err.connect_clicked(move |_| set_clipboard(&report));
-        }
-        action_box.append(&copy_err);
-    }
+    action_box.append(&overflow);
 
     header.append(&action_box);
 
@@ -2272,7 +2292,7 @@ fn build_finished_block(
 
     outer.append(&header);
 
-    // Reveal action buttons + highlight on hover.
+    // Reveal the toolbelt + highlight on hover.
     let hover = gtk::EventControllerMotion::new();
     {
         let outer = outer.clone();
@@ -2444,6 +2464,7 @@ fn build_finished_block(
         plain_output,
         exit_code,
         cwd: cwd.to_string(),
+        git_branch: git_branch.map(|s| s.to_string()),
         duration_ms,
         end_time_ms,
     }
@@ -2543,8 +2564,12 @@ fn show_block_menu(ctx: &Rc<Ctx>, id: u64, anchor: &gtk::Box, x: f64, y: f64) {
         .unwrap_or((false, false));
     let pin_label = if is_pinned { "Unpin Block" } else { "Pin Block" };
     let mut items: Vec<(&str, fn(&Rc<Ctx>, u64))> = vec![
+        ("Recall Command", recall_block_by_id),
+        ("Rerun Command", rerun_block_by_id),
         (pin_label, toggle_pin),
         ("Copy Block", copy_block_by_id),
+        ("Copy Command", copy_command_by_id),
+        ("Copy Output", copy_output_by_id),
     ];
     if is_failed {
         items.push(("Copy Error Report", copy_error_report_by_id));
@@ -2626,6 +2651,47 @@ fn update_history_pin(ctx: &Rc<Ctx>, command: &str, end_time_ms: Option<u64>, pi
 fn copy_block_by_id(ctx: &Rc<Ctx>, id: u64) {
     if let Some(b) = ctx.finished.borrow().iter().find(|b| b.id == id) {
         set_clipboard(&format!("{}\n{}\n{}", b.prompt, b.command, b.plain_output));
+    }
+}
+
+fn copy_command_by_id(ctx: &Rc<Ctx>, id: u64) {
+    if let Some(b) = ctx.finished.borrow().iter().find(|b| b.id == id) {
+        set_clipboard(&b.command);
+    }
+}
+
+fn copy_output_by_id(ctx: &Rc<Ctx>, id: u64) {
+    if let Some(b) = ctx.finished.borrow().iter().find(|b| b.id == id) {
+        set_clipboard(&b.plain_output);
+    }
+}
+
+/// Load a finished block's command into the live input line (clear with Ctrl+U,
+/// then type it) without running it, so it can be edited first.
+fn recall_block_by_id(ctx: &Rc<Ctx>, id: u64) {
+    let cmd = ctx
+        .finished
+        .borrow()
+        .iter()
+        .find(|b| b.id == id)
+        .map(|b| b.command.clone());
+    if let Some(cmd) = cmd {
+        ctx.pty.write_bytes(b"\x15");
+        ctx.pty.write_bytes(cmd.as_bytes());
+        ctx.typed_cmd.borrow_mut().clear();
+    }
+}
+
+/// Re-run a finished block's command immediately.
+fn rerun_block_by_id(ctx: &Rc<Ctx>, id: u64) {
+    let cmd = ctx
+        .finished
+        .borrow()
+        .iter()
+        .find(|b| b.id == id)
+        .map(|b| b.command.clone());
+    if let Some(cmd) = cmd {
+        ctx.pty.write_bytes(format!("{cmd}\r").as_bytes());
     }
 }
 
@@ -2869,6 +2935,102 @@ fn shorten_path(path: &str) -> String {
     } else {
         format!("…/{}", parts[parts.len() - 2..].join("/"))
     }
+}
+
+/// A Warp-style header pill: an optional Nerd Font icon glyph + text, wrapped in a
+/// rounded `.block-chip` box. The caller adds further css classes / click gestures.
+fn make_chip(text: &str, icon: Option<&str>, css_class: &str) -> gtk::Box {
+    let chip = gtk::Box::new(Orientation::Horizontal, 4);
+    chip.add_css_class("block-chip");
+    chip.add_css_class(css_class);
+    if let Some(glyph) = icon {
+        let i = gtk::Label::new(Some(glyph));
+        i.add_css_class("block-chip-icon");
+        chip.append(&i);
+    }
+    let lbl = gtk::Label::new(Some(text));
+    lbl.add_css_class("block-chip-text");
+    lbl.set_xalign(0.0);
+    lbl.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    chip.append(&lbl);
+    chip
+}
+
+/// Rebuild the live input's prompt chip row (cwd · git branch) from the current
+/// cwd. Called at init and whenever the shell reports a new cwd (OSC 7).
+fn update_active_prompt(ctx: &Rc<Ctx>) {
+    while let Some(child) = ctx.active_prompt.first_child() {
+        ctx.active_prompt.remove(&child);
+    }
+    let cwd = ctx.cwd.borrow().clone();
+    if cwd.is_empty() {
+        ctx.active_prompt.set_visible(false);
+        return;
+    }
+    ctx.active_prompt
+        .append(&make_chip(&shorten_path(&cwd), Some("\u{f07c}"), "block-chip-cwd"));
+    if let Some(branch) = git_branch(&cwd) {
+        ctx.active_prompt
+            .append(&make_chip(&branch, Some("\u{e0a0}"), "block-chip-git"));
+    }
+    ctx.active_prompt.set_visible(true);
+}
+
+/// Best-effort current git branch for `cwd`: walk up to the repo root, resolve the
+/// `.git` directory (handling the `gitdir:` pointer file used by worktrees/submodules),
+/// then read `HEAD`. Returns the branch name, or a short SHA for a detached HEAD.
+/// `None` on any failure (not a repo, unreadable, etc.) — Warp shows the branch as a
+/// header chip; we derive it locally since jterm1 has no Warp-style shell hooks.
+fn git_branch(cwd: &str) -> Option<String> {
+    if cwd.is_empty() {
+        return None;
+    }
+    let mut dir = std::path::PathBuf::from(cwd);
+    let git_dir = loop {
+        let candidate = dir.join(".git");
+        if candidate.is_dir() {
+            break candidate;
+        }
+        if candidate.is_file() {
+            // `.git` file: "gitdir: <path>" pointer (worktrees/submodules).
+            let contents = std::fs::read_to_string(&candidate).ok()?;
+            let target = contents.strip_prefix("gitdir:")?.trim();
+            let target_path = std::path::Path::new(target);
+            break if target_path.is_absolute() {
+                target_path.to_path_buf()
+            } else {
+                dir.join(target_path)
+            };
+        }
+        if !dir.pop() {
+            return None;
+        }
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(rest) = head.strip_prefix("ref:") {
+        // "ref: refs/heads/<branch>" → last path component.
+        rest.trim().rsplit('/').next().map(|s| s.to_string())
+    } else if head.len() >= 7 {
+        // Detached HEAD: a raw commit SHA.
+        Some(head[..7].to_string())
+    } else {
+        None
+    }
+}
+
+/// Best-effort virtual-env / conda name parsed from a leading `(name)` in the
+/// captured prompt. jterm1 lacks Warp's shell hooks for `VIRTUAL_ENV`/`CONDA_*`,
+/// so this scrapes the common prompt prefix. `None` when no such prefix is present.
+fn venv_name(prompt: &str) -> Option<String> {
+    let p = prompt.trim_start();
+    let rest = p.strip_prefix('(')?;
+    let close = rest.find(')')?;
+    let name = rest[..close].trim();
+    if name.is_empty() || name.contains(char::is_whitespace) || name.len() > 40 {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 // ─── UX helpers (badges, minimap, toasts, pulses, relative time) ────────────
@@ -3203,24 +3365,44 @@ fn install_block_css(config: &Config) {
     let scaled_size = (base_size as f64 * config.default_font_scale).round().max(1.0) as i32;
     let font_size = format!("{}pt", scaled_size);
 
+    // Failed blocks get a full-block red tint (Warp tints failed blocks ~10%).
+    let failed_bg = format!("rgba({err_r},{err_g},{err_b},0.09)");
+
+    // Density-dependent spacing (Warp normal vs compact). 16px left padding mirrors
+    // Warp's PADDING_LEFT.
+    let compact = config.block_compact;
+    let fin_margin = if compact { "1px 8px" } else { "4px 8px" };
+    let active_margin = if compact { "2px 8px" } else { "6px 8px" };
+    let active_pad_v = if compact { "1px" } else { "4px" };
+    let hdr_pad = if compact { "1px 8px" } else { "3px 8px" };
+    let cmd_pad = if compact { "0 16px" } else { "2px 16px 0 16px" };
+    let out_pad = if compact { "0 16px 2px 16px" } else { "0 16px 4px 16px" };
+    let prompt_pad = if compact { "1px 16px 0 16px" } else { "2px 16px 0 16px" };
+
     let css = format!(
         r#"
         .block-scroll {{ background-color: {bg_hex}; }}
         .block-list {{ background-color: {bg_hex}; }}
         .block-finished {{
             border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.08);
-            border-left: 3px solid transparent;
+            border-left: 5px solid transparent;
             border-radius: 10px;
             background-color: {block_bg_hex};
-            margin: 4px 8px;
+            margin: {fin_margin};
             min-height: 40px;
             transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
         }}
         .block-success {{ border-left-color: {ok_stripe}; }}
-        .block-failed {{ border-left-color: {err_stripe}; }}
+        .block-failed {{
+            border-left-color: {err_hex};
+            background-color: {failed_bg};
+        }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
             box-shadow: 0 4px 14px rgba(0,0,0,0.22);
+        }}
+        .block-failed.block-hovered {{
+            background-color: rgba({err_r},{err_g},{err_b},0.14);
         }}
         .block-selected {{
             border-color: {accent};
@@ -3228,11 +3410,11 @@ fn install_block_css(config: &Config) {
         }}
         .block-active {{
             border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.22);
-            border-left: 3px solid {accent};
+            border-left: 5px solid {accent};
             border-radius: 10px;
-            margin: 6px 8px;
-            padding-top: 4px;
-            padding-bottom: 4px;
+            margin: {active_margin};
+            padding-top: {active_pad_v};
+            padding-bottom: {active_pad_v};
             background-color: {block_bg_hex};
             min-height: 40px;
             transition: box-shadow 140ms ease, border-color 140ms ease;
@@ -3289,27 +3471,55 @@ fn install_block_css(config: &Config) {
         }}
         .block-header {{
             border-radius: 6px 6px 0 0;
-            padding: 2px 6px;
+            padding: {hdr_pad};
         }}
         .block-header-label {{ color: {dim_fg}; font-size: 0.85em; }}
         .block-cwd-label:hover {{ color: {fg_hex}; text-decoration: underline; }}
+        .block-chip {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            border-radius: 999px;
+            padding: 1px 8px;
+        }}
+        .block-chip-icon {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: 0.78em;
+        }}
+        .block-chip-text {{
+            color: {dim_fg};
+            font-size: 0.82em;
+        }}
+        .block-chip-cwd:hover {{ background-color: rgba({fg_r},{fg_g},{fg_b},0.14); }}
+        .block-chip-cwd:hover .block-chip-text {{ color: {fg_hex}; text-decoration: underline; }}
+        .block-chip-git {{ background-color: rgba({acc_r},{acc_g},{acc_b},0.12); }}
+        .block-chip-git .block-chip-icon,
+        .block-chip-git .block-chip-text {{ color: {accent}; }}
+        .block-chip-venv {{ background-color: rgba({ok_r},{ok_g},{ok_b},0.12); }}
+        .block-chip-venv .block-chip-icon,
+        .block-chip-venv .block-chip-text {{ color: {ok_stripe}; }}
+        .block-active-prompt {{ padding: {prompt_pad}; }}
+        .block-toolbelt {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.06);
+            border-radius: 6px;
+            padding: 1px;
+        }}
         .block-command-view {{
             color: {fg_hex};
             font-family: "{font_family}";
             font-size: {font_size};
-            padding: 0 12px;
-            background-color: {block_bg_hex};
+            padding: {cmd_pad};
+            background-color: transparent;
             caret-color: {cursor_hex};
         }}
-        .block-command-view text {{ color: {fg_hex}; background-color: {block_bg_hex}; }}
+        .block-command-view text {{ color: {fg_hex}; background-color: transparent; }}
         .block-output-view {{
             color: {fg_hex};
             font-family: "{font_family}";
             font-size: {font_size};
-            padding: 0 12px 4px 12px;
-            background-color: {block_bg_hex};
+            padding: {out_pad};
+            background-color: transparent;
         }}
-        .block-output-view text {{ color: {fg_hex}; background-color: {block_bg_hex}; }}
+        .block-output-view text {{ color: {fg_hex}; background-color: transparent; }}
         .block-exit-bad {{
             color: {err_hex};
             background-color: {err_bg};
