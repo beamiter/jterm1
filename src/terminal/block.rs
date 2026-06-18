@@ -84,6 +84,12 @@ struct FinishedBlock {
     pinned: bool,
     /// Header pin glyph, toggled with `pinned`.
     pin_icon: gtk::Label,
+    /// Header index badge (1-9), shown only in block-selection mode.
+    index_badge: gtk::Label,
+    /// Header collapse toggle, kept for collapse-all / toggle-selected.
+    collapse_btn: gtk::Button,
+    /// Relative-time label ("2m ago"), refreshed by a periodic timer.
+    time_label: Option<gtk::Label>,
     /// Buffer char offsets of detected error lines in the output, for n/N jump.
     error_offsets: Vec<i32>,
     /// Cursor into `error_offsets` for n/N cycling.
@@ -106,6 +112,10 @@ const SLOW_THRESHOLD_MS: u64 = 1000;
 /// A command taking at least this long (ms) triggers a completion notification
 /// (tab highlight) when the user isn't looking at this terminal.
 const NOTIFY_THRESHOLD_MS: u64 = 3000;
+
+/// Keyboard-nav legend shown in the bottom hint bar while a block is selected.
+const HINT_TEXT: &str =
+    "j/k move · Enter recall · n/N errors · 1-9 jump · y copy · Space fold · ,/. fold all · ? help · Esc exit";
 
 // ─── Shared reader/handler context ──────────────────────────────────────────
 
@@ -164,6 +174,23 @@ struct Ctx {
     sticky_label: gtk::Label,
     /// Index into `finished` the sticky header currently points at (for click).
     sticky_idx: Cell<Option<usize>>,
+    /// Bottom hint bar (keyboard-nav legend) shown while a block is selected.
+    hint_bar: gtk::Box,
+    /// Bottom-right container for transient completion toasts.
+    toast_box: gtk::Box,
+    /// Set at CommandEnd when a slow command finished while the user wasn't
+    /// watching; consumed in finalize_block to raise a click-to-jump toast.
+    pending_toast: Cell<bool>,
+    /// Right-edge minimap: one colored tick per visible finished block.
+    minimap: gtk::Box,
+    /// Generation guard so a newer animated scroll cancels the previous one.
+    scroll_anim_gen: Cell<u64>,
+    /// Live substring filter over block commands (AND-ed with the preset filter).
+    filter_query: RefCell<String>,
+    /// Revealer wrapping the live-filter entry at the top of the view.
+    filter_revealer: gtk::Revealer,
+    /// The live-filter text entry.
+    filter_entry: gtk::SearchEntry,
 }
 
 // ─── Component ──────────────────────────────────────────────────────────────
@@ -229,6 +256,46 @@ impl Component for BlockTerminal {
         sticky_label.add_css_class("block-sticky-label");
         sticky_header.append(&sticky_label);
         overlay.add_overlay(&sticky_header);
+
+        // Bottom hint bar: the keyboard-nav legend, revealed while a block is
+        // selected so the (otherwise invisible) vim-style nav is discoverable.
+        let hint_bar = gtk::Box::new(Orientation::Horizontal, 0);
+        hint_bar.add_css_class("block-hint-bar");
+        hint_bar.set_halign(gtk::Align::Center);
+        hint_bar.set_valign(gtk::Align::End);
+        hint_bar.set_visible(false);
+        hint_bar.set_can_target(false);
+        let hint_label = gtk::Label::new(Some(HINT_TEXT));
+        hint_label.add_css_class("block-hint-label");
+        hint_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        hint_bar.append(&hint_label);
+        overlay.add_overlay(&hint_bar);
+
+        // Bottom-right toast stack for off-screen completion notices.
+        let toast_box = gtk::Box::new(Orientation::Vertical, 6);
+        toast_box.add_css_class("block-toast-box");
+        toast_box.set_halign(gtk::Align::End);
+        toast_box.set_valign(gtk::Align::End);
+        overlay.add_overlay(&toast_box);
+
+        // Right-edge minimap: a strip of colored ticks, one per visible block.
+        let minimap = gtk::Box::new(Orientation::Vertical, 2);
+        minimap.add_css_class("block-minimap");
+        minimap.set_halign(gtk::Align::End);
+        minimap.set_valign(gtk::Align::Fill);
+        minimap.set_homogeneous(true);
+        minimap.set_visible(false);
+        overlay.add_overlay(&minimap);
+
+        // Live command-filter entry, slid in from the top on demand.
+        let filter_entry = gtk::SearchEntry::new();
+        filter_entry.set_placeholder_text(Some("Filter blocks by command…"));
+        filter_entry.add_css_class("block-filter-entry");
+        let filter_revealer = gtk::Revealer::new();
+        filter_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+        filter_revealer.set_child(Some(&filter_entry));
+        filter_revealer.set_reveal_child(false);
+        root.append(&filter_revealer);
         root.append(&overlay);
 
         // The persistent active card. `input_enabled` must stay true so VTE emits
@@ -289,6 +356,14 @@ impl Component for BlockTerminal {
             sticky_header: sticky_header.clone(),
             sticky_label: sticky_label.clone(),
             sticky_idx: Cell::new(None),
+            hint_bar: hint_bar.clone(),
+            toast_box: toast_box.clone(),
+            pending_toast: Cell::new(false),
+            minimap: minimap.clone(),
+            scroll_anim_gen: Cell::new(0),
+            filter_query: RefCell::new(String::new()),
+            filter_revealer: filter_revealer.clone(),
+            filter_entry: filter_entry.clone(),
         });
 
         // Keep the active card pinned to the viewport height. `vexpand` is inert
@@ -368,6 +443,35 @@ impl Component for BlockTerminal {
 
         // Restore previously-persisted finished blocks (if history is configured).
         load_block_history(&ctx);
+        rebuild_minimap(&ctx);
+
+        // Live command filter: typing narrows the block list by command substring.
+        {
+            let ctx = ctx.clone();
+            filter_entry.connect_search_changed(move |e| {
+                *ctx.filter_query.borrow_mut() = e.text().to_string();
+                apply_visibility(&ctx);
+            });
+        }
+        {
+            let ctx = ctx.clone();
+            filter_entry.connect_stop_search(move |_| {
+                ctx.filter_revealer.set_reveal_child(false);
+                ctx.filter_entry.set_text("");
+                ctx.filter_query.borrow_mut().clear();
+                apply_visibility(&ctx);
+                ctx.active_vte.grab_focus();
+            });
+        }
+
+        // Periodically refresh the relative-time labels ("2m ago").
+        {
+            let ctx = ctx.clone();
+            glib::timeout_add_seconds_local(30, move || {
+                refresh_relative_times(&ctx);
+                glib::ControlFlow::Continue
+            });
+        }
 
         // Install the reader: parser events drive the block state machine.
         {
@@ -486,6 +590,36 @@ impl Component for BlockTerminal {
                             jump_to_error(&ctx, -1);
                             return glib::Propagation::Stop;
                         }
+                        Key::y | Key::Y => {
+                            if let Some(i) = ctx.selected_block.get() {
+                                let id = ctx.finished.borrow().get(i).map(|b| b.id);
+                                if let Some(id) = id {
+                                    copy_block_by_id(&ctx, id);
+                                }
+                            }
+                            return glib::Propagation::Stop;
+                        }
+                        Key::space => {
+                            toggle_selected_collapse(&ctx);
+                            return glib::Propagation::Stop;
+                        }
+                        Key::comma => {
+                            set_all_collapsed(&ctx, true);
+                            return glib::Propagation::Stop;
+                        }
+                        Key::period => {
+                            set_all_collapsed(&ctx, false);
+                            return glib::Propagation::Stop;
+                        }
+                        Key::slash => {
+                            ctx.filter_revealer.set_reveal_child(true);
+                            ctx.filter_entry.grab_focus();
+                            return glib::Propagation::Stop;
+                        }
+                        Key::question => {
+                            show_cheatsheet(&ctx);
+                            return glib::Propagation::Stop;
+                        }
                         _ => {
                             if let Some(c) = keyval.to_unicode() {
                                 if ('1'..='9').contains(&c) {
@@ -521,6 +655,26 @@ impl Component for BlockTerminal {
                 if keyval == Key::Escape && ctx.selected_block.get().is_some() {
                     select_block(&ctx, None);
                     return glib::Propagation::Stop;
+                }
+
+                // Escape on an empty prompt enters block-nav mode by selecting
+                // the last visible block (the discoverable entry point). Guarded
+                // on an empty typed line so it never hijacks shell editing / vi-mode.
+                if keyval == Key::Escape
+                    && !ctrl
+                    && !alt
+                    && ctx.selected_block.get().is_none()
+                    && ctx.typed_cmd.borrow().is_empty()
+                    && matches!(
+                        ctx.state.get(),
+                        BlockState::AwaitingCommand | BlockState::RawFallback | BlockState::Idle
+                    )
+                {
+                    let visible = visible_indices(&ctx);
+                    if let Some(&idx) = visible.last() {
+                        select_block(&ctx, Some(idx));
+                        return glib::Propagation::Stop;
+                    }
                 }
 
                 // Ctrl+L: clear visible finished blocks + send form feed.
@@ -815,8 +969,40 @@ fn scroll_to_block(ctx: &Rc<Ctx>, idx: usize) {
     {
         let adj = ctx.scroll.vadjustment();
         let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
-        adj.set_value((p.y() as f64).clamp(adj.lower(), max_val));
+        animate_scroll_to(ctx, (p.y() as f64).clamp(adj.lower(), max_val));
     }
+}
+
+/// Smoothly scroll the block list to `target` (an absolute vadjustment value)
+/// with an ease-out tween. A generation guard cancels any in-flight animation.
+fn animate_scroll_to(ctx: &Rc<Ctx>, target: f64) {
+    let adj = ctx.scroll.vadjustment();
+    let start = adj.value();
+    let dist = target - start;
+    if dist.abs() < 1.0 {
+        adj.set_value(target);
+        return;
+    }
+    let gen = ctx.scroll_anim_gen.get().wrapping_add(1);
+    ctx.scroll_anim_gen.set(gen);
+    let begin = Instant::now();
+    const DUR_MS: f64 = 180.0;
+    let ctx = ctx.clone();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        // A newer animation (or a teardown) supersedes this one.
+        if ctx.scroll_anim_gen.get() != gen {
+            return glib::ControlFlow::Break;
+        }
+        let t = (begin.elapsed().as_secs_f64() * 1000.0 / DUR_MS).min(1.0);
+        // Cubic ease-out.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        ctx.scroll.vadjustment().set_value(start + dist * eased);
+        if t >= 1.0 {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
 }
 
 /// Cycle to the next/previous detected error line within the selected block,
@@ -861,7 +1047,7 @@ fn scroll_to_offset(ctx: &Rc<Ctx>, block: &FinishedBlock, offset: i32) {
         let adj = ctx.scroll.vadjustment();
         let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
         let target = (p.y() as f64 - 8.0).clamp(adj.lower(), max_val);
-        adj.set_value(target);
+        animate_scroll_to(ctx, target);
     }
 }
 
@@ -973,7 +1159,9 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             // matter AND the user isn't watching (tab inactive or scrolled away
             // from the bottom). Routed to the existing tab-highlight mechanism.
             let slow = elapsed.map(|d| d.as_millis() as u64).unwrap_or(0) >= NOTIFY_THRESHOLD_MS;
-            if slow && !user_is_watching(ctx) {
+            let off_screen = slow && !user_is_watching(ctx);
+            ctx.pending_toast.set(off_screen);
+            if off_screen {
                 let _ = sender.output(VteOutput::CommandFinished(code == 0));
             }
         }
@@ -1061,10 +1249,10 @@ fn exit_fullscreen(ctx: &Rc<Ctx>) {
     if !ctx.fullscreen.replace(false) {
         return;
     }
-    let filter = ctx.filter.get();
     for block in ctx.finished.borrow().iter() {
-        block.widget.set_visible(passes_filter(filter, block));
+        block.widget.set_visible(block_visible(ctx, block));
     }
+    rebuild_minimap(ctx);
 }
 
 /// Snapshot the current command + output into a finished block, then reset the
@@ -1106,12 +1294,24 @@ fn finalize_block(ctx: &Rc<Ctx>) {
     ctx.block_list
         .reorder_child_after(&ctx.active_holder, Some(&widget));
 
-    widget.set_visible(passes_filter(ctx.filter.get(), &meta));
+    widget.set_visible(block_visible(ctx, &meta));
     ctx.finished.borrow_mut().push(meta);
 
     append_block_history(ctx, &prompt, &command, &output, exit_code, &cwd, duration_ms, end_time_ms, false);
 
+    let new_idx = ctx.finished.borrow().len() - 1;
+    pulse_block(ctx, new_idx, exit_code == 0);
+    // On failure, surface the first error if the user is at the bottom watching.
+    if exit_code != 0 && user_is_watching(ctx) {
+        scroll_to_first_error(ctx, new_idx);
+    }
+    // Off-screen slow completion: raise a click-to-jump toast.
+    if ctx.pending_toast.replace(false) {
+        show_toast(ctx, new_idx, &command, duration, exit_code == 0);
+    }
+
     enforce_max_blocks(ctx);
+    rebuild_minimap(ctx);
     reset_active(ctx);
 }
 
@@ -1284,7 +1484,7 @@ fn load_block_history(ctx: &Rc<Ctx>) {
         ctx.block_list.append(&widget);
         ctx.block_list
             .reorder_child_after(&ctx.active_holder, Some(&widget));
-        widget.set_visible(passes_filter(ctx.filter.get(), &meta));
+        widget.set_visible(block_visible(ctx, &meta));
         ctx.finished.borrow_mut().push(meta);
     }
     enforce_max_blocks(ctx);
@@ -1298,6 +1498,29 @@ fn passes_filter(filter: BlockFilter, block: &FinishedBlock) -> bool {
         BlockFilter::Slow => block.pinned || block.duration_ms >= SLOW_THRESHOLD_MS,
         BlockFilter::Pinned => block.pinned,
     }
+}
+
+/// Whether a block should be visible: it must pass the preset filter AND, if a
+/// live command-filter query is set, contain that query (case-insensitive).
+fn block_visible(ctx: &Rc<Ctx>, block: &FinishedBlock) -> bool {
+    if !passes_filter(ctx.filter.get(), block) {
+        return false;
+    }
+    let query = ctx.filter_query.borrow();
+    if query.trim().is_empty() {
+        return true;
+    }
+    block.command.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// Re-apply visibility to every finished block per the current preset + live
+/// filter, then refresh the minimap and index badges.
+fn apply_visibility(ctx: &Rc<Ctx>) {
+    for block in ctx.finished.borrow().iter() {
+        block.widget.set_visible(block_visible(ctx, block));
+    }
+    rebuild_minimap(ctx);
+    refresh_index_badges(ctx);
 }
 
 /// Enforce `max_visible_blocks`: evict the oldest non-pinned finished blocks once
@@ -1330,9 +1553,7 @@ fn enforce_max_blocks(ctx: &Rc<Ctx>) {
 fn apply_filter(ctx: &Rc<Ctx>, filter: BlockFilter) {
     ctx.filter.set(filter);
     select_block(ctx, None);
-    for block in ctx.finished.borrow().iter() {
-        block.widget.set_visible(passes_filter(filter, block));
-    }
+    apply_visibility(ctx);
 }
 
 /// Move the keyboard block-selection highlight to `target` (an index into
@@ -1353,6 +1574,8 @@ fn select_block(ctx: &Rc<Ctx>, target: Option<usize>) {
     }
     ctx.selected_block.set(target);
     drop(finished);
+    ctx.hint_bar.set_visible(target.is_some());
+    refresh_index_badges(ctx);
     if let Some(idx) = target {
         scroll_to_block(ctx, idx);
     }
@@ -1425,6 +1648,7 @@ fn clear_visible_blocks(ctx: &Rc<Ctx>) {
     drop(finished);
     ctx.search_matches.borrow_mut().clear();
     ctx.search_idx.set(0);
+    rebuild_minimap(ctx);
     ctx.pty.write_bytes(b"\x0c");
 }
 
@@ -1490,6 +1714,13 @@ fn build_finished_block(
     let header = gtk::Box::new(Orientation::Horizontal, 6);
     header.add_css_class("block-header");
 
+    // Index badge (1-9): hidden until block-selection mode numbers it.
+    let index_badge = gtk::Label::new(None);
+    index_badge.add_css_class("block-index-badge");
+    index_badge.set_visible(false);
+    header.append(&index_badge);
+    let index_badge_ret = index_badge.clone();
+
     // Status icon: Nerd Font check () on success, times () on failure.
     let status = gtk::Label::new(Some(if exit_code == 0 { "\u{f00c}" } else { "\u{f00d}" }));
     status.add_css_class(if exit_code == 0 {
@@ -1515,15 +1746,20 @@ fn build_finished_block(
     spacer.set_hexpand(true);
     header.append(&spacer);
 
-    if let Some(et) = end_time_ms {
-        let ts = gtk::Label::new(Some(&format_clock(et)));
+    // Relative timestamp ("2m ago"), refreshed by the periodic timer; the exact
+    // wall-clock time is available on hover.
+    let time_label = end_time_ms.map(|et| {
+        let ts = gtk::Label::new(Some(&format_relative(et)));
         ts.add_css_class("block-header-label");
+        ts.set_tooltip_text(Some(&format_clock(et)));
         header.append(&ts);
-    }
+        ts
+    });
 
     if let Some(d) = duration {
         let badge = gtk::Label::new(Some(&format_duration(d)));
         badge.add_css_class("block-meta-badge");
+        badge.add_css_class(duration_grade_class(d));
         header.append(&badge);
     }
 
@@ -1570,6 +1806,21 @@ fn build_finished_block(
         });
     }
     action_box.append(&rerun);
+
+    // Copy error report (failed blocks only): command + exit code + error lines,
+    // formatted for pasting into an AI assistant or bug report. Nerd Font bug ().
+    if exit_code != 0 {
+        let copy_err = gtk::Button::with_label("\u{f188}");
+        copy_err.add_css_class("block-action-btn");
+        copy_err.add_css_class("block-action-err");
+        copy_err.add_css_class("flat");
+        copy_err.set_tooltip_text(Some("Copy error report"));
+        {
+            let report = build_error_report(command, cwd, exit_code, &plain_output);
+            copy_err.connect_clicked(move |_| set_clipboard(&report));
+        }
+        action_box.append(&copy_err);
+    }
 
     header.append(&action_box);
 
@@ -1618,7 +1869,8 @@ fn build_finished_block(
     let lazy_threshold = ctx.config.borrow().lazy_load_threshold as usize;
     let total_lines = ansi::count_lines(&runs);
     let do_truncate = truncate_lines > 0 && total_lines > truncate_lines;
-    let lazy = lazy_threshold > 0 && total_lines > lazy_threshold;
+    // Failed blocks always render eagerly + expanded so the error is on screen.
+    let lazy = lazy_threshold > 0 && total_lines > lazy_threshold && exit_code == 0;
     let has_output = !plain_output.is_empty();
 
     let collapsed = Rc::new(Cell::new(!has_output || lazy));
@@ -1745,6 +1997,9 @@ fn build_finished_block(
         error_offsets,
         error_idx: Cell::new(0),
         pin_icon: pin_icon_ret,
+        index_badge: index_badge_ret,
+        collapse_btn,
+        time_label,
         prompt: prompt.to_string(),
         command: command.to_string(),
         plain_output,
@@ -1840,21 +2095,26 @@ fn show_block_menu(ctx: &Rc<Ctx>, id: u64, anchor: &gtk::Box, x: f64, y: f64) {
         btn
     };
 
-    let is_pinned = ctx
+    let (is_pinned, is_failed) = ctx
         .finished
         .borrow()
         .iter()
         .find(|b| b.id == id)
-        .map(|b| b.pinned)
-        .unwrap_or(false);
+        .map(|b| (b.pinned, b.exit_code != 0))
+        .unwrap_or((false, false));
     let pin_label = if is_pinned { "Unpin Block" } else { "Pin Block" };
-    let items: [(&str, fn(&Rc<Ctx>, u64)); 5] = [
+    let mut items: Vec<(&str, fn(&Rc<Ctx>, u64))> = vec![
         (pin_label, toggle_pin),
         ("Copy Block", copy_block_by_id),
-        ("Export as JSON", export_block_json),
+    ];
+    if is_failed {
+        items.push(("Copy Error Report", copy_error_report_by_id));
+    }
+    items.extend([
+        ("Export as JSON", export_block_json as fn(&Rc<Ctx>, u64)),
         ("Export as Markdown", export_block_markdown),
         ("Delete Block", delete_block),
-    ];
+    ]);
     for (label, action) in items {
         let item = make_item(label);
         let ctx = ctx.clone();
@@ -1885,7 +2145,7 @@ fn toggle_pin(ctx: &Rc<Ctx>, id: u64) {
                 b.widget.remove_css_class("block-pinned");
             }
             b.pin_icon.set_visible(b.pinned);
-            b.widget.set_visible(passes_filter(ctx.filter.get(), b));
+            b.widget.set_visible(block_visible(ctx, b));
             changed = Some((b.command.clone(), b.end_time_ms, b.pinned));
         }
     }
@@ -1951,9 +2211,10 @@ fn delete_block(ctx: &Rc<Ctx>, id: u64) {
         ctx.block_list.remove(&block.widget);
     }
     drop(finished);
-    ctx.selected_block.set(None);
+    select_block(ctx, None);
     ctx.search_matches.borrow_mut().clear();
     ctx.search_idx.set(0);
+    rebuild_minimap(ctx);
 }
 
 fn ansi_output_view(runs: &[AnsiTextRun], css_class: &str) -> gtk::TextView {
@@ -2166,6 +2427,252 @@ fn shorten_path(path: &str) -> String {
     }
 }
 
+// ─── UX helpers (badges, minimap, toasts, pulses, relative time) ────────────
+
+/// Number the first nine visible blocks 1-9 while in block-selection mode; hide
+/// every badge when no block is selected.
+fn refresh_index_badges(ctx: &Rc<Ctx>) {
+    let active = ctx.selected_block.get().is_some();
+    let finished = ctx.finished.borrow();
+    let mut n = 0u32;
+    for block in finished.iter() {
+        if active && block.widget.is_visible() && n < 9 {
+            n += 1;
+            block.index_badge.set_text(&n.to_string());
+            block.index_badge.set_visible(true);
+        } else {
+            block.index_badge.set_visible(false);
+        }
+    }
+}
+
+/// Rebuild the right-edge minimap: one colored tick per visible block, clickable
+/// to jump. Hidden in fullscreen or when fewer than two blocks are visible.
+fn rebuild_minimap(ctx: &Rc<Ctx>) {
+    while let Some(child) = ctx.minimap.first_child() {
+        ctx.minimap.remove(&child);
+    }
+    let visible = visible_indices(ctx);
+    if ctx.fullscreen.get() || visible.len() < 2 {
+        ctx.minimap.set_visible(false);
+        return;
+    }
+    let finished = ctx.finished.borrow();
+    for &idx in &visible {
+        let Some(block) = finished.get(idx) else { continue };
+        let tick = gtk::Button::new();
+        tick.add_css_class("block-minimap-tick");
+        tick.add_css_class("flat");
+        if block.pinned {
+            tick.add_css_class("tick-pinned");
+        } else if block.exit_code == 0 {
+            tick.add_css_class("tick-ok");
+        } else {
+            tick.add_css_class("tick-bad");
+        }
+        let short: String = block.command.chars().take(60).collect();
+        tick.set_tooltip_text(Some(&short));
+        let ctx2 = ctx.clone();
+        tick.connect_clicked(move |_| scroll_to_block(&ctx2, idx));
+        ctx.minimap.append(&tick);
+    }
+    ctx.minimap.set_visible(true);
+}
+
+/// Briefly flash a just-finished block (green on success, red on failure) for
+/// peripheral awareness, then drop the pulse class.
+fn pulse_block(ctx: &Rc<Ctx>, idx: usize, ok: bool) {
+    if ctx.fullscreen.get() {
+        return;
+    }
+    let finished = ctx.finished.borrow();
+    let Some(block) = finished.get(idx) else { return };
+    let widget = block.widget.clone();
+    let class = if ok { "block-pulse-ok" } else { "block-pulse-bad" };
+    widget.add_css_class(class);
+    glib::timeout_add_local_once(Duration::from_millis(700), move || {
+        widget.remove_css_class(class);
+    });
+}
+
+/// Expand a failed block's full output and scroll its first detected error line
+/// into view, without changing the keyboard selection. The scroll is deferred so
+/// the freshly-appended widget has been allocated.
+fn scroll_to_first_error(ctx: &Rc<Ctx>, idx: usize) {
+    let err_bg = error_highlight_bg(ctx);
+    {
+        let finished = ctx.finished.borrow();
+        let Some(block) = finished.get(idx) else { return };
+        if block.error_offsets.is_empty() {
+            return;
+        }
+        if let Some(view) = &block.output_view {
+            if block.truncated.get() || block.collapsed.get() {
+                render_block_output(view, &block.full_runs, &block.full_runs, false, &block.error_offsets, &err_bg);
+                block.truncated.set(false);
+                block.collapsed.set(false);
+                view.set_visible(true);
+                if let Some(b) = &block.show_more {
+                    b.set_visible(false);
+                }
+            }
+        }
+    }
+    let ctx2 = ctx.clone();
+    glib::timeout_add_local_once(Duration::from_millis(30), move || {
+        let finished = ctx2.finished.borrow();
+        if let Some(block) = finished.get(idx) {
+            if let Some(&off) = block.error_offsets.first() {
+                scroll_to_offset(&ctx2, block, off);
+            }
+        }
+    });
+}
+
+/// Show a click-to-jump toast (bottom-right) announcing an off-screen completion;
+/// auto-dismisses after a few seconds.
+fn show_toast(ctx: &Rc<Ctx>, idx: usize, command: &str, duration: Option<Duration>, ok: bool) {
+    let id = match ctx.finished.borrow().get(idx) {
+        Some(b) => b.id,
+        None => return,
+    };
+    let glyph = if ok { "\u{f00c}" } else { "\u{f00d}" };
+    let dur = duration
+        .map(|d| format!("  ·  {}", format_duration(d)))
+        .unwrap_or_default();
+    let short: String = command.chars().take(48).collect();
+    let btn = gtk::Button::with_label(&format!("{glyph}  {short}{dur}"));
+    btn.add_css_class("block-toast");
+    btn.add_css_class(if ok { "toast-ok" } else { "toast-bad" });
+    btn.add_css_class("flat");
+    {
+        let ctx2 = ctx.clone();
+        let btn_c = btn.clone();
+        btn.connect_clicked(move |_| {
+            let pos = ctx2.finished.borrow().iter().position(|b| b.id == id);
+            if let Some(p) = pos {
+                scroll_to_block(&ctx2, p);
+            }
+            ctx2.toast_box.remove(&btn_c);
+        });
+    }
+    ctx.toast_box.append(&btn);
+    let toast_box = ctx.toast_box.clone();
+    let btn_c = btn.clone();
+    glib::timeout_add_local_once(Duration::from_secs(6), move || {
+        if btn_c.parent().is_some() {
+            toast_box.remove(&btn_c);
+        }
+    });
+}
+
+/// Toggle the collapsed state of the currently-selected block.
+fn toggle_selected_collapse(ctx: &Rc<Ctx>) {
+    if let Some(i) = ctx.selected_block.get() {
+        if let Some(b) = ctx.finished.borrow().get(i) {
+            b.collapse_btn.emit_clicked();
+        }
+    }
+}
+
+/// Collapse (or expand) every block with output. Reuses each block's collapse
+/// button so lazy first-render and label state stay consistent.
+fn set_all_collapsed(ctx: &Rc<Ctx>, want: bool) {
+    for b in ctx.finished.borrow().iter() {
+        if b.output_view.is_some() && b.collapsed.get() != want {
+            b.collapse_btn.emit_clicked();
+        }
+    }
+}
+
+/// Pop a keyboard cheatsheet over the block list.
+fn show_cheatsheet(ctx: &Rc<Ctx>) {
+    let popover = gtk::Popover::new();
+    popover.set_parent(&ctx.scroll);
+    let text = "Block navigation\n\n\
+        Shift+Up/Down    select / enter nav\n\
+        j / k            move selection\n\
+        gg / G           first / last block\n\
+        1-9              jump to block N\n\
+        n / N            next / prev error\n\
+        Enter            recall command\n\
+        y                copy block\n\
+        Space            fold / unfold block\n\
+        , / .            fold / unfold all\n\
+        /                filter by command\n\
+        Shift+PgUp/PgDn  page the list\n\
+        Esc              exit nav";
+    let label = gtk::Label::new(Some(text));
+    label.add_css_class("block-cheatsheet");
+    label.set_xalign(0.0);
+    popover.set_child(Some(&label));
+    popover.connect_closed(|p| p.unparent());
+    popover.popup();
+}
+
+fn copy_error_report_by_id(ctx: &Rc<Ctx>, id: u64) {
+    if let Some(b) = ctx.finished.borrow().iter().find(|b| b.id == id) {
+        set_clipboard(&build_error_report(&b.command, &b.cwd, b.exit_code, &b.plain_output));
+    }
+}
+
+/// Format a copy-ready error report (command, cwd, exit code, output tail) for
+/// pasting into an assistant or bug report.
+fn build_error_report(command: &str, cwd: &str, exit_code: i32, output: &str) -> String {
+    const TAIL: usize = 80;
+    let lines: Vec<&str> = output.lines().collect();
+    let start = lines.len().saturating_sub(TAIL);
+    let elision = if start > 0 { "…(earlier output omitted)…\n" } else { "" };
+    let tail = lines[start..].join("\n");
+    format!("$ {command}\n# cwd: {cwd}\n# exit code: {exit_code}\n\n{elision}{tail}")
+}
+
+/// Refresh every block's relative-time label ("2m ago").
+fn refresh_relative_times(ctx: &Rc<Ctx>) {
+    for b in ctx.finished.borrow().iter() {
+        if let (Some(label), Some(et)) = (&b.time_label, b.end_time_ms) {
+            label.set_text(&format_relative(et));
+        }
+    }
+}
+
+/// Render a wall-clock epoch-ms value as a short relative time, falling back to
+/// the absolute clock for timestamps older than a week or in the future.
+fn format_relative(end_time_ms: u64) -> String {
+    let now = now_ms();
+    if end_time_ms == 0 || end_time_ms > now {
+        return format_clock(end_time_ms);
+    }
+    let secs = (now - end_time_ms) / 1000;
+    if secs < 10 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else if secs < 604800 {
+        format!("{}d ago", secs / 86400)
+    } else {
+        format_clock(end_time_ms)
+    }
+}
+
+/// CSS class grading the duration badge by speed, so slow commands stand out.
+fn duration_grade_class(d: Duration) -> &'static str {
+    let ms = d.as_millis() as u64;
+    if ms < 500 {
+        "dur-fast"
+    } else if ms < SLOW_THRESHOLD_MS {
+        "dur-normal"
+    } else if ms < 5000 {
+        "dur-slow"
+    } else {
+        "dur-veryslow"
+    }
+}
+
 #[allow(deprecated)]
 fn install_block_css(config: &Config) {
     let fg = &config.foreground;
@@ -2214,6 +2721,13 @@ fn install_block_css(config: &Config) {
     let acc_r = (acc.red() * 255.0) as u8;
     let acc_g = (acc.green() * 255.0) as u8;
     let acc_b = (acc.blue() * 255.0) as u8;
+
+    // Amber/warn tone for the "slow" duration grade, from the palette yellow.
+    let warn = &config.palette[3];
+    let warn_r = (warn.red() * 255.0) as u8;
+    let warn_g = (warn.green() * 255.0) as u8;
+    let warn_b = (warn.blue() * 255.0) as u8;
+    let warn_hex = rgba_to_hex(warn);
 
     let fg_r = (fg.red() * 255.0) as u8;
     let fg_g = (fg.green() * 255.0) as u8;
@@ -2401,6 +2915,98 @@ fn install_block_css(config: &Config) {
             color: {fg_hex};
             font-family: "{font_family}";
             font-size: {font_size};
+        }}
+        .block-index-badge {{
+            color: {bg_hex};
+            background-color: {accent};
+            border-radius: 999px;
+            min-width: 15px; min-height: 15px;
+            padding: 0 5px;
+            margin-left: 6px;
+            font-family: "{font_family}";
+            font-size: 0.74em; font-weight: bold;
+        }}
+        .block-action-err {{ color: {err_hex}; }}
+        .block-action-err:hover {{
+            color: {err_hex};
+            background-color: rgba({err_r},{err_g},{err_b},0.16);
+        }}
+        .block-meta-badge.dur-fast {{ color: {dim_fg}; opacity: 0.7; }}
+        .block-meta-badge.dur-normal {{ color: {dim_fg}; }}
+        .block-meta-badge.dur-slow {{
+            color: {warn_hex};
+            background-color: rgba({warn_r},{warn_g},{warn_b},0.14);
+        }}
+        .block-meta-badge.dur-veryslow {{
+            color: {err_hex};
+            background-color: rgba({err_r},{err_g},{err_b},0.16);
+            font-weight: bold;
+        }}
+        @keyframes block-pulse-ok-kf {{
+            0% {{ background-color: rgba({ok_r},{ok_g},{ok_b},0.32); }}
+            100% {{ background-color: {block_bg_hex}; }}
+        }}
+        @keyframes block-pulse-bad-kf {{
+            0% {{ background-color: rgba({err_r},{err_g},{err_b},0.34); }}
+            100% {{ background-color: {block_bg_hex}; }}
+        }}
+        .block-pulse-ok {{ animation: block-pulse-ok-kf 700ms ease-out; }}
+        .block-pulse-bad {{ animation: block-pulse-bad-kf 700ms ease-out; }}
+        .block-hint-bar {{
+            background-color: rgba({bg_r},{bg_g},{bg_b},0.92);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.14);
+            border-radius: 999px;
+            margin-bottom: 12px;
+            padding: 3px 14px;
+            box-shadow: 0 3px 12px rgba(0,0,0,0.30);
+        }}
+        .block-hint-label {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: 0.80em;
+        }}
+        .block-toast-box {{ margin: 0 14px 14px 0; }}
+        .block-toast {{
+            color: {fg_hex};
+            background-color: rgba({bg_r},{bg_g},{bg_b},0.96);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.16);
+            border-left: 3px solid {accent};
+            border-radius: 8px;
+            padding: 6px 14px;
+            font-family: "{font_family}";
+            font-size: 0.84em;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.34);
+        }}
+        .block-toast.toast-ok {{ border-left-color: {ok_stripe}; }}
+        .block-toast.toast-bad {{ border-left-color: {err_stripe}; }}
+        .block-toast:hover {{ background-color: rgba({fg_r},{fg_g},{fg_b},0.10); }}
+        .block-minimap {{
+            margin: 6px 14px 6px 3px;
+            min-width: 6px;
+            opacity: 0.5;
+            transition: opacity 140ms ease;
+        }}
+        .block-minimap:hover {{ opacity: 1.0; }}
+        .block-minimap-tick {{
+            min-width: 6px; min-height: 4px;
+            padding: 0;
+            border-radius: 3px;
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.25);
+        }}
+        .block-minimap-tick.tick-ok {{ background-color: {ok_stripe}; }}
+        .block-minimap-tick.tick-bad {{ background-color: {err_stripe}; }}
+        .block-minimap-tick.tick-pinned {{ background-color: {accent}; }}
+        .block-minimap-tick:hover {{ background-color: {fg_hex}; }}
+        .block-filter-entry {{
+            margin: 6px 8px;
+            background-color: {block_bg_hex};
+            color: {fg_hex};
+            font-family: "{font_family}";
+        }}
+        .block-cheatsheet {{
+            font-family: "{font_family}";
+            font-size: 0.84em;
+            padding: 6px 4px;
         }}
         "#,
     );
