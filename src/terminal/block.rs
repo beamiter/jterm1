@@ -1256,6 +1256,13 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
 /// prompt + an input line visible without ballooning to the full screen.
 const MIN_ACTIVE_ROWS: i64 = 3;
 
+/// Total vertical pixels the active card's CSS chrome adds around the inner VTE:
+/// `.block-active` margin (6px × 2) + border (1px × 2) + padding (4px × 2). Used
+/// to size the full-viewport grid to what actually fits, so the pinned grid is
+/// achievable and the PTY is not resized every frame (see `update_active_height`).
+/// Keep in sync with the `.block-active` rule in the dynamic CSS.
+const ACTIVE_CARD_VCHROME_PX: f64 = 22.0;
+
 /// Count the number of visual rows `bytes` occupy when rendered at `cols`
 /// columns, counting line wraps. ANSI escape sequences and UTF-8 continuation
 /// bytes are skipped so the width estimate is reasonable. Scanning stops once
@@ -1311,20 +1318,33 @@ fn update_active_height(ctx: &Rc<Ctx>) {
     if ch <= 1 {
         return; // terminal not realized yet
     }
-    let page_rows = (page_px as i64 / ch).max(1);
+    // Largest grid that actually fits the viewport. Crucially this subtracts the
+    // active card's CSS chrome (`.block-active` margin + border + padding around
+    // the VTE) *before* dividing by the row height. Using raw page_px / ch
+    // overestimates by ~1 row, which leaves the card with zero slack at the
+    // ceiling: the holder's natural height (rows*ch + chrome) then equals the whole
+    // viewport, so it gets clamped to one row short while `set_size` keeps
+    // re-asserting the unreachable target. set_size and the squeezed allocation
+    // disagree every frame, the PTY is resized continuously, and an actively
+    // repainting alt-screen app (top, vim) jitters vertically. Reserving the chrome
+    // gives the holder slack so the size settles.
+    let max_rows = (((page_px - ACTIVE_CARD_VCHROME_PX).max(ch as f64)) as i64 / ch).max(1);
 
     let cols = ctx.active_vte.column_count().max(1);
+    // Alt-screen apps and no-OSC133 shells behave as a normal full-screen terminal
+    // and take the whole (achievable) viewport; otherwise size the card to its
+    // content so history stacks above a compact input (warp-style).
     let target_rows = if ctx.fullscreen.get() || ctx.state.get() == BlockState::RawFallback {
-        page_rows
+        max_rows
     } else {
-        let cmd_rows = count_wrapped_rows(ctx.typed_cmd.borrow().as_bytes(), cols, page_rows);
+        let cmd_rows = count_wrapped_rows(ctx.typed_cmd.borrow().as_bytes(), cols, max_rows);
         let content = match ctx.state.get() {
             BlockState::CollectingOutput | BlockState::PostCommand => {
-                1 + cmd_rows + count_wrapped_rows(&ctx.out_buf.borrow(), cols, page_rows)
+                1 + cmd_rows + count_wrapped_rows(&ctx.out_buf.borrow(), cols, max_rows)
             }
             _ => 1 + cmd_rows,
         };
-        content.clamp(MIN_ACTIVE_ROWS, page_rows)
+        content.clamp(MIN_ACTIVE_ROWS, max_rows)
     };
     // Drive the VTE grid directly. `set_height_request` only sets a *minimum*, so
     // it cannot shrink a VTE whose natural height (row_count * char_height) is
