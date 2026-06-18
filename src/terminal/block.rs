@@ -434,9 +434,16 @@ impl Component for BlockTerminal {
             });
         }
 
-        // Track size changes and resize the PTY accordingly.
+        // Track size changes and resize the PTY accordingly. Also re-pin the
+        // scroll to the bottom each frame while stuck there: the active cell's
+        // height_request resize lands a frame or two after the data arrives, and
+        // the vadjustment `changed` signal can fire against a stale `upper`, so a
+        // per-frame pin is what reliably keeps the active input cell visible
+        // (without it the view only settled after an unrelated relayout, e.g. a
+        // mouse move).
         {
             let pty = pty.clone();
+            let ctx = ctx.clone();
             let last = Rc::new(Cell::new((0i64, 0i64)));
             active_vte.add_tick_callback(move |term, _clock| {
                 let cols = term.column_count();
@@ -444,6 +451,13 @@ impl Component for BlockTerminal {
                 if (cols, rows) != last.get() && cols > 0 && rows > 0 {
                     last.set((cols, rows));
                     pty.resize(cols as u16, rows as u16);
+                }
+                if ctx.stick_bottom.get() && !ctx.fullscreen.get() {
+                    let adj = ctx.scroll.vadjustment();
+                    let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
+                    if (adj.value() - max_val).abs() > 0.5 {
+                        adj.set_value(max_val);
+                    }
                 }
                 glib::ControlFlow::Continue
             });
