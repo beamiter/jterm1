@@ -185,6 +185,10 @@ struct Ctx {
     minimap: gtk::Box,
     /// Generation guard so a newer animated scroll cancels the previous one.
     scroll_anim_gen: Cell<u64>,
+    /// Whether the view is "stuck" to the bottom: when true, content/height
+    /// changes re-pin the scroll to the bottom so the active input cell stays
+    /// visible. Cleared when the user scrolls up, restored when they return.
+    stick_bottom: Cell<bool>,
     /// Live substring filter over block commands (AND-ed with the preset filter).
     filter_query: RefCell<String>,
     /// Revealer wrapping the live-filter entry at the top of the view.
@@ -361,6 +365,7 @@ impl Component for BlockTerminal {
             pending_toast: Cell::new(false),
             minimap: minimap.clone(),
             scroll_anim_gen: Cell::new(0),
+            stick_bottom: Cell::new(true),
             filter_query: RefCell::new(String::new()),
             filter_revealer: filter_revealer.clone(),
             filter_entry: filter_entry.clone(),
@@ -369,18 +374,28 @@ impl Component for BlockTerminal {
         // Size the active card to its content (warp-style): compact while typing,
         // growing as a command streams output, full-screen only for alt-screen
         // apps / no-OSC133 shells. Re-clamp whenever the viewport changes (resize).
+        // `changed` fires after layout with a fresh `upper`, so this is also where
+        // we re-pin to the bottom (keeping the active input cell visible) once the
+        // grown/shrunk content is laid out — the immediate scroll in `autoscroll`
+        // runs against a stale `upper` and would otherwise land short.
         {
             let ctx = ctx.clone();
-            scroll.vadjustment().connect_changed(move |_adj| {
+            scroll.vadjustment().connect_changed(move |adj| {
                 update_active_height(&ctx);
+                if ctx.stick_bottom.get() && !ctx.fullscreen.get() {
+                    adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
+                }
             });
         }
 
-        // Sticky command header: as the user scrolls, show the command of the
-        // finished block currently passing under the viewport's top edge.
+        // Sticky command header + stick-to-bottom tracking: as the user scrolls,
+        // show the command under the top edge, and remember whether they are at the
+        // bottom so output/height changes only auto-follow when they want them to.
         {
             let ctx = ctx.clone();
-            scroll.vadjustment().connect_value_changed(move |_adj| {
+            scroll.vadjustment().connect_value_changed(move |adj| {
+                let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
+                ctx.stick_bottom.set(adj.value() >= max_val - 4.0);
                 update_sticky_header(&ctx);
             });
         }
@@ -1294,7 +1309,7 @@ fn update_active_height(ctx: &Rc<Ctx>) {
 }
 
 fn autoscroll(ctx: &Rc<Ctx>) {
-    if ctx.fullscreen.get() {
+    if ctx.fullscreen.get() || !ctx.stick_bottom.get() {
         return;
     }
     let adj = ctx.scroll.vadjustment();
