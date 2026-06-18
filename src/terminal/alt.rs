@@ -89,10 +89,38 @@ pub(crate) fn overlap_line_count(existing: &[String], next: &[String]) -> usize 
     0
 }
 
+/// Minimum frame height before the repaint heuristic engages; below this a
+/// coincidental line match is too likely.
+const MIN_REPAINT_ROWS: usize = 6;
+/// Fraction (percent) of positionally-identical non-blank rows that marks two
+/// frames as the same screen repainted in place rather than scrolled content.
+const REPAINT_IDENTICAL_PCT: usize = 30;
+
+/// Do two frames look like the *same* screen repainted in place (a live
+/// dashboard such as `top`/`htop`) rather than newly scrolled content? Such
+/// frames keep many rows byte-identical at the same position (column headers,
+/// idle processes, static labels) even as a few rows change, whereas a forward
+/// scroll shares content only through its leading/trailing overlap.
+fn looks_like_repaint(prev: &[String], next: &[String]) -> bool {
+    let rows = prev.len().min(next.len());
+    if rows < MIN_REPAINT_ROWS {
+        return false;
+    }
+    let identical = (0..rows)
+        .filter(|&i| !prev[i].trim().is_empty() && prev[i] == next[i])
+        .count();
+    identical * 100 >= rows * REPAINT_IDENTICAL_PCT
+}
+
 /// Stitch a sequence of pager frames into one document, dropping pages that are
 /// a duplicate sub-window of what we already have and de-overlapping the rest.
+/// Live dashboards that repaint the screen in place (no scroll overlap) replace
+/// the previous frame instead of stacking, so only the latest screen remains.
 pub(crate) fn merge_pager_snapshots(pages: Vec<String>) -> String {
     let mut merged: Vec<String> = Vec::new();
+    // Index in `merged` where the most recently added frame begins, so a repaint
+    // of the same screen can overwrite it in place.
+    let mut last_page_start = 0usize;
 
     for page in pages {
         let page_lines: Vec<String> = page.lines().map(|line| line.to_string()).collect();
@@ -100,6 +128,7 @@ pub(crate) fn merge_pager_snapshots(pages: Vec<String>) -> String {
             continue;
         }
         if merged.is_empty() {
+            last_page_start = 0;
             merged = page_lines;
             continue;
         }
@@ -112,6 +141,12 @@ pub(crate) fn merge_pager_snapshots(pages: Vec<String>) -> String {
             continue;
         }
         let overlap = overlap_line_count(&merged, &page_lines);
+        if overlap == 0 && looks_like_repaint(&merged[last_page_start..], &page_lines) {
+            merged.truncate(last_page_start);
+            merged.extend(page_lines);
+            continue;
+        }
+        last_page_start = merged.len() - overlap;
         merged.extend(page_lines.into_iter().skip(overlap));
     }
 
@@ -230,5 +265,23 @@ mod tests {
             "commit a\nAuthor: me".to_string(),
         ]);
         assert_eq!(merged, "commit a\nAuthor: me");
+    }
+
+    #[test]
+    fn keeps_only_latest_frame_for_in_place_repaint() {
+        // A `top`-style dashboard: header rows churn every refresh but most rows
+        // stay byte-identical at the same position. Frames must not be stacked.
+        let frame = |cpu: &str, p0: &str| {
+            format!(
+                "top - 23:34:28 up\nTasks: 280 total\n%Cpu(s): {cpu} us\n  PID USER   %CPU\n{p0}\n    1 root    0.0\n    2 root    0.0\n    3 root    0.0"
+            )
+        };
+        let merged = merge_pager_snapshots(vec![
+            frame("25.2", " 523491 mm    60.0"),
+            frame("17.9", " 524435 mm    75.0"),
+            frame("37.9", " 500844 mm   157.1"),
+        ]);
+        assert_eq!(merged, frame("37.9", " 500844 mm   157.1"));
+        assert_eq!(merged.matches("PID USER").count(), 1);
     }
 }

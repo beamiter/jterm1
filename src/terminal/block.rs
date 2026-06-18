@@ -502,6 +502,9 @@ impl Component for BlockTerminal {
                 let rows = term.row_count();
                 if (cols, rows) != last.get() && cols > 0 && rows > 0 {
                     last.set((cols, rows));
+                    if std::env::var_os("JTERM1_DBG").is_some() {
+                        eprintln!("[DBG] PTY resize -> {}x{}", cols, rows);
+                    }
                     pty.resize(cols as u16, rows as u16);
                 }
                 glib::ControlFlow::Continue
@@ -1305,6 +1308,13 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             let _ = sender.output(VteOutput::CwdChanged(path));
         }
         ParserEvent::AltScreenEnter => {
+            if std::env::var_os("JTERM1_DBG").is_some() {
+                eprintln!(
+                    "[DBG] AltScreenEnter grid={}x{}",
+                    ctx.active_vte.column_count(),
+                    ctx.active_vte.row_count()
+                );
+            }
             ctx.prev_state.set(ctx.state.get());
             ctx.state.set(BlockState::AltScreen);
             // Cancel any snapshot scheduled for the previous alt-screen session
@@ -1325,6 +1335,14 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             ctx.active_vte.feed(b"\x1b[?1049h");
         }
         ParserEvent::AltScreenLeave => {
+            if std::env::var_os("JTERM1_DBG").is_some() {
+                eprintln!(
+                    "[DBG] AltScreenLeave grid={}x{} snaps={}",
+                    ctx.active_vte.column_count(),
+                    ctx.active_vte.row_count(),
+                    ctx.pager_snapshots.borrow().len()
+                );
+            }
             // Capture the final visible frame synchronously *before* switching back
             // to the normal buffer. The deferred idle captures race with the VTE's
             // paint and frequently never land (leaving an empty block), so this is
@@ -1512,6 +1530,14 @@ fn update_active_height(ctx: &Rc<Ctx>) {
     // grid, shrinking the VTE's natural height so the (non-expanding) holder
     // collapses to it. The PTY-resize tick then follows row_count down/up.
     if ctx.active_vte.row_count() != target_rows {
+        if std::env::var_os("JTERM1_DBG").is_some() {
+            eprintln!(
+                "[DBG] resize grid {} -> {} rows (fs={})",
+                ctx.active_vte.row_count(),
+                target_rows,
+                ctx.fullscreen.get(),
+            );
+        }
         ctx.active_vte.set_size(cols, target_rows);
     }
     ctx.active_holder
@@ -1575,6 +1601,16 @@ fn finalize_block(ctx: &Rc<Ctx>) {
     }
     let output_bytes = captured_output(ctx);
     let output = String::from_utf8_lossy(&output_bytes).into_owned();
+    if std::env::var_os("JTERM1_DBG").is_some() {
+        eprintln!(
+            "[DBG] finalize cmd={:?} out_len={} out_lines={} first={:?} last={:?}",
+            command,
+            output.len(),
+            output.lines().count(),
+            output.lines().next(),
+            output.lines().last(),
+        );
+    }
     let exit_code = ctx.exit_code.get();
     let cwd = ctx.cwd.borrow().clone();
     let prompt = ctx.prompt.borrow().clone();
