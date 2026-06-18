@@ -18,6 +18,7 @@ use relm4::prelude::*;
 use gtk::glib;
 use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vte4::{TerminalExt, TerminalExtManual};
@@ -115,7 +116,7 @@ const NOTIFY_THRESHOLD_MS: u64 = 3000;
 
 /// Keyboard-nav legend shown in the bottom hint bar while a block is selected.
 const HINT_TEXT: &str =
-    "j/k move · Enter recall · n/N errors · 1-9 jump · y copy · Space fold · ,/. fold all · ? help · Esc exit";
+    "j/k move · Enter recall · n/N errors · f/F failed · 1-9 jump · y copy · Space fold · ,/. fold all · ? help · Esc exit";
 
 // ─── Shared reader/handler context ──────────────────────────────────────────
 
@@ -195,7 +196,29 @@ struct Ctx {
     filter_revealer: gtk::Revealer,
     /// The live-filter text entry.
     filter_entry: gtk::SearchEntry,
+    /// Source id of the periodic relative-time refresh timer, removed on
+    /// shutdown so it stops firing (and stops anchoring this `Ctx`).
+    relative_timer: RefCell<Option<glib::SourceId>>,
+    /// Rolling tail of the current command's output, bounded to `OUTPUT_TAIL_CAP`.
+    /// Paired with `out_buf` (the bounded head) so huge output is captured as
+    /// head + omission notice + tail instead of being held in full.
+    out_tail: RefCell<VecDeque<u8>>,
+    /// Total bytes streamed for the current command (may exceed head+tail).
+    out_total: Cell<usize>,
+    /// Set when the typed-command reconstruction was invalidated by an escape
+    /// sequence (arrow keys, history recall): finalize falls back to scraping.
+    typed_unreliable: Cell<bool>,
+    /// Last time a pager frame was scheduled for capture, for throttling.
+    pager_last_snap: Cell<Option<Instant>>,
 }
+
+/// Bounded head retained verbatim for a command's captured output.
+const OUTPUT_HEAD_CAP: usize = 256 * 1024;
+/// Bounded rolling tail retained for a command's captured output.
+const OUTPUT_TAIL_CAP: usize = 256 * 1024;
+/// Minimum spacing between scheduled pager-frame captures while in alt-screen,
+/// so continuously-repainting apps (top, htop, vim) don't scrape every frame.
+const PAGER_SNAP_MIN_INTERVAL: Duration = Duration::from_millis(150);
 
 // ─── Component ──────────────────────────────────────────────────────────────
 
@@ -384,6 +407,11 @@ impl Component for BlockTerminal {
             filter_query: RefCell::new(String::new()),
             filter_revealer: filter_revealer.clone(),
             filter_entry: filter_entry.clone(),
+            relative_timer: RefCell::new(None),
+            out_tail: RefCell::new(VecDeque::new()),
+            out_total: Cell::new(0),
+            typed_unreliable: Cell::new(false),
+            pager_last_snap: Cell::new(None),
         });
 
         // `changed` fires during the viewport's size-allocate, after layout, so
@@ -441,6 +469,15 @@ impl Component for BlockTerminal {
             active_vte.connect_commit(move |_term, text, _size| {
                 pty.write_bytes(text.as_bytes());
                 if ctx.state.get() == BlockState::AwaitingCommand {
+                    // An escape sequence (arrow keys, history recall, line edits,
+                    // accepted autosuggestion) cannot be reconstructed from commit
+                    // text. Mark the typed buffer unreliable so finalize falls back
+                    // to scraping the echoed command line instead of recording junk.
+                    if text.as_bytes().contains(&0x1b) {
+                        ctx.typed_unreliable.set(true);
+                        ctx.typed_cmd.borrow_mut().clear();
+                        return;
+                    }
                     let mut typed = ctx.typed_cmd.borrow_mut();
                     for ch in text.chars() {
                         match ch {
@@ -494,13 +531,16 @@ impl Component for BlockTerminal {
             });
         }
 
-        // Periodically refresh the relative-time labels ("2m ago").
+        // Periodically refresh the relative-time labels ("2m ago"). The source id
+        // is stored so `shutdown` can remove it; otherwise this closure (holding an
+        // `Rc<Ctx>`) keeps the whole pane alive forever after it is closed.
         {
-            let ctx = ctx.clone();
-            glib::timeout_add_seconds_local(30, move || {
-                refresh_relative_times(&ctx);
+            let ctx_t = ctx.clone();
+            let id = glib::timeout_add_seconds_local(30, move || {
+                refresh_relative_times(&ctx_t);
                 glib::ControlFlow::Continue
             });
+            *ctx.relative_timer.borrow_mut() = Some(id);
         }
 
         // Install the reader: parser events drive the block state machine.
@@ -618,6 +658,14 @@ impl Component for BlockTerminal {
                         }
                         Key::N => {
                             jump_to_error(&ctx, -1);
+                            return glib::Propagation::Stop;
+                        }
+                        Key::f => {
+                            jump_to_failed(&ctx, 1);
+                            return glib::Propagation::Stop;
+                        }
+                        Key::F => {
+                            jump_to_failed(&ctx, -1);
                             return glib::Propagation::Stop;
                         }
                         Key::y | Key::Y => {
@@ -780,6 +828,31 @@ impl Component for BlockTerminal {
             }
         }
     }
+
+    fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
+        teardown(&self.ctx);
+    }
+}
+
+/// Release the resources a closed pane would otherwise leak: stop the periodic
+/// relative-time timer (which holds an `Rc<Ctx>` and would keep firing forever),
+/// and drop every finished block (their TextViews + cached ANSI runs are the bulk
+/// of a long session's memory). Signal closures attached to `Ctx`-owned widgets
+/// can still retain the lightweight `Ctx` scaffold via GTK reference cycles, but
+/// the unbounded, growing state is freed here.
+fn teardown(ctx: &Rc<Ctx>) {
+    if let Some(id) = ctx.relative_timer.borrow_mut().take() {
+        id.remove();
+    }
+    for block in ctx.finished.borrow_mut().drain(..) {
+        ctx.block_list.remove(&block.widget);
+    }
+    while let Some(child) = ctx.minimap.first_child() {
+        ctx.minimap.remove(&child);
+    }
+    ctx.out_buf.borrow_mut().clear();
+    ctx.out_tail.borrow_mut().clear();
+    ctx.search_matches.borrow_mut().clear();
 }
 
 /// Compute the set of finished blocks matching `query`, highlight the matches in
@@ -816,6 +889,10 @@ fn search_set(ctx: &Rc<Ctx>, query: &str, use_regex: bool) {
         };
         if hit {
             matches.push(idx);
+            // A collapsed/truncated/lazy block matched on its full text but its
+            // view shows nothing (or only the head). Render + expand it so the
+            // highlight lands on visible text and the user actually sees the match.
+            expand_block_fully(ctx, block);
             highlight_matches_in_view(&block.command_view, re.as_ref(), &needle, &bg);
             if let Some(view) = &block.output_view {
                 highlight_matches_in_view(view, re.as_ref(), &needle, &bg);
@@ -1035,29 +1112,37 @@ fn animate_scroll_to(ctx: &Rc<Ctx>, target: f64) {
     });
 }
 
+/// Render a block's full output and expand it (uncollapse, untruncate) if it is
+/// currently hidden or truncated, so its content is fully visible. No-op when the
+/// block has no output view or is already fully shown.
+fn expand_block_fully(ctx: &Rc<Ctx>, block: &FinishedBlock) {
+    let Some(view) = &block.output_view else { return };
+    if !(block.truncated.get() || block.collapsed.get()) {
+        return;
+    }
+    let err_bg = error_highlight_bg(ctx);
+    render_block_output(view, &block.full_runs, &block.full_runs, false, &block.error_offsets, &err_bg);
+    block.truncated.set(false);
+    block.collapsed.set(false);
+    view.set_visible(true);
+    if let Some(b) = &block.show_more {
+        b.set_visible(false);
+    }
+    block.collapse_btn.set_label("\u{f078}");
+}
+
 /// Cycle to the next/previous detected error line within the selected block,
 /// expanding its output first, and scroll that line into view. No-op when no
 /// block is selected or the selected block has no detected errors.
 fn jump_to_error(ctx: &Rc<Ctx>, delta: i32) {
     let Some(sel) = ctx.selected_block.get() else { return };
-    let err_bg = error_highlight_bg(ctx);
     let finished = ctx.finished.borrow();
     let Some(block) = finished.get(sel) else { return };
     if block.error_offsets.is_empty() {
         return;
     }
     // Ensure the full output is rendered + visible so every error is reachable.
-    if let Some(view) = &block.output_view {
-        if block.truncated.get() || block.collapsed.get() {
-            render_block_output(view, &block.full_runs, &block.full_runs, false, &block.error_offsets, &err_bg);
-            block.truncated.set(false);
-            block.collapsed.set(false);
-            view.set_visible(true);
-            if let Some(b) = &block.show_more {
-                b.set_visible(false);
-            }
-        }
-    }
+    expand_block_fully(ctx, block);
     let n = block.error_offsets.len() as i32;
     let cur = block.error_idx.get() as i32;
     let next = ((cur + delta) % n + n) % n;
@@ -1107,11 +1192,15 @@ fn handle_data(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, data: &[u
 fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: ParserEvent) {
     match ev {
         ParserEvent::Bytes(bytes) => {
-            if contains_bell(&bytes) {
-                let _ = sender.output(VteOutput::Bell);
-            }
-            if let Some(title) = scan_title(&bytes) {
-                let _ = sender.output(VteOutput::TitleChanged(title));
+            // Only walk the chunk for BEL/OSC-title when it actually contains the
+            // trigger bytes; plain high-throughput output then skips two O(n) scans.
+            if memchr::memchr2(0x07, 0x1b, &bytes).is_some() {
+                if contains_bell(&bytes) {
+                    let _ = sender.output(VteOutput::Bell);
+                }
+                if let Some(title) = scan_title(&bytes) {
+                    let _ = sender.output(VteOutput::TitleChanged(title));
+                }
             }
             // Idle (no integration yet): treat as raw fallback once real output flows.
             if ctx.state.get() == BlockState::Idle {
@@ -1123,7 +1212,7 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                 }
                 BlockState::AwaitingCommand => ctx.cmd_buf.borrow_mut().extend_from_slice(&bytes),
                 BlockState::CollectingOutput => {
-                    ctx.out_buf.borrow_mut().extend_from_slice(&bytes);
+                    append_captured(ctx, &bytes);
                     let _ = sender.output(VteOutput::Activity);
                 }
                 BlockState::AltScreen => {
@@ -1139,13 +1228,25 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                         );
                     }
                     // Also snapshot the rendered frame after the feed below paints it,
-                    // so the finished block keeps the pager's content on exit.
-                    super::alt::schedule_pager_snapshot(
-                        &ctx.active_vte,
-                        &ctx.pager_snapshots,
-                        &ctx.pager_generation,
-                        &ctx.pager_preclear,
-                    );
+                    // so the finished block keeps the pager's content on exit. Throttled:
+                    // continuously-repainting apps (top, htop, vim) would otherwise scrape
+                    // the whole grid every frame. Page boundaries (clear-screen above) and
+                    // the final frame (on alt-screen leave) are captured unconditionally.
+                    let now = Instant::now();
+                    let due = ctx
+                        .pager_last_snap
+                        .get()
+                        .map(|t| now.duration_since(t) >= PAGER_SNAP_MIN_INTERVAL)
+                        .unwrap_or(true);
+                    if due {
+                        ctx.pager_last_snap.set(Some(now));
+                        super::alt::schedule_pager_snapshot(
+                            &ctx.active_vte,
+                            &ctx.pager_snapshots,
+                            &ctx.pager_generation,
+                            &ctx.pager_preclear,
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -1171,10 +1272,13 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             ctx.prompt_buf.borrow_mut().clear();
             ctx.cmd_buf.borrow_mut().clear();
             ctx.typed_cmd.borrow_mut().clear();
+            ctx.typed_unreliable.set(false);
             ctx.state.set(BlockState::AwaitingCommand);
         }
         ParserEvent::CommandStart => {
             ctx.out_buf.borrow_mut().clear();
+            ctx.out_tail.borrow_mut().clear();
+            ctx.out_total.set(0);
             ctx.start_time.set(Some(Instant::now()));
             ctx.has_command.set(true);
             ctx.state.set(BlockState::CollectingOutput);
@@ -1207,6 +1311,7 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             // and baseline the current frame so its stale render is dropped.
             ctx.pager_generation.set(ctx.pager_generation.get().wrapping_add(1));
             ctx.pager_snapshots.borrow_mut().clear();
+            ctx.pager_last_snap.set(None);
             // Normalize the baseline so it is comparable to the normalized frames
             // captured later; otherwise the stale pre-alt prompt line leaks in as
             // the first "page" of the recorded output.
@@ -1234,11 +1339,16 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             ctx.pager_generation.set(ctx.pager_generation.get().wrapping_add(1));
             let merged = super::alt::drain_pager_snapshots(&ctx.pager_snapshots);
             if !merged.is_empty() {
-                let mut out = ctx.out_buf.borrow_mut();
-                if !out.is_empty() && !out.ends_with(b"\n") {
-                    out.push(b'\n');
+                let need_nl = {
+                    let out = ctx.out_buf.borrow();
+                    !out.is_empty() && !out.ends_with(b"\n")
+                };
+                let mut buf = Vec::with_capacity(merged.len() + 1);
+                if need_nl {
+                    buf.push(b'\n');
                 }
-                out.extend_from_slice(merged.as_bytes());
+                buf.extend_from_slice(merged.as_bytes());
+                append_captured(ctx, &buf);
             }
             exit_fullscreen(ctx);
             ctx.state.set(ctx.prev_state.get());
@@ -1249,6 +1359,56 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             }
         }
         ParserEvent::ApcSequence(_) => {}
+    }
+}
+
+/// Append streamed command output under a memory bound: the first
+/// `OUTPUT_HEAD_CAP` bytes are kept verbatim in `out_buf`, and the last
+/// `OUTPUT_TAIL_CAP` bytes roll through `out_tail`. `out_total` records the true
+/// size so `captured_output` can reconstruct (or elide) the middle at finalize.
+fn append_captured(ctx: &Rc<Ctx>, bytes: &[u8]) {
+    ctx.out_total.set(ctx.out_total.get() + bytes.len());
+    {
+        let mut head = ctx.out_buf.borrow_mut();
+        if head.len() < OUTPUT_HEAD_CAP {
+            let take = (OUTPUT_HEAD_CAP - head.len()).min(bytes.len());
+            head.extend_from_slice(&bytes[..take]);
+        }
+    }
+    let mut tail = ctx.out_tail.borrow_mut();
+    if bytes.len() >= OUTPUT_TAIL_CAP {
+        tail.clear();
+        tail.extend(bytes[bytes.len() - OUTPUT_TAIL_CAP..].iter().copied());
+    } else {
+        tail.extend(bytes.iter().copied());
+        while tail.len() > OUTPUT_TAIL_CAP {
+            tail.pop_front();
+        }
+    }
+}
+
+/// Reconstruct the captured output from the bounded head + tail. When the command
+/// produced no more than the caps allow, this is the exact output; otherwise the
+/// elided middle is replaced by a one-line notice.
+fn captured_output(ctx: &Rc<Ctx>) -> Vec<u8> {
+    let head = ctx.out_buf.borrow();
+    let total = ctx.out_total.get();
+    if total <= head.len() {
+        return head.clone();
+    }
+    let tail: Vec<u8> = ctx.out_tail.borrow().iter().copied().collect();
+    if head.len() + tail.len() >= total {
+        // Head and tail meet or overlap: stitch without loss.
+        let skip = head.len().saturating_sub(total - tail.len());
+        let mut out = head.clone();
+        out.extend_from_slice(&tail[skip..]);
+        out
+    } else {
+        let omitted = total - head.len() - tail.len();
+        let mut out = head.clone();
+        out.extend_from_slice(format!("\n…({omitted} bytes omitted)…\n").as_bytes());
+        out.extend_from_slice(&tail);
+        out
     }
 }
 
@@ -1398,7 +1558,7 @@ fn finalize_block(ctx: &Rc<Ctx>) {
     // Prefer the keystroke-reconstructed command; fall back to scraping the last
     // line of the echoed output (e.g. for history recall / paste).
     let typed = ctx.typed_cmd.borrow().trim().to_string();
-    let command = if !typed.is_empty() {
+    let command = if !typed.is_empty() && !ctx.typed_unreliable.get() {
         typed
     } else {
         strip_ansi(&ctx.cmd_buf.borrow())
@@ -1413,7 +1573,8 @@ fn finalize_block(ctx: &Rc<Ctx>) {
         reset_active(ctx);
         return;
     }
-    let output = String::from_utf8_lossy(&ctx.out_buf.borrow()).into_owned();
+    let output_bytes = captured_output(ctx);
+    let output = String::from_utf8_lossy(&output_bytes).into_owned();
     let exit_code = ctx.exit_code.get();
     let cwd = ctx.cwd.borrow().clone();
     let prompt = ctx.prompt.borrow().clone();
@@ -1577,8 +1738,45 @@ fn append_block_history(
     {
         Ok(mut file) => {
             let _ = writeln!(file, "{line}");
+            drop(file);
+            maybe_rotate_history(&path);
         }
         Err(err) => log::warn!("Failed to append block history to {path}: {err}"),
+    }
+}
+
+/// Cap unbounded growth of the history file. Once it exceeds `HISTORY_MAX_BYTES`,
+/// rewrite it keeping only the most recent `HISTORY_KEEP_RECORDS` lines.
+fn maybe_rotate_history(path: &str) {
+    const HISTORY_MAX_BYTES: u64 = 4 * 1024 * 1024;
+    const HISTORY_KEEP_RECORDS: usize = 2000;
+    let too_big = std::fs::metadata(path)
+        .map(|m| m.len() > HISTORY_MAX_BYTES)
+        .unwrap_or(false);
+    if !too_big {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= HISTORY_KEEP_RECORDS {
+        return;
+    }
+    let start = lines.len() - HISTORY_KEEP_RECORDS;
+    let kept = lines[start..].join("\n");
+    let tmp = format!("{path}.tmp");
+    use std::io::Write;
+    let write_ok = std::fs::File::create(&tmp)
+        .and_then(|mut f| writeln!(f, "{kept}"))
+        .is_ok();
+    if write_ok {
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            log::warn!("Failed to rotate block history {path}: {err}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -1748,6 +1946,40 @@ fn jump_to_nth_visible(ctx: &Rc<Ctx>, n: usize) {
     select_block(ctx, Some(idx));
 }
 
+/// Cycle the selection to the next/previous *failed* (non-zero exit) visible
+/// block, wrapping around. Starts from the current selection if any.
+fn jump_to_failed(ctx: &Rc<Ctx>, delta: i32) {
+    let visible = visible_indices(ctx);
+    if visible.is_empty() {
+        return;
+    }
+    let failed: Vec<usize> = {
+        let finished = ctx.finished.borrow();
+        visible
+            .iter()
+            .copied()
+            .filter(|&i| finished.get(i).map(|b| b.exit_code != 0).unwrap_or(false))
+            .collect()
+    };
+    if failed.is_empty() {
+        return;
+    }
+    let cur = ctx.selected_block.get();
+    let pos = cur.and_then(|c| failed.iter().position(|&i| i == c));
+    let n = failed.len() as i32;
+    let next = match pos {
+        None => {
+            if delta < 0 {
+                failed.len() - 1
+            } else {
+                0
+            }
+        }
+        Some(p) => (((p as i32 + delta) % n + n) % n) as usize,
+    };
+    select_block(ctx, Some(failed[next]));
+}
+
 /// Step the block selection by `delta` (+1 = next/down, -1 = prev/up) over the
 /// currently *visible* finished blocks, clamping at the ends. With no current
 /// selection, Up selects the last visible block and Down selects the first.
@@ -1799,7 +2031,10 @@ fn reset_active(ctx: &Rc<Ctx>) {
     ctx.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
     ctx.cmd_buf.borrow_mut().clear();
     ctx.typed_cmd.borrow_mut().clear();
+    ctx.typed_unreliable.set(false);
     ctx.out_buf.borrow_mut().clear();
+    ctx.out_tail.borrow_mut().clear();
+    ctx.out_total.set(0);
     ctx.has_command.set(false);
     ctx.exit_code.set(0);
     ctx.duration.set(None);
@@ -1876,7 +2111,21 @@ fn build_finished_block(
 
     let cwd_label = gtk::Label::new(Some(&shorten_path(cwd)));
     cwd_label.add_css_class("block-header-label");
+    cwd_label.add_css_class("block-cwd-label");
     cwd_label.set_xalign(0.0);
+    cwd_label.set_tooltip_text(Some("Click to cd here"));
+    if !cwd.is_empty() {
+        let click = gtk::GestureClick::new();
+        let ctx_cd = ctx.clone();
+        let cwd_owned = cwd.to_string();
+        click.connect_released(move |_, _, _, _| {
+            ctx_cd.pty.write_bytes(b"\x15");
+            ctx_cd
+                .pty
+                .write_bytes(format!("cd {}\r", shell_quote(&cwd_owned)).as_bytes());
+        });
+        cwd_label.add_controller(click);
+    }
     header.append(&cwd_label);
 
     let spacer = gtk::Box::new(Orientation::Horizontal, 0);
@@ -1943,6 +2192,23 @@ fn build_finished_block(
         });
     }
     action_box.append(&rerun);
+
+    // Recall: load the command into the live input line (Ctrl+U to clear, then
+    // type it) without running it, so it can be edited first. Nerd Font pencil ().
+    let recall = gtk::Button::with_label("\u{f044}");
+    recall.add_css_class("block-action-btn");
+    recall.add_css_class("flat");
+    recall.set_tooltip_text(Some("Recall command into input"));
+    {
+        let ctx = ctx.clone();
+        let cmd = command.to_string();
+        recall.connect_clicked(move |_| {
+            ctx.pty.write_bytes(b"\x15");
+            ctx.pty.write_bytes(cmd.as_bytes());
+            ctx.typed_cmd.borrow_mut().clear();
+        });
+    }
+    action_box.append(&recall);
 
     // Copy error report (failed blocks only): command + exit code + error lines,
     // formatted for pasting into an AI assistant or bug report. Nerd Font bug ().
@@ -2549,6 +2815,11 @@ fn rgba_to_hex(c: &RGBA) -> String {
     )
 }
 
+/// Single-quote a path for safe interpolation into a shell command line.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn shorten_path(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let display = if !home.is_empty() && path.starts_with(&home) {
@@ -2732,6 +3003,7 @@ fn show_cheatsheet(ctx: &Rc<Ctx>) {
         gg / G           first / last block\n\
         1-9              jump to block N\n\
         n / N            next / prev error\n\
+        f / F            next / prev failed block\n\
         Enter            recall command\n\
         y                copy block\n\
         Space            fold / unfold block\n\
@@ -2984,6 +3256,7 @@ fn install_block_css(config: &Config) {
             padding: 2px 6px;
         }}
         .block-header-label {{ color: {dim_fg}; font-size: 0.85em; }}
+        .block-cwd-label:hover {{ color: {fg_hex}; text-decoration: underline; }}
         .block-command-view {{
             color: {fg_hex};
             font-family: "{font_family}";
