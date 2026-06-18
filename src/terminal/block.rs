@@ -366,20 +366,13 @@ impl Component for BlockTerminal {
             filter_entry: filter_entry.clone(),
         });
 
-        // Keep the active card pinned to the viewport height. `vexpand` is inert
-        // along the scroll axis (the viewport hands the child its natural height),
-        // so without this the active card collapses to ~1 row once finished blocks
-        // fill the viewport — and that 1-row allocation is what gets forwarded to
-        // the PTY, so pagers/`git log` render into a single line. Pinning the card
-        // to `page_size` keeps the live VTE at a full screen of rows, like a normal
-        // terminal with history above.
+        // Size the active card to its content (warp-style): compact while typing,
+        // growing as a command streams output, full-screen only for alt-screen
+        // apps / no-OSC133 shells. Re-clamp whenever the viewport changes (resize).
         {
             let ctx = ctx.clone();
-            scroll.vadjustment().connect_changed(move |adj| {
-                let page = adj.page_size();
-                if page > 1.0 {
-                    ctx.active_holder.set_height_request(page as i32);
-                }
+            scroll.vadjustment().connect_changed(move |_adj| {
+                update_active_height(&ctx);
             });
         }
 
@@ -1070,6 +1063,7 @@ fn handle_data(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, data: &[u
     for ev in events {
         handle_event(ctx, sender, ev);
     }
+    update_active_height(ctx);
     autoscroll(ctx);
 }
 
@@ -1219,6 +1213,84 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
         }
         ParserEvent::ApcSequence(_) => {}
     }
+}
+
+/// Compact minimum height for the active (input) card, in text rows. Keeps the
+/// prompt + an input line visible without ballooning to the full screen.
+const MIN_ACTIVE_ROWS: i64 = 3;
+
+/// Count the number of visual rows `bytes` occupy when rendered at `cols`
+/// columns, counting line wraps. ANSI escape sequences and UTF-8 continuation
+/// bytes are skipped so the width estimate is reasonable. Scanning stops once
+/// `cap` rows are reached, bounding the cost for huge output.
+fn count_wrapped_rows(bytes: &[u8], cols: i64, cap: i64) -> i64 {
+    let cols = cols.max(1);
+    let mut rows: i64 = 0;
+    let mut col: i64 = 0;
+    let mut esc = false;
+    for &b in bytes {
+        if esc {
+            // Crude CSI/escape skip: terminates on a final byte (ASCII letter).
+            if b.is_ascii_alphabetic() {
+                esc = false;
+            }
+            continue;
+        }
+        match b {
+            0x1b => esc = true,
+            b'\n' => {
+                rows += 1;
+                col = 0;
+            }
+            b'\r' => col = 0,
+            // Advance one cell per character, ignoring UTF-8 continuation bytes.
+            b if b >= 0x20 && (b & 0xc0) != 0x80 => {
+                col += 1;
+                if col >= cols {
+                    rows += 1;
+                    col = 0;
+                }
+            }
+            _ => {}
+        }
+        if rows >= cap {
+            return cap;
+        }
+    }
+    rows + if col > 0 { 1 } else { 0 }
+}
+
+/// Resize the active card to fit its current content, clamped between a compact
+/// input minimum and the viewport height. Alt-screen apps and no-OSC133 shells
+/// get the full viewport (they behave as a normal full-screen terminal). This
+/// keeps the live input compact with history stacked above (warp-style) while
+/// letting command output expand the card as it streams.
+fn update_active_height(ctx: &Rc<Ctx>) {
+    let page_px = ctx.scroll.vadjustment().page_size();
+    if page_px <= 1.0 {
+        return;
+    }
+    let ch = ctx.active_vte.char_height();
+    if ch <= 1 {
+        return; // terminal not realized yet
+    }
+    let page_rows = (page_px as i64 / ch).max(1);
+
+    let target_rows = if ctx.fullscreen.get() || ctx.state.get() == BlockState::RawFallback {
+        page_rows
+    } else {
+        let cols = ctx.active_vte.column_count().max(1);
+        let cmd_rows = count_wrapped_rows(ctx.typed_cmd.borrow().as_bytes(), cols, page_rows);
+        let content = match ctx.state.get() {
+            BlockState::CollectingOutput | BlockState::PostCommand => {
+                1 + cmd_rows + count_wrapped_rows(&ctx.out_buf.borrow(), cols, page_rows)
+            }
+            _ => 1 + cmd_rows,
+        };
+        content.clamp(MIN_ACTIVE_ROWS, page_rows)
+    };
+    ctx.active_holder
+        .set_height_request((target_rows * ch) as i32);
 }
 
 fn autoscroll(ctx: &Rc<Ctx>) {
