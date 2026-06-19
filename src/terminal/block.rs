@@ -172,6 +172,11 @@ struct Ctx {
     pager_preclear: Rc<RefCell<String>>,
     /// True while an alt-screen app owns the viewport (finished blocks hidden).
     fullscreen: Cell<bool>,
+    /// True when we promoted the active card to fullscreen via the curses-style
+    /// heuristic (smkx — `\e[?1h`) rather than a real `?1049h`. Tracked so the
+    /// teardown sequence (`\e[?1l`) or CommandEnd knows to undo our promotion
+    /// without disturbing real alt-screen flows.
+    tui_promoted: Cell<bool>,
     /// Last `(cols, rows)` we asked `active_vte.set_size` for. Compared against
     /// the freshly computed target each frame so we only re-assert when our
     /// *preference* actually changes — never just because GTK's allocation
@@ -417,6 +422,7 @@ impl Component for BlockTerminal {
             selected_block: Cell::new(None),
             pager_preclear: Rc::new(RefCell::new(String::new())),
             fullscreen: Cell::new(false),
+            tui_promoted: Cell::new(false),
             last_size_target: Cell::new((0, 0)),
             sticky_header: sticky_header.clone(),
             sticky_label: sticky_label.clone(),
@@ -1284,6 +1290,21 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                 BlockState::AwaitingCommand => ctx.cmd_buf.borrow_mut().extend_from_slice(&bytes),
                 BlockState::CollectingOutput => {
                     append_captured(ctx, &bytes);
+                    // TUI promotion: curses programs (top, htop, watch, less without
+                    // -X, vim without `set t_ti=`) emit `\e[?1h` (smkx) at startup
+                    // and `\e[?1l` (rmkx) on exit. Programs that just print to a
+                    // scrolling terminal — including progress bars — never set
+                    // application cursor mode. Treat the on/off pair as
+                    // "command wants the whole viewport," same as a real
+                    // `\e[?1049h` alt-screen but without trampling the captured
+                    // bytes (we still want the last frame in block history).
+                    if !ctx.tui_promoted.get() && contains_seq(&bytes, b"\x1b[?1h") {
+                        ctx.tui_promoted.set(true);
+                        enter_fullscreen(ctx);
+                    } else if ctx.tui_promoted.get() && contains_seq(&bytes, b"\x1b[?1l") {
+                        ctx.tui_promoted.set(false);
+                        exit_fullscreen(ctx);
+                    }
                     let _ = sender.output(VteOutput::Activity);
                 }
                 BlockState::AltScreen => {
@@ -1336,6 +1357,12 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             ctx.duration.set(elapsed);
             ctx.end_time_ms.set(Some(now_ms()));
             ctx.state.set(BlockState::PostCommand);
+            // Safety: a TUI that exited without rmkx (`\e[?1l`) — e.g. killed
+            // by a signal — would leave us promoted forever. Drop the
+            // promotion at command boundaries.
+            if ctx.tui_promoted.replace(false) {
+                exit_fullscreen(ctx);
+            }
 
             // In-app completion notice: only when the command was slow enough to
             // matter AND the user isn't watching (tab inactive or scrolled away
@@ -2176,6 +2203,9 @@ fn reset_active(ctx: &Rc<Ctx>) {
     // reset() does not reliably round-trip with our cached preference, so the
     // shrink to a compact prompt grid would be skipped if we left it stale.
     ctx.last_size_target.set((0, 0));
+    if ctx.tui_promoted.replace(false) {
+        exit_fullscreen(ctx);
+    }
     // `reset()` acts on the emulator state immediately, but `feed()` bytes are
     // parsed asynchronously: the just-finished command's output is still queued
     // and would replay onto the cleared grid, leaving stale lines above the next
@@ -2932,6 +2962,17 @@ fn contains_bell(bytes: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Naive substring search; we only call it with short literal needles like
+/// `\e[?1h` so a windowed comparison is cheaper than pulling in `memchr::memmem`.
+/// The parser guarantees each CSI sequence lands intact in a single Bytes
+/// payload, so a needle never straddles chunk boundaries.
+fn contains_seq(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Extract a window title from an OSC 0/2 sequence, if present.
