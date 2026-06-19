@@ -33,7 +33,7 @@ pub use super::vte::{VteInit, VteInput, VteOutput};
 
 // ─── Block state machine ────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BlockState {
     /// No OSC 133 marks seen yet — waiting to learn if the shell has integration.
     Idle,
@@ -1595,13 +1595,20 @@ fn update_active_height(ctx: &Rc<Ctx>) {
     // larger — the cell would stay full-height. `set_size` sets the preferred
     // grid, shrinking the VTE's natural height so the (non-expanding) holder
     // collapses to it. The PTY-resize tick then follows row_count down/up.
-    if ctx.active_vte.row_count() != target_rows {
+    // Accept a 1-row undershoot as settled: when GTK's allocation falls a
+    // fraction of a row short of our target (subpixel rounding, undeclared CSS
+    // padding, scrollbar appearance), VTE returns target_rows-1. Re-asserting
+    // target_rows every frame would just oscillate set_size between N and N-1,
+    // SIGWINCHing the running app at frame rate. Only resize when the gap is
+    // wider than a single row — and always when the VTE is too tall, since
+    // overflow is what alt-screen apps must not see.
+    let cur = ctx.active_vte.row_count();
+    let lower = (target_rows - 1).max(MIN_ACTIVE_ROWS);
+    if cur > target_rows || cur < lower {
         if std::env::var_os("JTERM1_DBG").is_some() {
             eprintln!(
                 "[DBG] resize grid {} -> {} rows (fs={})",
-                ctx.active_vte.row_count(),
-                target_rows,
-                ctx.fullscreen.get(),
+                cur, target_rows, ctx.fullscreen.get(),
             );
         }
         ctx.active_vte.set_size(cols, target_rows);
@@ -1630,6 +1637,14 @@ fn enter_fullscreen(ctx: &Rc<Ctx>) {
         block.widget.set_visible(false);
     }
     ctx.sticky_header.set_visible(false);
+    // Hide the cwd/git-branch chip strip too: an alt-screen app expects the
+    // full viewport, and the chips sit above the VTE inside the active card.
+    // Leaving them visible costs ~1 row of pixels that the chrome-math doesn't
+    // account for, and GTK then rounds the VTE down by one row — we retarget
+    // every frame, GTK rounds back, and the resulting set_size churn SIGWINCHes
+    // the running app at frame rate (visible flicker in top/htop). Restore on
+    // exit_fullscreen via update_active_prompt.
+    ctx.active_prompt.set_visible(false);
 }
 
 /// Restore the block list when the alt-screen app exits, re-applying the active
@@ -1641,6 +1656,7 @@ fn exit_fullscreen(ctx: &Rc<Ctx>) {
     for block in ctx.finished.borrow().iter() {
         block.widget.set_visible(block_visible(ctx, block));
     }
+    update_active_prompt(ctx);
     rebuild_minimap(ctx);
 }
 
