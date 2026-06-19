@@ -17,6 +17,8 @@ pub(crate) enum Action {
     OpacityDecrease,
     ToggleSearch,
     ToggleCommandPalette,
+    OpenPalette,
+    OpenHistoryPalette,
     ToggleSettings,
     ToggleSidebar,
     SplitHorizontal,
@@ -68,7 +70,9 @@ impl Action {
             Action::OpacityIncrease => "Opacity increase",
             Action::OpacityDecrease => "Opacity decrease",
             Action::ToggleSearch => "Toggle search",
-            Action::ToggleCommandPalette => "Command palette",
+            Action::ToggleCommandPalette => "Command palette (actions)",
+            Action::OpenPalette => "Palette: search everything",
+            Action::OpenHistoryPalette => "Palette: search history",
             Action::ToggleSettings => "Toggle settings panel",
             Action::ToggleSidebar => "Toggle sidebar",
             Action::SplitHorizontal => "Split horizontal",
@@ -132,6 +136,8 @@ impl Action {
             Action::OpacityDecrease => Some("opacity_decrease"),
             Action::ToggleSearch => Some("toggle_search"),
             Action::ToggleCommandPalette => Some("toggle_command_palette"),
+            Action::OpenPalette => Some("open_palette"),
+            Action::OpenHistoryPalette => Some("open_history_palette"),
             Action::ToggleSettings => Some("toggle_settings"),
             Action::ToggleSidebar => Some("toggle_sidebar"),
             Action::SplitHorizontal => Some("split_horizontal"),
@@ -184,6 +190,8 @@ impl Action {
             Action::OpacityDecrease,
             Action::ToggleSearch,
             Action::ToggleCommandPalette,
+            Action::OpenPalette,
+            Action::OpenHistoryPalette,
             Action::ToggleSettings,
             Action::ToggleSidebar,
             Action::SplitHorizontal,
@@ -407,6 +415,12 @@ impl KeybindingMap {
         bind("Ctrl+Shift+K", Action::OpacityIncrease);
         bind("Ctrl+Shift+F", Action::ToggleSearch);
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
+        // Ctrl+r hijacks the shell's reverse-i-search to bring up the same
+        // palette filtered to shell history (jterm1 picks the bookmark-style
+        // UI over readline). OpenPalette (all sources) is unbound by default
+        // because Ctrl+p would steal readline's previous-history binding;
+        // users who want it can set it in config.
+        bind("Ctrl+r",       Action::OpenHistoryPalette);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
         bind("Ctrl+backslash", Action::ToggleSidebar);
         bind("Ctrl+Shift+L", Action::FilterTabs);

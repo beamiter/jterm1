@@ -236,7 +236,9 @@ pub(crate) fn spawn_shell(
     }
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-    let envv: &[&str] = &[];
+    // Advertise ourselves so users can gate `source jterm1.{bash,zsh,fish}` on
+    // `[[ $TERM_PROGRAM == jterm1 ]]` in their rc files.
+    let envv: &[&str] = &["TERM_PROGRAM=jterm1"];
     let spawn_flags = SpawnFlags::SEARCH_PATH;
     let cancellable: Option<&Cancellable> = None;
     let home = std::env::var("HOME").ok();

@@ -4,6 +4,7 @@ mod config;
 mod dialogs;
 mod file_tree;
 mod keybindings;
+mod palette;
 mod parser;
 mod process;
 mod pty;
@@ -74,6 +75,9 @@ enum AppMsg {
     FileTreeGoUp,
     /// Sidebar: switch between the tab list and the file tree view.
     SetSidebarView(config::SidebarView),
+    /// Palette accepted a command — type it into the active pane (no newline)
+    /// so the user can edit before submitting.
+    PaletteTypeCommand(String),
     Ignore,
 }
 
@@ -201,6 +205,9 @@ struct AppModel {
     command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
+    /// Inline Ctrl+R history popover anchored to the active terminal widget.
+    /// One per app — opening it on a different terminal moves it.
+    history_popover: Rc<RefCell<Option<gtk::Popover>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1374,6 +1381,30 @@ impl AppModel {
                     sender,
                 );
             }
+            Action::OpenPalette => {
+                let history = self.config.borrow().block_history_path.clone();
+                dialogs::toggle_palette(
+                    &self.window,
+                    &self.kbmap,
+                    history.as_deref().map(std::path::Path::new),
+                    &self.command_palette_dialog,
+                    sender,
+                    palette::PaletteMode::All,
+                );
+            }
+            Action::OpenHistoryPalette => {
+                let history = self.config.borrow().block_history_path.clone();
+                if let Some(term) = self.active_terminal() {
+                    let anchor = term.widget();
+                    dialogs::toggle_history_popover(
+                        &anchor,
+                        &self.kbmap,
+                        history.as_deref().map(std::path::Path::new),
+                        &self.history_popover,
+                        sender,
+                    );
+                }
+            }
             Action::ToggleSettings => {
                 dialogs::toggle_settings(
                     &self.window,
@@ -2213,6 +2244,7 @@ impl SimpleComponent for AppModel {
             command_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
+            history_popover: Rc::new(RefCell::new(None)),
         };
 
         let widgets = view_output!();
@@ -2460,6 +2492,12 @@ impl SimpleComponent for AppModel {
                 if let Some(term) = self.active_terminal() {
                     let snippet = format!("{} ", file_tree::shell_quote(&path));
                     term.emit(VteInput::WriteInput(snippet.into_bytes()));
+                    term.emit(VteInput::GrabFocus);
+                }
+            }
+            AppMsg::PaletteTypeCommand(cmd) => {
+                if let Some(term) = self.active_terminal() {
+                    term.emit(VteInput::WriteInput(cmd.into_bytes()));
                     term.emit(VteInput::GrabFocus);
                 }
             }

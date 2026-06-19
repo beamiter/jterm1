@@ -16,38 +16,58 @@ use std::rc::Rc;
 
 use crate::config::{Config, Theme};
 use crate::keybindings::{Action, KeybindingMap};
+use crate::palette::{self, Accept, PaletteMode, Query};
 use crate::{AppModel, AppMsg};
 
-/// Fuzzy-filterable list of every bound action. Activating a row dispatches the
-/// action and closes the palette. A second invocation toggles it closed.
+/// Open the palette in command-only mode (kept for backwards-compat with the
+/// `ToggleCommandPalette` action and `Ctrl+Shift+P`).
 pub(crate) fn toggle_command_palette(
     window: &adw::ApplicationWindow,
     kbmap: &Rc<RefCell<KeybindingMap>>,
     dialog_ref: &Rc<RefCell<Option<adw::Dialog>>>,
     sender: &ComponentSender<AppModel>,
 ) {
+    toggle_palette(window, kbmap, None, dialog_ref, sender, PaletteMode::Commands);
+}
+
+/// Fuzzy palette over actions and shell history. `default_mode` decides what
+/// sources are initially included; the user can still narrow with a `>` or `@`
+/// prefix. A second invocation toggles it closed.
+pub(crate) fn toggle_palette(
+    window: &adw::ApplicationWindow,
+    kbmap: &Rc<RefCell<KeybindingMap>>,
+    history_path: Option<&std::path::Path>,
+    dialog_ref: &Rc<RefCell<Option<adw::Dialog>>>,
+    sender: &ComponentSender<AppModel>,
+    default_mode: PaletteMode,
+) {
     if let Some(dialog) = dialog_ref.borrow_mut().take() {
         dialog.force_close();
         return;
     }
 
-    let bound = kbmap.borrow().all_bound_actions();
-    let actions_data: Rc<Vec<(Action, String, String)>> = Rc::new(
-        bound
-            .iter()
-            .map(|(action, binding)| (*action, action.name().to_string(), binding.clone()))
-            .collect(),
-    );
+    let history_path = history_path.map(|p| p.to_path_buf());
+
+    let title = match default_mode {
+        PaletteMode::All => "Palette",
+        PaletteMode::Commands => "Command Palette",
+        PaletteMode::History => "History",
+    };
+    let placeholder = match default_mode {
+        PaletteMode::All => "Search commands and history…",
+        PaletteMode::Commands => "Search commands…  (try @ for history)",
+        PaletteMode::History => "Search history…  (try > for commands)",
+    };
 
     let dialog = adw::Dialog::builder()
-        .title("Command Palette")
-        .content_width(480)
-        .content_height(480)
+        .title(title)
+        .content_width(560)
+        .content_height(520)
         .build();
 
     let header_bar = adw::HeaderBar::new();
     let filter_entry = gtk::SearchEntry::new();
-    filter_entry.set_placeholder_text(Some("Search commands..."));
+    filter_entry.set_placeholder_text(Some(placeholder));
     filter_entry.set_hexpand(true);
     filter_entry.set_margin_start(12);
     filter_entry.set_margin_end(12);
@@ -60,22 +80,6 @@ pub(crate) fn toggle_command_palette(
     list_box.set_margin_start(12);
     list_box.set_margin_end(12);
     list_box.set_margin_bottom(12);
-
-    for (_, description, binding) in actions_data.iter() {
-        let row = adw::ActionRow::builder()
-            .title(description.as_str())
-            .activatable(true)
-            .build();
-        if !binding.is_empty() {
-            let key_label = gtk::Label::new(Some(binding));
-            key_label.add_css_class("dim-label");
-            row.add_suffix(&key_label);
-        }
-        list_box.append(&row);
-    }
-    if let Some(first_row) = list_box.row_at_index(0) {
-        list_box.select_row(Some(&first_row));
-    }
 
     let scrolled = gtk::ScrolledWindow::builder()
         .hexpand(true)
@@ -92,50 +96,81 @@ pub(crate) fn toggle_command_palette(
     toolbar_view.set_content(Some(&search_box));
     dialog.set_child(Some(&toolbar_view));
 
-    // Substring filter over description + binding.
-    {
+    // Each rebuild stores the entries' accept handlers here so row-activation
+    // can resolve a row index back to the chosen Accept.
+    let accepts: Rc<RefCell<Vec<Accept>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let rebuild: Rc<dyn Fn(&str)> = {
+        let kbmap = kbmap.clone();
+        let history_path = history_path.clone();
         let list_box = list_box.clone();
-        let actions_data = actions_data.clone();
-        filter_entry.connect_search_changed(move |entry| {
-            let query = entry.text().to_lowercase();
-            let mut first_visible: Option<gtk::ListBoxRow> = None;
-            for (idx, (_, desc, binding)) in actions_data.iter().enumerate() {
-                if let Some(row) = list_box.row_at_index(idx as i32) {
-                    let visible = query.is_empty()
-                        || desc.to_lowercase().contains(&query)
-                        || binding.to_lowercase().contains(&query);
-                    row.set_visible(visible);
-                    if visible && first_visible.is_none() {
-                        first_visible = Some(row);
+        let accepts = accepts.clone();
+        Rc::new(move |needle: &str| {
+            let query = Query::parse(needle, default_mode);
+            let entries = palette::gather(&query, &kbmap.borrow(), history_path.as_deref(), 200);
+
+            // Clear existing rows.
+            while let Some(row) = list_box.row_at_index(0) {
+                list_box.remove(&row);
+            }
+            accepts.borrow_mut().clear();
+
+            for entry in entries.into_iter() {
+                let row = adw::ActionRow::builder()
+                    .title(glib_escape(&entry.label))
+                    .activatable(true)
+                    .build();
+                if let Some(sub) = entry.sublabel.as_ref() {
+                    if !sub.is_empty() {
+                        row.set_subtitle(&glib_escape(sub));
                     }
                 }
+                if let Some(right) = entry.right.as_ref() {
+                    let key_label = gtk::Label::new(Some(right));
+                    key_label.add_css_class("dim-label");
+                    row.add_suffix(&key_label);
+                }
+                list_box.append(&row);
+                accepts.borrow_mut().push(entry.accept);
             }
-            if let Some(row) = first_visible {
-                list_box.select_row(Some(&row));
+            if let Some(first_row) = list_box.row_at_index(0) {
+                list_box.select_row(Some(&first_row));
             }
+        })
+    };
+
+    rebuild("");
+
+    {
+        let rebuild = rebuild.clone();
+        filter_entry.connect_search_changed(move |entry| {
+            rebuild(&entry.text());
         });
     }
 
-    let fire: Rc<dyn Fn(usize)> = {
+    let fire: Rc<dyn Fn(i32)> = {
         let sender = sender.clone();
-        let actions_data = actions_data.clone();
         let dialog = dialog.clone();
-        Rc::new(move |idx: usize| {
-            if let Some((action, _, _)) = actions_data.get(idx) {
-                let action = *action;
-                dialog.force_close();
-                sender.input(AppMsg::Action(action));
+        let accepts = accepts.clone();
+        Rc::new(move |idx: i32| {
+            if idx < 0 { return; }
+            let accept = match accepts.borrow().get(idx as usize) {
+                Some(a) => a.clone(),
+                None => return,
+            };
+            dialog.force_close();
+            match accept {
+                Accept::Action(a) => sender.input(AppMsg::Action(a)),
+                Accept::TypeCommand(cmd) => sender.input(AppMsg::PaletteTypeCommand(cmd)),
             }
         })
     };
 
     {
         let fire = fire.clone();
-        list_box.connect_row_activated(move |_, row| fire(row.index() as usize));
+        list_box.connect_row_activated(move |_, row| fire(row.index()));
     }
 
-    // Escape closes; Enter fires the selected row; Up/Down navigate while the
-    // search entry keeps keyboard focus.
     let key_controller = gtk::EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     {
@@ -154,33 +189,23 @@ pub(crate) fn toggle_command_palette(
             }
             if matches!(keyval, Key::Return | Key::KP_Enter) {
                 if let Some(row) = list_box.selected_row() {
-                    fire(row.index() as usize);
+                    fire(row.index());
                 }
                 return gtk::glib::Propagation::Stop;
             }
             if keyval == Key::Down {
                 let cur = list_box.selected_row().map(|r| r.index()).unwrap_or(-1);
-                let mut next = cur + 1;
-                while let Some(row) = list_box.row_at_index(next) {
-                    if row.is_visible() {
-                        list_box.select_row(Some(&row));
-                        break;
-                    }
-                    next += 1;
+                if let Some(row) = list_box.row_at_index(cur + 1) {
+                    list_box.select_row(Some(&row));
                 }
                 return gtk::glib::Propagation::Stop;
             }
             if keyval == Key::Up {
                 let cur = list_box.selected_row().map(|r| r.index()).unwrap_or(0);
-                let mut prev = cur - 1;
-                while prev >= 0 {
-                    if let Some(row) = list_box.row_at_index(prev) {
-                        if row.is_visible() {
-                            list_box.select_row(Some(&row));
-                            break;
-                        }
+                if cur > 0 {
+                    if let Some(row) = list_box.row_at_index(cur - 1) {
+                        list_box.select_row(Some(&row));
                     }
-                    prev -= 1;
                 }
                 return gtk::glib::Propagation::Stop;
             }
@@ -199,6 +224,192 @@ pub(crate) fn toggle_command_palette(
     *dialog_ref.borrow_mut() = Some(dialog.clone());
     dialog.present(Some(window));
     filter_entry.grab_focus();
+}
+
+/// Inline history search anchored to the active terminal widget — the
+/// jterm1 equivalent of warp's Ctrl-R inline menu. Floats above the terminal
+/// (PositionType::Top) and dismisses on focus loss. The chosen command is
+/// typed into the active pane without submitting (the user reviews and runs).
+///
+/// Re-invoking while already open closes it (toggle semantics, matches the
+/// rest of the palette).
+pub(crate) fn toggle_history_popover(
+    anchor: &gtk::Widget,
+    kbmap: &Rc<RefCell<KeybindingMap>>,
+    history_path: Option<&std::path::Path>,
+    popover_ref: &Rc<RefCell<Option<gtk::Popover>>>,
+    sender: &ComponentSender<AppModel>,
+) {
+    if let Some(p) = popover_ref.borrow_mut().take() {
+        p.popdown();
+        p.unparent();
+        return;
+    }
+
+    let history_path = history_path.map(|p| p.to_path_buf());
+
+    let popover = gtk::Popover::new();
+    popover.set_parent(anchor);
+    popover.set_position(gtk::PositionType::Top);
+    popover.set_autohide(true);
+    popover.set_has_arrow(false);
+    popover.set_size_request(520, 360);
+
+    let filter_entry = gtk::SearchEntry::new();
+    filter_entry.set_placeholder_text(Some("Search history…  (try > for commands)"));
+    filter_entry.set_hexpand(true);
+
+    let list_box = gtk::ListBox::new();
+    list_box.set_selection_mode(gtk::SelectionMode::Single);
+    list_box.add_css_class("boxed-list");
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .child(&list_box)
+        .build();
+
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    vbox.set_margin_start(8);
+    vbox.set_margin_end(8);
+    vbox.set_margin_top(8);
+    vbox.set_margin_bottom(8);
+    vbox.append(&filter_entry);
+    vbox.append(&scrolled);
+    popover.set_child(Some(&vbox));
+
+    let accepts: Rc<RefCell<Vec<Accept>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let rebuild: Rc<dyn Fn(&str)> = {
+        let kbmap = kbmap.clone();
+        let history_path = history_path.clone();
+        let list_box = list_box.clone();
+        let accepts = accepts.clone();
+        Rc::new(move |needle: &str| {
+            let query = Query::parse(needle, PaletteMode::History);
+            let entries = palette::gather(&query, &kbmap.borrow(), history_path.as_deref(), 100);
+            while let Some(row) = list_box.row_at_index(0) {
+                list_box.remove(&row);
+            }
+            accepts.borrow_mut().clear();
+            for entry in entries.into_iter() {
+                let row = adw::ActionRow::builder()
+                    .title(glib_escape(&entry.label))
+                    .activatable(true)
+                    .build();
+                if let Some(sub) = entry.sublabel.as_ref() {
+                    if !sub.is_empty() {
+                        row.set_subtitle(&glib_escape(sub));
+                    }
+                }
+                if let Some(right) = entry.right.as_ref() {
+                    let key_label = gtk::Label::new(Some(right));
+                    key_label.add_css_class("dim-label");
+                    row.add_suffix(&key_label);
+                }
+                list_box.append(&row);
+                accepts.borrow_mut().push(entry.accept);
+            }
+            if let Some(first) = list_box.row_at_index(0) {
+                list_box.select_row(Some(&first));
+            }
+        })
+    };
+
+    rebuild("");
+
+    {
+        let rebuild = rebuild.clone();
+        filter_entry.connect_search_changed(move |entry| rebuild(&entry.text()));
+    }
+
+    let fire: Rc<dyn Fn(i32)> = {
+        let sender = sender.clone();
+        let popover = popover.clone();
+        let accepts = accepts.clone();
+        let popover_ref = popover_ref.clone();
+        Rc::new(move |idx: i32| {
+            if idx < 0 { return; }
+            let accept = match accepts.borrow().get(idx as usize) {
+                Some(a) => a.clone(),
+                None => return,
+            };
+            popover.popdown();
+            popover.unparent();
+            *popover_ref.borrow_mut() = None;
+            match accept {
+                Accept::Action(a) => sender.input(AppMsg::Action(a)),
+                Accept::TypeCommand(cmd) => sender.input(AppMsg::PaletteTypeCommand(cmd)),
+            }
+        })
+    };
+
+    {
+        let fire = fire.clone();
+        list_box.connect_row_activated(move |_, row| fire(row.index()));
+    }
+
+    let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let popover_ref = popover_ref.clone();
+        let list_box = list_box.clone();
+        let fire = fire.clone();
+        let popover = popover.clone();
+        key.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == Key::Escape {
+                popover.popdown();
+                popover.unparent();
+                *popover_ref.borrow_mut() = None;
+                return gtk::glib::Propagation::Stop;
+            }
+            if matches!(keyval, Key::Return | Key::KP_Enter) {
+                if let Some(row) = list_box.selected_row() {
+                    fire(row.index());
+                }
+                return gtk::glib::Propagation::Stop;
+            }
+            if keyval == Key::Down {
+                let cur = list_box.selected_row().map(|r| r.index()).unwrap_or(-1);
+                if let Some(row) = list_box.row_at_index(cur + 1) {
+                    list_box.select_row(Some(&row));
+                }
+                return gtk::glib::Propagation::Stop;
+            }
+            if keyval == Key::Up {
+                let cur = list_box.selected_row().map(|r| r.index()).unwrap_or(0);
+                if cur > 0 {
+                    if let Some(row) = list_box.row_at_index(cur - 1) {
+                        list_box.select_row(Some(&row));
+                    }
+                }
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+    }
+    popover.add_controller(key);
+
+    {
+        let popover_ref = popover_ref.clone();
+        popover.connect_closed(move |p| {
+            // autohide-on-click-outside path: also clear the ref.
+            p.unparent();
+            *popover_ref.borrow_mut() = None;
+        });
+    }
+
+    *popover_ref.borrow_mut() = Some(popover.clone());
+    popover.popup();
+    filter_entry.grab_focus();
+}
+
+/// Escape pango markup chars in user-supplied strings before we hand them to
+/// AdwActionRow titles/subtitles (Adw renders them as markup).
+fn glib_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Searchable list of configured remote hosts. Activating a row opens a new tab
