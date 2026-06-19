@@ -1350,6 +1350,19 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             ctx.start_time.set(Some(Instant::now()));
             ctx.has_command.set(true);
             ctx.state.set(BlockState::CollectingOutput);
+            // Pre-emptive TUI promotion. The smkx heuristic only fires after we
+            // see the program's first output — by then it has already called
+            // ioctl(TIOCGWINSZ) on a small PTY and rendered its first frame
+            // into 3-4 rows. Subsequent frames repaint at the post-SIGWINCH
+            // size, but the truncated opening frame is jarring. For the
+            // commands we know are TUIs from the user's typed name, hide the
+            // finished blocks and resize the PTY now, before the child reads
+            // its size.
+            if !ctx.tui_promoted.get() && looks_like_tui(&current_command_text(ctx)) {
+                ctx.tui_promoted.set(true);
+                enter_fullscreen(ctx);
+                resize_active_to_fullscreen(ctx);
+            }
         }
         ParserEvent::CommandEnd(code) => {
             ctx.exit_code.set(code);
@@ -1651,6 +1664,110 @@ fn update_active_height(ctx: &Rc<Ctx>) {
     }
     ctx.active_holder
         .set_height_request((target_rows * ch) as i32);
+}
+
+/// Synchronously size the active VTE/holder to the full viewport AND resize the
+/// PTY immediately, so a freshly spawned TUI's first `ioctl(TIOCGWINSZ)` returns
+/// the full grid instead of the compact prompt grid. Called from CommandStart's
+/// pre-emptive promotion path; the regular tick-callback PTY resize is too late
+/// because the child has already rendered its opening frame by then.
+fn resize_active_to_fullscreen(ctx: &Rc<Ctx>) {
+    let page_px = ctx.scroll.vadjustment().page_size();
+    let ch = ctx.active_vte.char_height();
+    if page_px <= 1.0 || ch <= 1 {
+        return;
+    }
+    let cols = ctx.active_vte.column_count().max(1);
+    let max_rows = (((page_px - ACTIVE_CARD_VCHROME_PX).max(ch as f64)) as i64 / ch)
+        .max(MIN_ACTIVE_ROWS);
+    if std::env::var_os("JTERM1_DBG").is_some() {
+        eprintln!(
+            "[DBG] tui pre-promote -> {}x{} (sync PTY resize)",
+            cols, max_rows
+        );
+    }
+    ctx.active_vte.set_size(cols, max_rows);
+    ctx.last_size_target.set((cols, max_rows));
+    ctx.active_holder.set_height_request((max_rows * ch) as i32);
+    ctx.pty.resize(cols as u16, max_rows as u16);
+}
+
+/// Best-effort current command text at CommandStart. Prefers the keystroke
+/// reconstruction (`typed_cmd`); falls back to the last echoed line in
+/// `cmd_buf` for paste / history-recall flows where keystroke capture is
+/// unreliable. Mirrors the same prefer-typed-then-scrape logic
+/// `finalize_block` uses at the other end of the command lifecycle.
+fn current_command_text(ctx: &Rc<Ctx>) -> String {
+    let typed = ctx.typed_cmd.borrow().trim().to_string();
+    if !typed.is_empty() && !ctx.typed_unreliable.get() {
+        return typed;
+    }
+    strip_ansi(&ctx.cmd_buf.borrow())
+        .lines()
+        .next_back()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// First word of the user's typed command, lowercased. We strip a leading
+/// `sudo ` / `command ` / env-var-assignment so `sudo htop` and `LESS=-R less`
+/// still match. Conservative — we only return a name we're prepared to look up.
+fn first_program_word(cmd: &str) -> Option<String> {
+    let mut rest = cmd.trim_start();
+    loop {
+        // `VAR=value`-style env prefixes: skip until we hit a token without `=`.
+        let first = rest.split_whitespace().next()?;
+        if first.contains('=') && !first.starts_with('=') {
+            rest = rest[first.len()..].trim_start();
+            continue;
+        }
+        if matches!(first, "sudo" | "doas" | "command" | "env" | "nice" | "ionice") {
+            rest = rest[first.len()..].trim_start();
+            continue;
+        }
+        return Some(first.trim_start_matches('/').to_lowercase());
+    }
+}
+
+/// True when the user's typed command names a program that runs as a
+/// full-screen TUI. Used at CommandStart for pre-emptive promotion. Anything
+/// not in this list still falls through to the smkx heuristic — this list
+/// only fixes the opening-frame size for the well-known cases.
+fn looks_like_tui(cmd: &str) -> bool {
+    const TUIS: &[&str] = &[
+        // process / system viewers
+        "top", "htop", "btop", "btm", "atop", "iotop", "nethogs", "nload",
+        "powertop", "iftop", "bmon",
+        // editors
+        "vim", "vi", "nvim", "neovim", "nano", "pico", "emacs",
+        // pagers
+        "less", "more", "most",
+        // file managers / explorers
+        "ranger", "nnn", "mc", "lf", "vifm",
+        // disk / inspection tools
+        "ncdu", "dust", "tig", "lazygit", "lazydocker", "k9s",
+        // misc
+        "watch", "man", "fzf", "tldr", "alsamixer", "ttyper",
+    ];
+    let Some(name) = first_program_word(cmd) else {
+        return false;
+    };
+    if TUIS.contains(&name.as_str()) {
+        return true;
+    }
+    // `git log/diff/show/blame` typically pipe through `less` (the user's PAGER)
+    // and emit smkx; treat them like TUIs.
+    if name == "git" {
+        let after_git = cmd.trim_start();
+        let after_git = after_git
+            .strip_prefix("git")
+            .map(|s| s.trim_start())
+            .unwrap_or("");
+        let sub = after_git.split_whitespace().next().unwrap_or("");
+        return matches!(sub, "log" | "diff" | "show" | "blame" | "reflog");
+    }
+    false
 }
 
 fn autoscroll(ctx: &Rc<Ctx>) {
