@@ -1,17 +1,15 @@
-//! Pager-snapshot capture for alt-screen commands.
+//! Final-frame capture for alt-screen commands.
 //!
-//! When a command enters the alt-screen (`less`, `man`, `git log`, …) all of its
-//! output is painted onto the alternate buffer and torn down on exit, so the
-//! block view's output buffer would otherwise be empty. To leave a readable
-//! block behind, we snapshot the visible VTE grid on every frame while in
-//! alt-screen, then merge the pages by their scroll overlap when the app exits
-//! and feed the result into the command's output buffer.
-//!
-//! Ported from jterm4's `block_view/alt_screen.rs` (pure helpers only).
+//! When a command enters the alt-screen (`less`, `man`, `git log`, `top`, …)
+//! all of its output is painted onto the alternate buffer and torn down on
+//! exit. To leave a readable block behind we snapshot the alt grid exactly
+//! once, on alt-screen leave, and feed that single frame into the command's
+//! output buffer. Earlier versions scraped frames continuously and merged
+//! them with overlap detection; that produced duplicated commits in `git log`
+//! blocks (when the merge mis-aligned pages) and visible jitter in `top`/
+//! `htop` (text_range_format racing the VTE's paint). Aligns with warp's
+//! "alt-screen content is ephemeral; the live grid is what you see" model.
 
-use gtk4::glib;
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 use vte4::{Terminal, TerminalExt};
 
 /// Scrape the currently-visible VTE grid as plain text.
@@ -75,169 +73,9 @@ pub(crate) fn normalize_pager_snapshot(text: &str) -> String {
     }
 }
 
-/// Number of trailing lines of `existing` that equal the leading lines of `next`
-/// (the scroll overlap between two consecutive pages).
-pub(crate) fn overlap_line_count(existing: &[String], next: &[String]) -> usize {
-    let max_overlap = existing.len().min(next.len());
-    for count in (1..=max_overlap).rev() {
-        if existing[existing.len() - count..] == next[..count]
-            && (count > 1 || !existing[existing.len() - count].trim().is_empty())
-        {
-            return count;
-        }
-    }
-    0
-}
-
-/// Minimum frame height before the repaint heuristic engages; below this a
-/// coincidental line match is too likely.
-const MIN_REPAINT_ROWS: usize = 6;
-/// Fraction (percent) of positionally-identical non-blank rows that marks two
-/// frames as the same screen repainted in place rather than scrolled content.
-const REPAINT_IDENTICAL_PCT: usize = 30;
-
-/// Do two frames look like the *same* screen repainted in place (a live
-/// dashboard such as `top`/`htop`) rather than newly scrolled content? Such
-/// frames keep many rows byte-identical at the same position (column headers,
-/// idle processes, static labels) even as a few rows change, whereas a forward
-/// scroll shares content only through its leading/trailing overlap.
-fn looks_like_repaint(prev: &[String], next: &[String]) -> bool {
-    let rows = prev.len().min(next.len());
-    if rows < MIN_REPAINT_ROWS {
-        return false;
-    }
-    let identical = (0..rows)
-        .filter(|&i| !prev[i].trim().is_empty() && prev[i] == next[i])
-        .count();
-    identical * 100 >= rows * REPAINT_IDENTICAL_PCT
-}
-
-/// Stitch a sequence of pager frames into one document, dropping pages that are
-/// a duplicate sub-window of what we already have and de-overlapping the rest.
-/// Live dashboards that repaint the screen in place (no scroll overlap) replace
-/// the previous frame instead of stacking, so only the latest screen remains.
-pub(crate) fn merge_pager_snapshots(pages: Vec<String>) -> String {
-    let mut merged: Vec<String> = Vec::new();
-    // Index in `merged` where the most recently added frame begins, so a repaint
-    // of the same screen can overwrite it in place.
-    let mut last_page_start = 0usize;
-
-    for page in pages {
-        let page_lines: Vec<String> = page.lines().map(|line| line.to_string()).collect();
-        if page_lines.is_empty() {
-            continue;
-        }
-        if merged.is_empty() {
-            last_page_start = 0;
-            merged = page_lines;
-            continue;
-        }
-        let first_line = &page_lines[0];
-        if merged.iter().any(|line| line == first_line)
-            && merged
-                .windows(page_lines.len())
-                .any(|window| window == page_lines.as_slice())
-        {
-            continue;
-        }
-        let overlap = overlap_line_count(&merged, &page_lines);
-        if overlap == 0 && looks_like_repaint(&merged[last_page_start..], &page_lines) {
-            merged.truncate(last_page_start);
-            merged.extend(page_lines);
-            continue;
-        }
-        last_page_start = merged.len() - overlap;
-        merged.extend(page_lines.into_iter().skip(overlap));
-    }
-
-    merged.join("\n")
-}
-
-/// True if `bytes` contains a full clear-screen sequence (CSI 2J / CSI 3J).
-/// Pagers that repaint a fresh page emit one; we snapshot the current frame
-/// before it lands so paged-through content is not lost.
-pub(crate) fn contains_clear_screen(bytes: &[u8]) -> bool {
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            i += 2;
-            let mut params = Vec::new();
-            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                params.push(bytes[i]);
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == b'J' && (params == b"2" || params == b"3") {
-                return true;
-            }
-        } else {
-            i += 1;
-        }
-    }
-    false
-}
-
-/// Capture one frame: normalize, drop the pre-clear baseline (a stale render of
-/// the previous command) and consecutive duplicates, then push.
-pub(crate) fn record_pager_snapshot(
-    vte: &Terminal,
-    snapshots: &Rc<RefCell<Vec<String>>>,
-    pre_clear: &Rc<RefCell<String>>,
-) {
-    let raw = visible_vte_text(vte);
-    let snapshot = normalize_pager_snapshot(&raw);
-    if snapshot.is_empty() {
-        return;
-    }
-    if pre_clear.borrow().as_str() == snapshot {
-        return;
-    }
-    let mut snapshots = snapshots.borrow_mut();
-    if snapshots.last().map(|last| last == &snapshot).unwrap_or(false) {
-        return;
-    }
-    snapshots.push(snapshot);
-    pre_clear.borrow_mut().clear();
-}
-
-/// Defer a capture to the next idle tick so the VTE has finished painting the
-/// frame. A generation token cancels captures scheduled before the last reset.
-pub(crate) fn schedule_pager_snapshot(
-    vte: &Terminal,
-    snapshots: &Rc<RefCell<Vec<String>>>,
-    generation: &Rc<Cell<u64>>,
-    pre_clear: &Rc<RefCell<String>>,
-) {
-    let token = generation.get();
-    let vte = vte.clone();
-    let snapshots = snapshots.clone();
-    let generation = generation.clone();
-    let pre_clear = pre_clear.clone();
-    glib::idle_add_local_once(move || {
-        if generation.get() == token {
-            record_pager_snapshot(&vte, &snapshots, &pre_clear);
-        }
-    });
-}
-
-/// Take all captured frames and return the merged document, clearing the buffer.
-pub(crate) fn drain_pager_snapshots(snapshots: &Rc<RefCell<Vec<String>>>) -> String {
-    let pages = std::mem::take(&mut *snapshots.borrow_mut());
-    merge_pager_snapshots(pages)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{contains_clear_screen, merge_pager_snapshots, normalize_pager_snapshot};
-
-    #[test]
-    fn detects_clear_screen_sequences() {
-        assert!(contains_clear_screen(b"\x1b[2J"));
-        assert!(contains_clear_screen(b"text\x1b[3Jmore"));
-        assert!(contains_clear_screen(b"\x1b[H\x1b[2J"));
-        assert!(!contains_clear_screen(b"\x1b[0J"));
-        assert!(!contains_clear_screen(b"\x1b[1Jplain"));
-        assert!(!contains_clear_screen(b"no escapes here"));
-    }
+    use super::normalize_pager_snapshot;
 
     #[test]
     fn filters_less_status_lines() {
@@ -246,42 +84,12 @@ mod tests {
     }
 
     #[test]
-    fn merges_viewed_pages_by_overlap() {
-        let merged = merge_pager_snapshots(vec![
-            "commit a\nAuthor: me\nDate: today\n\n    first".to_string(),
-            "Date: today\n\n    first\ncommit b\nAuthor: you".to_string(),
-            "commit b\nAuthor: you\nDate: yesterday".to_string(),
-        ]);
-        assert_eq!(
-            merged,
-            "commit a\nAuthor: me\nDate: today\n\n    first\ncommit b\nAuthor: you\nDate: yesterday"
-        );
-    }
-
-    #[test]
-    fn skips_duplicate_pages() {
-        let merged = merge_pager_snapshots(vec![
-            "commit a\nAuthor: me".to_string(),
-            "commit a\nAuthor: me".to_string(),
-        ]);
-        assert_eq!(merged, "commit a\nAuthor: me");
-    }
-
-    #[test]
-    fn keeps_only_latest_frame_for_in_place_repaint() {
-        // A `top`-style dashboard: header rows churn every refresh but most rows
-        // stay byte-identical at the same position. Frames must not be stacked.
-        let frame = |cpu: &str, p0: &str| {
-            format!(
-                "top - 23:34:28 up\nTasks: 280 total\n%Cpu(s): {cpu} us\n  PID USER   %CPU\n{p0}\n    1 root    0.0\n    2 root    0.0\n    3 root    0.0"
-            )
-        };
-        let merged = merge_pager_snapshots(vec![
-            frame("25.2", " 523491 mm    60.0"),
-            frame("17.9", " 524435 mm    75.0"),
-            frame("37.9", " 500844 mm   157.1"),
-        ]);
-        assert_eq!(merged, frame("37.9", " 500844 mm   157.1"));
-        assert_eq!(merged.matches("PID USER").count(), 1);
+    fn drops_mid_render_skipping_frames() {
+        // `less` paints `...skipping...` on the next status line while it is
+        // still emitting the new page; a snapshot taken at that instant is
+        // partial and would otherwise pollute the recorded block.
+        let snapshot =
+            normalize_pager_snapshot("commit a\nAuthor: me\n:...skipping...\ncommit b\n");
+        assert_eq!(snapshot, "");
     }
 }

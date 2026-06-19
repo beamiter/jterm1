@@ -166,13 +166,9 @@ struct Ctx {
     /// Index into `finished` of the keyboard-selected block (Warp-style block
     /// recall), or `None` when nothing is selected.
     selected_block: Cell<Option<usize>>,
-    /// Pager frames captured while inside the alt-screen, merged on exit so the
-    /// finished block keeps `less`/`man`/`git log` content instead of vanishing.
-    pager_snapshots: Rc<RefCell<Vec<String>>>,
-    /// Bumped on each alt-screen entry to cancel snapshots scheduled before it.
-    pager_generation: Rc<Cell<u64>>,
-    /// The last frame of the *previous* command, used to drop the stale render
-    /// that lingers before the alt VTE's reset paints the new screen.
+    /// Baseline frame captured at alt-screen entry (the stale pre-alt render).
+    /// Used to suppress an empty/identical capture on exit when the app left
+    /// nothing meaningful behind.
     pager_preclear: Rc<RefCell<String>>,
     /// True while an alt-screen app owns the viewport (finished blocks hidden).
     fullscreen: Cell<bool>,
@@ -218,18 +214,12 @@ struct Ctx {
     /// Set when the typed-command reconstruction was invalidated by an escape
     /// sequence (arrow keys, history recall): finalize falls back to scraping.
     typed_unreliable: Cell<bool>,
-    /// Last time a pager frame was scheduled for capture, for throttling.
-    pager_last_snap: Cell<Option<Instant>>,
 }
 
 /// Bounded head retained verbatim for a command's captured output.
 const OUTPUT_HEAD_CAP: usize = 256 * 1024;
 /// Bounded rolling tail retained for a command's captured output.
 const OUTPUT_TAIL_CAP: usize = 256 * 1024;
-/// Minimum spacing between scheduled pager-frame captures while in alt-screen,
-/// so continuously-repainting apps (top, htop, vim) don't scrape every frame.
-const PAGER_SNAP_MIN_INTERVAL: Duration = Duration::from_millis(150);
-
 // ─── Component ──────────────────────────────────────────────────────────────
 
 pub struct BlockTerminal {
@@ -420,8 +410,6 @@ impl Component for BlockTerminal {
             search_matches: RefCell::new(Vec::new()),
             search_idx: Cell::new(0),
             selected_block: Cell::new(None),
-            pager_snapshots: Rc::new(RefCell::new(Vec::new())),
-            pager_generation: Rc::new(Cell::new(0)),
             pager_preclear: Rc::new(RefCell::new(String::new())),
             fullscreen: Cell::new(false),
             sticky_header: sticky_header.clone(),
@@ -441,7 +429,6 @@ impl Component for BlockTerminal {
             out_tail: RefCell::new(VecDeque::new()),
             out_total: Cell::new(0),
             typed_unreliable: Cell::new(false),
-            pager_last_snap: Cell::new(None),
         });
 
         // `changed` fires during the viewport's size-allocate, after layout, so
@@ -1294,37 +1281,13 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                     let _ = sender.output(VteOutput::Activity);
                 }
                 BlockState::AltScreen => {
-                    // A pager that repaints a fresh page first clears the screen;
-                    // snapshot the page currently on the grid before the clear lands
-                    // so paged-through content (e.g. `git log` over many commits) is
-                    // preserved instead of being overwritten.
-                    if super::alt::contains_clear_screen(&bytes) {
-                        super::alt::record_pager_snapshot(
-                            &ctx.active_vte,
-                            &ctx.pager_snapshots,
-                            &ctx.pager_preclear,
-                        );
-                    }
-                    // Also snapshot the rendered frame after the feed below paints it,
-                    // so the finished block keeps the pager's content on exit. Throttled:
-                    // continuously-repainting apps (top, htop, vim) would otherwise scrape
-                    // the whole grid every frame. Page boundaries (clear-screen above) and
-                    // the final frame (on alt-screen leave) are captured unconditionally.
-                    let now = Instant::now();
-                    let due = ctx
-                        .pager_last_snap
-                        .get()
-                        .map(|t| now.duration_since(t) >= PAGER_SNAP_MIN_INTERVAL)
-                        .unwrap_or(true);
-                    if due {
-                        ctx.pager_last_snap.set(Some(now));
-                        super::alt::schedule_pager_snapshot(
-                            &ctx.active_vte,
-                            &ctx.pager_snapshots,
-                            &ctx.pager_generation,
-                            &ctx.pager_preclear,
-                        );
-                    }
+                    // The live alt-screen renders directly into the active VTE; we
+                    // intentionally do NOT scrape mid-flight frames. Continuous
+                    // scraping caused two regressions: (1) live dashboards (top, htop)
+                    // jittered as text_range_format raced with the VTE's paint, and
+                    // (2) merging consecutive less/git-log frames produced duplicated
+                    // commits in the recorded block when overlap detection failed.
+                    // Only the final frame at AltScreenLeave is captured.
                 }
                 _ => {}
             }
@@ -1393,14 +1356,9 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             }
             ctx.prev_state.set(ctx.state.get());
             ctx.state.set(BlockState::AltScreen);
-            // Cancel any snapshot scheduled for the previous alt-screen session
-            // and baseline the current frame so its stale render is dropped.
-            ctx.pager_generation.set(ctx.pager_generation.get().wrapping_add(1));
-            ctx.pager_snapshots.borrow_mut().clear();
-            ctx.pager_last_snap.set(None);
-            // Normalize the baseline so it is comparable to the normalized frames
-            // captured later; otherwise the stale pre-alt prompt line leaks in as
-            // the first "page" of the recorded output.
+            // Baseline the pre-alt render so a final-frame capture that just
+            // mirrors the prior prompt line (the alt buffer never painted
+            // anything meaningful) is suppressed.
             *ctx.pager_preclear.borrow_mut() = super::alt::normalize_pager_snapshot(
                 &super::alt::visible_vte_text(&ctx.active_vte),
             );
@@ -1413,35 +1371,30 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
         ParserEvent::AltScreenLeave => {
             if std::env::var_os("JTERM1_DBG").is_some() {
                 eprintln!(
-                    "[DBG] AltScreenLeave grid={}x{} snaps={}",
+                    "[DBG] AltScreenLeave grid={}x{}",
                     ctx.active_vte.column_count(),
                     ctx.active_vte.row_count(),
-                    ctx.pager_snapshots.borrow().len()
                 );
             }
-            // Capture the final visible frame synchronously *before* switching back
-            // to the normal buffer. The deferred idle captures race with the VTE's
-            // paint and frequently never land (leaving an empty block), so this is
-            // the reliable snapshot of the app's last screen.
-            super::alt::record_pager_snapshot(
-                &ctx.active_vte,
-                &ctx.pager_snapshots,
-                &ctx.pager_preclear,
+            // Snapshot exactly the final visible frame *before* swapping back to
+            // the normal buffer — that is the screen the user saw last and the
+            // only content we record for the finished block. Skip it if the alt
+            // app left nothing distinct from the pre-alt baseline.
+            let final_frame = super::alt::normalize_pager_snapshot(
+                &super::alt::visible_vte_text(&ctx.active_vte),
             );
             ctx.active_vte.feed(b"\x1b[?1049l");
-            // Bump the generation so no late idle capture lands after we drain.
-            ctx.pager_generation.set(ctx.pager_generation.get().wrapping_add(1));
-            let merged = super::alt::drain_pager_snapshots(&ctx.pager_snapshots);
-            if !merged.is_empty() {
+            let baseline = ctx.pager_preclear.replace(String::new());
+            if !final_frame.is_empty() && final_frame != baseline {
                 let need_nl = {
                     let out = ctx.out_buf.borrow();
                     !out.is_empty() && !out.ends_with(b"\n")
                 };
-                let mut buf = Vec::with_capacity(merged.len() + 1);
+                let mut buf = Vec::with_capacity(final_frame.len() + 1);
                 if need_nl {
                     buf.push(b'\n');
                 }
-                buf.extend_from_slice(merged.as_bytes());
+                buf.extend_from_slice(final_frame.as_bytes());
                 append_captured(ctx, &buf);
             }
             exit_fullscreen(ctx);
@@ -1504,6 +1457,43 @@ fn captured_output(ctx: &Rc<Ctx>) -> Vec<u8> {
         out.extend_from_slice(&tail);
         out
     }
+}
+
+/// Re-render the command's captured byte stream through a small offline
+/// terminal-grid emulator and return the resulting text. Necessary for
+/// commands that repaint the screen with cursor-positioning sequences (e.g.
+/// `less -X` for `git log`, the no-alt-screen path of less): the raw bytes
+/// have CSI cursor moves which `strip_ansi` deletes without applying, so
+/// stacked repaints collapse into duplicated text. Returns `None` when there
+/// are no captured bytes or no cursor-positioning escapes were used (in which
+/// case the raw stream is fine to display as-is).
+fn scrape_command_output(ctx: &Rc<Ctx>) -> Option<String> {
+    use vte4::TerminalExt;
+    let bytes = captured_output(ctx);
+    if bytes.is_empty() {
+        return None;
+    }
+    if !super::grid::has_cursor_positioning(&bytes) {
+        return None;
+    }
+    let cols = ctx.active_vte.column_count().max(1) as usize;
+    let rows = ctx.active_vte.row_count().max(1) as usize;
+    Some(super::grid::render_to_text(&bytes, cols, rows))
+}
+
+/// When `JTERM1_DUMP_BLOCKS=<path>` is set, append each finalized block to
+/// `<path>` so the captured output can be inspected end-to-end (matches what
+/// the rendered block shows).
+fn dump_block_to_log(path: &str, command: &str, output: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "===== block: {} =====", command)?;
+    writeln!(f, "{}", output)?;
+    writeln!(f, "===== end =====")?;
+    Ok(())
 }
 
 /// Compact minimum height for the active (input) card, in text rows. Keeps the
@@ -1675,8 +1665,20 @@ fn finalize_block(ctx: &Rc<Ctx>) {
         reset_active(ctx);
         return;
     }
-    let output_bytes = captured_output(ctx);
-    let output = String::from_utf8_lossy(&output_bytes).into_owned();
+    // Prefer scraping the VTE for the command's rendered output region. The raw
+    // captured bytes lose cursor positioning when ANSI is stripped — a pager like
+    // `less -X` (no alt screen) repaints over the same lines, and stacked stripped
+    // text shows the same content N times. The VTE has already applied those
+    // cursor moves, so its grid is the truth. Fall back to the byte stream when
+    // the scrape is unavailable (no recorded row, empty range).
+    let scraped = scrape_command_output(ctx);
+    let output = match scraped {
+        Some(text) => text,
+        None => {
+            let bytes = captured_output(ctx);
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    };
     if std::env::var_os("JTERM1_DBG").is_some() {
         eprintln!(
             "[DBG] finalize cmd={:?} out_len={} out_lines={} first={:?} last={:?}",
@@ -1686,6 +1688,9 @@ fn finalize_block(ctx: &Rc<Ctx>) {
             output.lines().next(),
             output.lines().last(),
         );
+    }
+    if let Ok(path) = std::env::var("JTERM1_DUMP_BLOCKS") {
+        let _ = dump_block_to_log(&path, &command, &output);
     }
     let exit_code = ctx.exit_code.get();
     let cwd = ctx.cwd.borrow().clone();
