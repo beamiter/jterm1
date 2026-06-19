@@ -328,6 +328,9 @@ pub enum VteInput {
     FilterSlowBlocks,
     FilterPinnedBlocks,
     ClearBlockFilter,
+    /// Block-view only: jump to the previous / next pinned block.
+    JumpToPrevPinned,
+    JumpToNextPinned,
     /// Search: set the query and jump to the first match. `use_regex` treats the
     /// query as a regex; otherwise it is matched literally (case-insensitive).
     SearchSet(String, bool),
@@ -527,7 +530,9 @@ impl Component for VteTerminal {
             VteInput::FilterFailedBlocks
             | VteInput::FilterSlowBlocks
             | VteInput::FilterPinnedBlocks
-            | VteInput::ClearBlockFilter => {}
+            | VteInput::ClearBlockFilter
+            | VteInput::JumpToPrevPinned
+            | VteInput::JumpToNextPinned => {}
             VteInput::SearchSet(query, use_regex) => {
                 let pattern = if use_regex {
                     query

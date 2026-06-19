@@ -112,9 +112,11 @@ struct FinishedBlock {
 /// A command slower than this (ms) counts as "slow" for the slow filter.
 const SLOW_THRESHOLD_MS: u64 = 1000;
 
-/// A command taking at least this long (ms) triggers a completion notification
-/// (tab highlight) when the user isn't looking at this terminal.
-const NOTIFY_THRESHOLD_MS: u64 = 3000;
+/// A command taking at least this long (ms) triggers an OS desktop notification
+/// (via gio) when the user isn't looking at this terminal. Matches Warp's 30s
+/// threshold — short enough to catch builds/tests, long enough that a normal
+/// `git push` doesn't ping you.
+const NOTIFY_THRESHOLD_MS: u64 = 30_000;
 
 /// Keyboard-nav legend shown in the bottom hint bar while a block is selected.
 const HINT_TEXT: &str =
@@ -188,6 +190,10 @@ struct Ctx {
     pending_toast: Cell<bool>,
     /// Right-edge minimap: one colored tick per visible finished block.
     minimap: gtk::Box,
+    /// Floating "jump to latest" button revealed when the user has scrolled
+    /// the active block out of view (warp parity). Click → smooth-scroll to
+    /// the bottom and re-pin stick_bottom.
+    jump_to_bottom_btn: gtk::Button,
     /// Generation guard so a newer animated scroll cancels the previous one.
     scroll_anim_gen: Cell<u64>,
     /// Whether the view is "stuck" to the bottom: when true, content/height
@@ -311,6 +317,17 @@ impl Component for BlockTerminal {
         toast_box.set_valign(gtk::Align::End);
         overlay.add_overlay(&toast_box);
 
+        // Floating "jump to latest" button — appears at bottom-right when the
+        // user has scrolled away from the active block.
+        let jump_to_bottom_btn = gtk::Button::with_label("\u{f078}  Latest");
+        jump_to_bottom_btn.add_css_class("block-jump-bottom");
+        jump_to_bottom_btn.add_css_class("flat");
+        jump_to_bottom_btn.set_halign(gtk::Align::End);
+        jump_to_bottom_btn.set_valign(gtk::Align::End);
+        jump_to_bottom_btn.set_visible(false);
+        jump_to_bottom_btn.set_tooltip_text(Some("Jump to latest output"));
+        overlay.add_overlay(&jump_to_bottom_btn);
+
         // Right-edge minimap: a strip of colored ticks, one per visible block.
         let minimap = gtk::Box::new(Orientation::Vertical, 2);
         minimap.add_css_class("block-minimap");
@@ -414,6 +431,7 @@ impl Component for BlockTerminal {
             toast_box: toast_box.clone(),
             pending_toast: Cell::new(false),
             minimap: minimap.clone(),
+            jump_to_bottom_btn: jump_to_bottom_btn.clone(),
             scroll_anim_gen: Cell::new(0),
             stick_bottom: Cell::new(true),
             filter_query: RefCell::new(String::new()),
@@ -458,7 +476,22 @@ impl Component for BlockTerminal {
             scroll.vadjustment().connect_value_changed(move |adj| {
                 let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
                 ctx.stick_bottom.set(adj.value() >= max_val - 4.0);
+                // Reveal "jump to latest" once the user has drifted ≥70px above
+                // the bottom (warp's overhang threshold).
+                let overhang = max_val - adj.value();
+                ctx.jump_to_bottom_btn.set_visible(overhang >= 70.0);
                 update_sticky_header(&ctx);
+            });
+        }
+        // Click jump-to-bottom: animate to bottom and re-pin stick_bottom.
+        {
+            let ctx = ctx.clone();
+            jump_to_bottom_btn.connect_clicked(move |btn| {
+                let adj = ctx.scroll.vadjustment();
+                let target = (adj.upper() - adj.page_size()).max(adj.lower());
+                animate_scroll_to(&ctx, target);
+                ctx.stick_bottom.set(true);
+                btn.set_visible(false);
             });
         }
         // Click the sticky header to jump back to the top of that block.
@@ -833,6 +866,14 @@ impl Component for BlockTerminal {
             VteInput::FilterFailedBlocks => apply_filter(&self.ctx, BlockFilter::Failed),
             VteInput::FilterSlowBlocks => apply_filter(&self.ctx, BlockFilter::Slow),
             VteInput::FilterPinnedBlocks => apply_filter(&self.ctx, BlockFilter::Pinned),
+            VteInput::JumpToPrevPinned => {
+                eprintln!("[jterm1] JumpToPrevPinned dispatched");
+                jump_to_pinned(&self.ctx, -1)
+            }
+            VteInput::JumpToNextPinned => {
+                eprintln!("[jterm1] JumpToNextPinned dispatched");
+                jump_to_pinned(&self.ctx, 1)
+            }
             VteInput::ClearBlockFilter => apply_filter(&self.ctx, BlockFilter::None),
             VteInput::SearchSet(query, use_regex) => search_set(&self.ctx, &query, use_regex),
             VteInput::SearchNext => search_step(&self.ctx, 1),
@@ -888,13 +929,9 @@ fn search_set(ctx: &Rc<Ctx>, query: &str, use_regex: bool) {
     } else {
         None
     };
-    let accent = ctx.config.borrow().palette[3];
-    let bg = format!(
-        "rgba({},{},{},0.40)",
-        (accent.red() * 255.0) as u8,
-        (accent.green() * 255.0) as u8,
-        (accent.blue() * 255.0) as u8,
-    );
+    // Warp's exact search-match yellow (#FFFE3D) at 40% opacity so dark fg text
+    // stays legible. Focused match gets bumped via the .jterm-search-focus tag.
+    let bg = "rgba(255,254,61,0.40)".to_string();
     let needle = query.to_lowercase();
     let mut matches = Vec::new();
     for (idx, block) in ctx.finished.borrow().iter().enumerate() {
@@ -1081,6 +1118,31 @@ fn update_sticky_header(ctx: &Rc<Ctx>) {
             ctx.sticky_header.set_visible(false);
         }
     }
+}
+
+/// Hop to the previous (`dir = -1`) or next (`dir = 1`) pinned/bookmarked block
+/// relative to the currently-selected block (or the topmost-visible block if
+/// nothing is selected). No-op when no pinned blocks exist; wraps around.
+fn jump_to_pinned(ctx: &Rc<Ctx>, dir: i32) {
+    let finished = ctx.finished.borrow();
+    let pinned: Vec<usize> = finished
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| if b.pinned { Some(i) } else { None })
+        .collect();
+    if pinned.is_empty() {
+        return;
+    }
+    let cursor = ctx.selected_block.get().unwrap_or_else(|| ctx.sticky_idx.get().unwrap_or(0));
+    // Find the next/prev pinned index strictly past `cursor`; fall back to wrap.
+    let target = if dir > 0 {
+        pinned.iter().copied().find(|&i| i > cursor).unwrap_or(pinned[0])
+    } else {
+        pinned.iter().copied().rev().find(|&i| i < cursor).unwrap_or(*pinned.last().unwrap())
+    };
+    drop(finished);
+    scroll_to_block(ctx, target);
+    select_block(ctx, Some(target));
 }
 
 fn scroll_to_block(ctx: &Rc<Ctx>, idx: usize) {
@@ -3135,41 +3197,32 @@ fn scroll_to_first_error(ctx: &Rc<Ctx>, idx: usize) {
     });
 }
 
-/// Show a click-to-jump toast (bottom-right) announcing an off-screen completion;
-/// auto-dismisses after a few seconds.
-fn show_toast(ctx: &Rc<Ctx>, idx: usize, command: &str, duration: Option<Duration>, ok: bool) {
-    let id = match ctx.finished.borrow().get(idx) {
-        Some(b) => b.id,
-        None => return,
-    };
-    let glyph = if ok { "\u{f00c}" } else { "\u{f00d}" };
+/// Send an OS-level desktop notification for a long-running off-screen
+/// completion (Warp parity, replacing the prior 3s in-app toast). Uses the
+/// running GApplication's notification channel — desktop environments route
+/// this through libnotify/portals automatically, and macOS/GNOME also surface
+/// it in their notification centers.
+fn show_toast(_ctx: &Rc<Ctx>, _idx: usize, command: &str, duration: Option<Duration>, ok: bool) {
+    use gtk::gio::{self, prelude::*};
+    let Some(app) = gio::Application::default() else { return };
+    let title = if ok { "Command finished" } else { "Command failed" };
     let dur = duration
         .map(|d| format!("  ·  {}", format_duration(d)))
         .unwrap_or_default();
-    let short: String = command.chars().take(48).collect();
-    let btn = gtk::Button::with_label(&format!("{glyph}  {short}{dur}"));
-    btn.add_css_class("block-toast");
-    btn.add_css_class(if ok { "toast-ok" } else { "toast-bad" });
-    btn.add_css_class("flat");
-    {
-        let ctx2 = ctx.clone();
-        let btn_c = btn.clone();
-        btn.connect_clicked(move |_| {
-            let pos = ctx2.finished.borrow().iter().position(|b| b.id == id);
-            if let Some(p) = pos {
-                scroll_to_block(&ctx2, p);
-            }
-            ctx2.toast_box.remove(&btn_c);
-        });
-    }
-    ctx.toast_box.append(&btn);
-    let toast_box = ctx.toast_box.clone();
-    let btn_c = btn.clone();
-    glib::timeout_add_local_once(Duration::from_secs(6), move || {
-        if btn_c.parent().is_some() {
-            toast_box.remove(&btn_c);
-        }
+    let short: String = command.chars().take(96).collect();
+    let body = format!("{short}{dur}");
+    let n = gio::Notification::new(title);
+    n.set_body(Some(&body));
+    n.set_priority(if ok {
+        gio::NotificationPriority::Normal
+    } else {
+        gio::NotificationPriority::High
     });
+    let icon = gio::ThemedIcon::new("utilities-terminal");
+    n.set_icon(&icon);
+    // Stable id ⇒ later notifications replace earlier ones from the same
+    // command stream rather than stacking.
+    app.send_notification(Some("jterm1.command-finished"), &n);
 }
 
 /// Toggle the collapsed state of the currently-selected block.
@@ -3366,13 +3419,14 @@ fn install_block_css(config: &Config) {
     let font_size = format!("{}pt", scaled_size);
 
     // Failed blocks get a full-block red tint (Warp tints failed blocks ~10%).
-    let failed_bg = format!("rgba({err_r},{err_g},{err_b},0.09)");
+    let failed_bg = format!("rgba({err_r},{err_g},{err_b},0.10)");
 
     // Density-dependent spacing (Warp normal vs compact). 16px left padding mirrors
-    // Warp's PADDING_LEFT.
+    // Warp's PADDING_LEFT. Warp blocks are flat full-width slabs — no horizontal
+    // margin, no rounded corners, separated by a 1px bottom divider.
     let compact = config.block_compact;
-    let fin_margin = if compact { "1px 8px" } else { "4px 8px" };
-    let active_margin = if compact { "2px 8px" } else { "6px 8px" };
+    let fin_margin = if compact { "0" } else { "0" };
+    let active_margin = if compact { "0" } else { "0" };
     let active_pad_v = if compact { "1px" } else { "4px" };
     let hdr_pad = if compact { "1px 8px" } else { "3px 8px" };
     let cmd_pad = if compact { "0 16px" } else { "2px 16px 0 16px" };
@@ -3384,12 +3438,11 @@ fn install_block_css(config: &Config) {
         .block-scroll {{ background-color: {bg_hex}; }}
         .block-list {{ background-color: {bg_hex}; }}
         .block-finished {{
-            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.08);
             border-left: 5px solid transparent;
-            border-radius: 10px;
+            border-bottom: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
             background-color: {block_bg_hex};
             margin: {fin_margin};
-            min-height: 40px;
+            min-height: 36px;
             transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
         }}
         .block-success {{ border-left-color: {ok_stripe}; }}
@@ -3398,30 +3451,26 @@ fn install_block_css(config: &Config) {
             background-color: {failed_bg};
         }}
         .block-hovered {{
-            background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
-            box-shadow: 0 4px 14px rgba(0,0,0,0.22);
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.04);
         }}
         .block-failed.block-hovered {{
             background-color: rgba({err_r},{err_g},{err_b},0.14);
         }}
         .block-selected {{
-            border-color: {accent};
-            box-shadow: 0 0 0 1px {accent}, 0 4px 14px rgba(0,0,0,0.28);
+            box-shadow: inset 2px 0 0 {accent}, inset -2px 0 0 {accent}, inset 0 2px 0 {accent}, inset 0 -2px 0 {accent};
         }}
         .block-active {{
-            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.22);
             border-left: 5px solid {accent};
-            border-radius: 10px;
+            border-bottom: 1px solid rgba({acc_r},{acc_g},{acc_b},0.22);
             margin: {active_margin};
             padding-top: {active_pad_v};
             padding-bottom: {active_pad_v};
             background-color: {block_bg_hex};
-            min-height: 40px;
+            min-height: 36px;
             transition: box-shadow 140ms ease, border-color 140ms ease;
         }}
         .block-active:focus-within {{
-            border-color: {accent};
-            box-shadow: 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.45), 0 6px 18px rgba(0,0,0,0.30);
+            border-left-color: {accent};
         }}
         .block-status-ok {{
             color: {ok_hex};
@@ -3621,6 +3670,19 @@ fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: 0.80em;
         }}
+        .block-jump-bottom {{
+            color: {bg_hex};
+            background-color: {accent};
+            border: none;
+            border-radius: 999px;
+            margin: 0 18px 18px 0;
+            padding: 4px 14px;
+            font-family: "{font_family}";
+            font-size: 0.82em; font-weight: bold;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+            transition: background-color 120ms ease, transform 120ms ease;
+        }}
+        .block-jump-bottom:hover {{ transform: translateY(-1px); }}
         .block-toast-box {{ margin: 0 14px 14px 0; }}
         .block-toast {{
             color: {fg_hex};

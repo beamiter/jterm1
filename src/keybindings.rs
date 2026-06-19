@@ -54,6 +54,10 @@ pub(crate) enum Action {
     FilterSlowBlocks,
     FilterPinnedBlocks,
     ClearBlockFilter,
+    /// Jump to the previous / next pinned ("bookmarked") block. Warp parity:
+    /// gives users persistent navigation targets through long sessions.
+    JumpToPrevPinned,
+    JumpToNextPinned,
     ToggleDebugDashboard,
 }
 
@@ -118,6 +122,8 @@ impl Action {
             Action::FilterFailedBlocks => "Filter failed blocks",
             Action::FilterSlowBlocks => "Filter slow blocks",
             Action::FilterPinnedBlocks => "Filter pinned blocks",
+            Action::JumpToPrevPinned => "Jump to previous pinned block",
+            Action::JumpToNextPinned => "Jump to next pinned block",
             Action::ClearBlockFilter => "Clear block filter",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
         }
@@ -172,6 +178,8 @@ impl Action {
             Action::FilterFailedBlocks => Some("filter_failed_blocks"),
             Action::FilterSlowBlocks => Some("filter_slow_blocks"),
             Action::FilterPinnedBlocks => Some("filter_pinned_blocks"),
+            Action::JumpToPrevPinned => Some("jump_to_prev_pinned"),
+            Action::JumpToNextPinned => Some("jump_to_next_pinned"),
             Action::ClearBlockFilter => Some("clear_block_filter"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
         }
@@ -224,6 +232,8 @@ impl Action {
             Action::FilterFailedBlocks,
             Action::FilterSlowBlocks,
             Action::FilterPinnedBlocks,
+            Action::JumpToPrevPinned,
+            Action::JumpToNextPinned,
             Action::ClearBlockFilter,
             Action::ToggleDebugDashboard,
         ]
@@ -427,6 +437,8 @@ impl KeybindingMap {
         bind("Ctrl+Shift+X", Action::FilterFailedBlocks);
         bind("Ctrl+Shift+S", Action::FilterSlowBlocks);
         bind("Ctrl+Shift+M", Action::FilterPinnedBlocks);
+        bind("Alt+Up", Action::JumpToPrevPinned);
+        bind("Alt+Down", Action::JumpToNextPinned);
         bind("Ctrl+Shift+N", Action::ClearBlockFilter);
         bind("Ctrl+Shift+E", Action::SplitHorizontal);
         bind("Ctrl+Shift+D", Action::SplitVertical);

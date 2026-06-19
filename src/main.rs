@@ -1469,6 +1469,18 @@ impl AppModel {
                     t.emit(VteInput::FilterPinnedBlocks);
                 }
             }
+            Action::JumpToPrevPinned => {
+                eprintln!("[jterm1] Action::JumpToPrevPinned");
+                if let Some(t) = self.active_terminal() {
+                    t.emit(VteInput::JumpToPrevPinned);
+                }
+            }
+            Action::JumpToNextPinned => {
+                eprintln!("[jterm1] Action::JumpToNextPinned");
+                if let Some(t) = self.active_terminal() {
+                    t.emit(VteInput::JumpToNextPinned);
+                }
+            }
             Action::ClearBlockFilter => {
                 if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::ClearBlockFilter);
@@ -2265,7 +2277,9 @@ impl SimpleComponent for AppModel {
                     modifiers: mods,
                     key: normalize_key(keyval),
                 };
-                if let Some(action) = kb.borrow().lookup(&combo) {
+                let lookup = kb.borrow().lookup(&combo);
+                eprintln!("[jterm1] key combo={:?} -> {:?}", combo, lookup);
+                if let Some(action) = lookup {
                     ksender.input(AppMsg::Action(action));
                     return glib::Propagation::Stop;
                 }
