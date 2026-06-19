@@ -172,6 +172,11 @@ struct Ctx {
     pager_preclear: Rc<RefCell<String>>,
     /// True while an alt-screen app owns the viewport (finished blocks hidden).
     fullscreen: Cell<bool>,
+    /// Last `(cols, rows)` we asked `active_vte.set_size` for. Compared against
+    /// the freshly computed target each frame so we only re-assert when our
+    /// *preference* actually changes — never just because GTK's allocation
+    /// rounded row_count below the value we requested. (0, 0) = uninitialized.
+    last_size_target: Cell<(i64, i64)>,
     /// Sticky command header floating over the viewport top.
     sticky_header: gtk::Box,
     sticky_label: gtk::Label,
@@ -412,6 +417,7 @@ impl Component for BlockTerminal {
             selected_block: Cell::new(None),
             pager_preclear: Rc::new(RefCell::new(String::new())),
             fullscreen: Cell::new(false),
+            last_size_target: Cell::new((0, 0)),
             sticky_header: sticky_header.clone(),
             sticky_label: sticky_label.clone(),
             sticky_idx: Cell::new(None),
@@ -1595,23 +1601,26 @@ fn update_active_height(ctx: &Rc<Ctx>) {
     // larger — the cell would stay full-height. `set_size` sets the preferred
     // grid, shrinking the VTE's natural height so the (non-expanding) holder
     // collapses to it. The PTY-resize tick then follows row_count down/up.
-    // Accept a 1-row undershoot as settled: when GTK's allocation falls a
-    // fraction of a row short of our target (subpixel rounding, undeclared CSS
-    // padding, scrollbar appearance), VTE returns target_rows-1. Re-asserting
-    // target_rows every frame would just oscillate set_size between N and N-1,
-    // SIGWINCHing the running app at frame rate. Only resize when the gap is
-    // wider than a single row — and always when the VTE is too tall, since
-    // overflow is what alt-screen apps must not see.
-    let cur = ctx.active_vte.row_count();
-    let lower = (target_rows - 1).max(MIN_ACTIVE_ROWS);
-    if cur > target_rows || cur < lower {
+    //
+    // Only re-assert set_size when our *preference* changes. Reading
+    // active_vte.row_count() and resizing whenever it doesn't match target_rows
+    // creates an oscillation loop: GTK's allocation rounds the VTE down by one
+    // or two rows from our requested grid (subpixel math, undeclared CSS
+    // padding, scrollbar appearance), set_size keeps re-asserting the target,
+    // GTK keeps rounding down, and the SIGWINCH-per-frame storm makes
+    // continuously-repainting apps (top, htop) jitter visibly. The widget will
+    // converge to whatever GTK actually allocates; that's the size apps should
+    // see — and it stays stable as long as we don't poke it again.
+    let new_target = (cols, target_rows);
+    if ctx.last_size_target.get() != new_target {
         if std::env::var_os("JTERM1_DBG").is_some() {
             eprintln!(
                 "[DBG] resize grid {} -> {} rows (fs={})",
-                cur, target_rows, ctx.fullscreen.get(),
+                ctx.active_vte.row_count(), target_rows, ctx.fullscreen.get(),
             );
         }
         ctx.active_vte.set_size(cols, target_rows);
+        ctx.last_size_target.set(new_target);
     }
     ctx.active_holder
         .set_height_request((target_rows * ch) as i32);
@@ -2163,6 +2172,10 @@ fn clear_visible_blocks(ctx: &Rc<Ctx>) {
 
 fn reset_active(ctx: &Rc<Ctx>) {
     ctx.active_vte.reset(true, true);
+    // Force the next update_active_height to re-assert set_size: row_count after
+    // reset() does not reliably round-trip with our cached preference, so the
+    // shrink to a compact prompt grid would be skipped if we left it stale.
+    ctx.last_size_target.set((0, 0));
     // `reset()` acts on the emulator state immediately, but `feed()` bytes are
     // parsed asynchronously: the just-finished command's output is still queued
     // and would replay onto the cleared grid, leaving stale lines above the next
