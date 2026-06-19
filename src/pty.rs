@@ -217,7 +217,15 @@ impl OwnedPty {
                         break;
                     }
                     Ok(n) => {
-                        if tx.send(PtyMsg::Data(buf[..n].to_vec())).is_err() {
+                        let mut combined = Vec::with_capacity(n + 4096);
+                        combined.extend_from_slice(&buf[..n]);
+                        // Coalesce bytes that arrive within ~1ms so a single PTY frame
+                        // (e.g. clear + repaint from `top`/`htop`) lands in VTE atomically
+                        // instead of as a clear-only chunk followed by a content chunk —
+                        // the latter renders an empty screen for one paint cycle and
+                        // shows up as flicker.
+                        coalesce_pending(fd, &mut file, &mut buf, &mut combined);
+                        if tx.send(PtyMsg::Data(combined)).is_err() {
                             std::mem::forget(file);
                             break;
                         }
@@ -286,7 +294,10 @@ impl OwnedPty {
                         break;
                     }
                     Ok(n) => {
-                        if tx.send(PtyMsg::Data(buf[..n].to_vec())).is_err() {
+                        let mut combined = Vec::with_capacity(n + 4096);
+                        combined.extend_from_slice(&buf[..n]);
+                        coalesce_pending(fd, &mut file, &mut buf, &mut combined);
+                        if tx.send(PtyMsg::Data(combined)).is_err() {
                             std::mem::forget(file);
                             break;
                         }
@@ -349,6 +360,38 @@ fn reap_child(child_pid: Pid, tx: &mpsc::Sender<PtyMsg>) {
         _ => {
             let _ = tx.send(PtyMsg::Exit(1));
         }
+    }
+}
+
+/// Briefly poll the PTY master for more bytes already on the wire and append
+/// them onto `combined`. Caps work at 256KB / 8 follow-up reads so a steady
+/// firehose can't starve the main thread; the 1ms poll timeout is a tiny
+/// fraction of a 60Hz frame budget but enough to merge clear+repaint pairs
+/// that one program emitted in a single render.
+fn coalesce_pending(
+    fd: RawFd,
+    file: &mut std::fs::File,
+    buf: &mut [u8],
+    combined: &mut Vec<u8>,
+) {
+    const MAX_BYTES: usize = 256 * 1024;
+    const MAX_FOLLOWUP_READS: u32 = 8;
+    let mut follow_ups = 0u32;
+    while combined.len() < MAX_BYTES && follow_ups < MAX_FOLLOWUP_READS {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let r = unsafe { libc::poll(&mut pfd as *mut _, 1, 1) };
+        if r <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+            break;
+        }
+        match file.read(buf) {
+            Ok(0) | Err(_) => break,
+            Ok(m) => combined.extend_from_slice(&buf[..m]),
+        }
+        follow_ups += 1;
     }
 }
 
