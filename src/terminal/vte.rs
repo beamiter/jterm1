@@ -316,6 +316,9 @@ pub enum VteInput {
     Resize(u16, u16),
     GrabFocus,
     Copy,
+    /// Block-view only: when a finished block is selected, copy its output
+    /// only (Warp's Alt+Ctrl+Shift+C). Falls back to a regular Copy elsewhere.
+    CopyOutputOnly,
     Paste,
     SetFontScale(f64),
     SetFont(String),
@@ -489,7 +492,9 @@ impl Component for VteTerminal {
             VteInput::GrabFocus => {
                 self.terminal.grab_focus();
             }
-            VteInput::Copy => self.terminal.copy_clipboard_format(vte4::Format::Text),
+            VteInput::Copy | VteInput::CopyOutputOnly => {
+                self.terminal.copy_clipboard_format(vte4::Format::Text)
+            }
             VteInput::Paste => self.terminal.paste_clipboard(),
             VteInput::SetFontScale(scale) => self.terminal.set_font_scale(scale),
             VteInput::SetFont(desc) => {

@@ -39,6 +39,10 @@ enum AppMsg {
     NextTab,
     PrevTab,
     ToggleSidebar,
+    /// Close the application window (top-bar X button).
+    Quit,
+    /// Block-view: Alt+Ctrl+Shift+C — copy the selected block's output only.
+    CopyOutputOnly,
     Action(Action),
     ReloadConfig,
     PaneExited(u64, u64, i32),
@@ -1979,6 +1983,12 @@ impl SimpleComponent for AppModel {
                         set_label: "+",
                         connect_clicked[sender] => move |_| sender.input(AppMsg::NewTab),
                     },
+                    gtk::Button {
+                        set_label: "✕",
+                        set_tooltip_text: Some("Close window"),
+                        add_css_class: "top-bar-close",
+                        connect_clicked[sender] => move |_| sender.input(AppMsg::Quit),
+                    },
                 },
 
                 // Top tab bar: holds the horizontal tab strip when tab
@@ -2283,6 +2293,18 @@ impl SimpleComponent for AppModel {
                     ksender.input(AppMsg::Action(action));
                     return glib::Propagation::Stop;
                 }
+                // Alt+<Copy-binding> in block mode → copy block output only.
+                // Re-lookup with ALT stripped so users only need to bind Copy once.
+                if mods.contains(ModifierType::ALT_MASK) {
+                    let alt_combo = KeyCombo {
+                        modifiers: mods - ModifierType::ALT_MASK,
+                        key: combo.key,
+                    };
+                    if kb.borrow().lookup(&alt_combo) == Some(Action::Copy) {
+                        ksender.input(AppMsg::CopyOutputOnly);
+                        return glib::Propagation::Stop;
+                    }
+                }
                 glib::Propagation::Proceed
             });
         }
@@ -2356,6 +2378,14 @@ impl SimpleComponent for AppModel {
             AppMsg::PrevTab => self.switch_tab(-1, &sender),
             AppMsg::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
+            }
+            AppMsg::Quit => {
+                self.window.close();
+            }
+            AppMsg::CopyOutputOnly => {
+                if let Some(t) = self.active_terminal() {
+                    t.emit(VteInput::CopyOutputOnly);
+                }
             }
             AppMsg::Action(action) => self.execute_action(action, &sender),
             AppMsg::ReloadConfig => self.reload_config(),

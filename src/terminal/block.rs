@@ -828,10 +828,8 @@ impl Component for BlockTerminal {
             VteInput::GrabFocus => {
                 self.ctx.active_vte.grab_focus();
             }
-            VteInput::Copy => self
-                .ctx
-                .active_vte
-                .copy_clipboard_format(vte4::Format::Text),
+            VteInput::Copy => copy_selection_to_clipboard(&self.ctx, false),
+            VteInput::CopyOutputOnly => copy_selection_to_clipboard(&self.ctx, true),
             VteInput::Paste => self.ctx.active_vte.paste_clipboard(),
             VteInput::SetFontScale(scale) => self.ctx.active_vte.set_font_scale(scale),
             VteInput::SetFont(desc) => {
@@ -1544,7 +1542,7 @@ fn dump_block_to_log(path: &str, command: &str, output: &str) -> std::io::Result
 
 /// Compact minimum height for the active (input) card, in text rows. Keeps the
 /// prompt + an input line visible without ballooning to the full screen.
-const MIN_ACTIVE_ROWS: i64 = 3;
+const MIN_ACTIVE_ROWS: i64 = 8;
 
 /// Total vertical pixels the active card's CSS chrome adds around the inner VTE:
 /// `.block-active` margin (6px × 2) + border (1px × 2) + padding (4px × 2). Used
@@ -3000,6 +2998,55 @@ fn plain_text_view(text: &str, css_class: &str) -> gtk::TextView {
 fn set_clipboard(text: &str) {
     if let Some(display) = gtk::gdk::Display::default() {
         display.clipboard().set_text(text);
+    }
+}
+
+/// Resolve a Copy action in block mode by trying (in priority order):
+/// (1) a Warp-style whole-block selection, (2) the live VTE selection,
+/// (3) any finished-block TextView with an active TextBuffer selection.
+///
+/// `alt_held` only affects case (1): when a whole block is selected, Alt
+/// narrows the copy to its output (Warp's Alt+Ctrl+Shift+C).
+///
+/// Why: dragging to select text in a finished block moves focus onto that
+/// TextView, so `active_vte.copy_clipboard_format` would silently no-op even
+/// though there's a visible selection. Walking the finished blocks' buffers
+/// covers that case (the common "select output, Ctrl+Shift+C" workflow).
+fn copy_selection_to_clipboard(ctx: &Rc<Ctx>, alt_held: bool) {
+    if let Some(idx) = ctx.selected_block.get() {
+        let bs = ctx.finished.borrow();
+        if let Some(b) = bs.get(idx) {
+            let text = if alt_held {
+                b.plain_output.clone()
+            } else {
+                format!("{}\n{}\n{}", b.prompt, b.command, b.plain_output)
+            };
+            set_clipboard(&text);
+            return;
+        }
+    }
+
+    if let Some(text) = ctx.active_vte.text_selected(vte4::Format::Text) {
+        if !text.is_empty() {
+            ctx.active_vte.clipboard().set_text(&text);
+            return;
+        }
+    }
+
+    for b in ctx.finished.borrow().iter() {
+        for view in [Some(&b.command_view), b.output_view.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let buf = view.buffer();
+            if let Some((start, end)) = buf.selection_bounds() {
+                let text = buf.text(&start, &end, false);
+                if !text.is_empty() {
+                    set_clipboard(&text);
+                    return;
+                }
+            }
+        }
     }
 }
 
