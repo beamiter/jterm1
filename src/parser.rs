@@ -3,6 +3,32 @@
 //! shell-integration marks, OSC 7 cwd, OSC 52 clipboard, alt-screen toggles and
 //! APC sequences that drive the block view. Ported from jterm4.
 
+/// Which color slot an OSC 10/11/12/4 query asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorKind {
+    /// OSC 10 — default foreground.
+    Foreground,
+    /// OSC 11 — default background.
+    Background,
+    /// OSC 12 — cursor color.
+    Cursor,
+    /// OSC 4;N — palette index N.
+    Palette(u8),
+}
+
+/// Which terminal-capability handshake an app sent. The active VTE in block view
+/// has no real PTY return path, so we synthesize a sensible "not supported"
+/// reply ourselves to keep neovim/helix from blocking on a missing response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardProtocolQuery {
+    /// `CSI ? u` — kitty progressive-enhancement flag query.
+    KittyQuery,
+    /// `CSI ? 4 m` — XTQMODKEYS modifyOtherKeys query.
+    ModifyOtherKeysQuery,
+    /// `CSI > c` / `CSI c` — secondary/primary device attributes.
+    DeviceAttributes,
+}
+
 /// Events emitted by the stream parser.
 #[derive(Debug, Clone)]
 pub enum ParserEvent {
@@ -26,6 +52,13 @@ pub enum ParserEvent {
     ClipboardSet(String),
     /// APC sequence (ESC _) — Kitty graphics protocol or similar.
     ApcSequence(Vec<u8>),
+    /// OSC 10/11/12/4 with a `?` — app is asking the terminal what color it uses.
+    /// The caller must write a `\e]<n>;rgb:RRRR/GGGG/BBBB\e\\` reply to the PTY.
+    ColorQuery(ColorKind),
+    /// App queried a keyboard/capability protocol. Caller should reply on the PTY
+    /// with a canned "not supported" / level-0 response so the app falls back
+    /// gracefully (otherwise neovim, helix, etc. hang waiting on the reply).
+    KeyboardProtocolQuery(KeyboardProtocolQuery),
 }
 
 #[derive(Default)]
@@ -44,7 +77,13 @@ enum State {
     Apc { buf: Vec<u8> },
     /// Saw ESC while in APC — next byte should be '\' for ST
     ApcEsc { payload: Vec<u8> },
-    /// Inside DCS/PM — just consume until ST
+    /// Inside DCS (ESC P): collect until ST. Unlike `Ignore`, the bytes are
+    /// rewrapped as `ESC P ... ESC \` and passed through to the active VTE so
+    /// sixel graphics, DECRQSS replies, and tmux passthrough survive block mode.
+    Dcs { buf: Vec<u8> },
+    /// Saw ESC while in DCS — next byte should be '\' for ST.
+    DcsEsc { payload: Vec<u8> },
+    /// Inside PM (ESC ^) — consume until ST and discard.
     Ignore,
 }
 
@@ -250,7 +289,10 @@ impl Parser {
                     b'_' => {
                         self.state = State::Apc { buf: Vec::new() };
                     }
-                    b'P' | b'^' => {
+                    b'P' => {
+                        self.state = State::Dcs { buf: Vec::new() };
+                    }
+                    b'^' => {
                         self.state = State::Ignore;
                     }
                     _ => {
@@ -281,6 +323,34 @@ impl Parser {
                             // mirror state.
                             if (b == b'h' || b == b'l') && params.first() == Some(&b'?') {
                                 self.update_dec_private_modes(&params[1..], b == b'h');
+                            }
+                            // Detect terminal-capability handshakes whose response
+                            // the active VTE would write back through its own PTY
+                            // (which is not connected). The caller synthesizes a
+                            // canned reply on `ctx.pty` so neovim/helix/etc. don't
+                            // hang waiting on it. The byte stream itself is still
+                            // passed through so the VTE updates its internal state.
+                            //
+                            // `CSI ? u`                       — kitty keyboard query
+                            // `CSI ? 4 m`                     — XTQMODKEYS query
+                            // `CSI c`, `CSI 0 c`, `CSI > c`   — primary/secondary DA
+                            match (b, params.as_slice()) {
+                                (b'u', b"?") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::KittyQuery,
+                                    ));
+                                }
+                                (b'm', b"?4") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::ModifyOtherKeysQuery,
+                                    ));
+                                }
+                                (b'c', b"") | (b'c', b"0") | (b'c', b">") | (b'c', b">0") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::DeviceAttributes,
+                                    ));
+                                }
+                                _ => {}
                             }
                             // Pass the complete sequence through as one contiguous run.
                             self.passthrough.push(0x1b);
@@ -357,6 +427,38 @@ impl Parser {
                     }
                 }
 
+                State::Dcs { buf } => match b {
+                    0x07 => {
+                        let payload = std::mem::take(buf);
+                        self.state = State::Ground;
+                        emit_dcs_passthrough(&payload, &mut self.passthrough);
+                    }
+                    0x1b => {
+                        let payload = std::mem::take(buf);
+                        self.state = State::DcsEsc { payload };
+                    }
+                    _ => {
+                        buf.push(b);
+                        // Bound runaway DCS (malformed stream) the same way CSI is bounded.
+                        if buf.len() > 1 << 20 {
+                            let payload = std::mem::take(buf);
+                            self.state = State::Ground;
+                            emit_dcs_passthrough(&payload, &mut self.passthrough);
+                        }
+                    }
+                },
+
+                State::DcsEsc { payload } => {
+                    let payload = std::mem::take(payload);
+                    self.state = State::Ground;
+                    emit_dcs_passthrough(&payload, &mut self.passthrough);
+                    if b == b'\\' {
+                        // Consumed the ST terminator.
+                    } else {
+                        self.passthrough.push(b);
+                    }
+                }
+
                 State::Ignore => {
                     if b == 0x07 || b == 0x1b {
                         self.state = State::Ground;
@@ -367,6 +469,18 @@ impl Parser {
 
         flush!();
     }
+}
+
+/// Rewrap a DCS payload as `ESC P ... ESC \` and append to the passthrough buffer
+/// so the active VTE — which can interpret sixel, DECRQSS replies, tmux
+/// passthrough, etc. — gets the original sequence verbatim.
+fn emit_dcs_passthrough(payload: &[u8], passthrough: &mut Vec<u8>) {
+    passthrough.reserve(payload.len() + 4);
+    passthrough.push(0x1b);
+    passthrough.push(b'P');
+    passthrough.extend_from_slice(payload);
+    passthrough.push(0x1b);
+    passthrough.push(b'\\');
 }
 
 fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
@@ -410,6 +524,36 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
             events.push(ParserEvent::CwdUpdate(path));
         }
         return;
+    }
+
+    // OSC 10 ; ? / OSC 11 ; ? / OSC 12 ; ?  — color queries (XParseColor reply).
+    // The active VTE in block view has no return PTY, so the response we'd
+    // expect VTE to emit never reaches the app. Emit a semantic event and let
+    // the caller write a reply on the real PTY.
+    for (prefix, kind) in [
+        ("10;", ColorKind::Foreground),
+        ("11;", ColorKind::Background),
+        ("12;", ColorKind::Cursor),
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            if rest.starts_with('?') {
+                events.push(ParserEvent::ColorQuery(kind));
+                return;
+            }
+        }
+    }
+
+    // OSC 4 ; <idx> ; ? — palette color query.
+    if let Some(rest) = s.strip_prefix("4;") {
+        let mut it = rest.splitn(2, ';');
+        if let (Some(idx_str), Some(value)) = (it.next(), it.next()) {
+            if value.starts_with('?') {
+                if let Ok(idx) = idx_str.parse::<u8>() {
+                    events.push(ParserEvent::ColorQuery(ColorKind::Palette(idx)));
+                    return;
+                }
+            }
+        }
     }
 
     // OSC 52 ; <selection> ; <base64-data> — clipboard set
@@ -551,6 +695,68 @@ mod tests {
         assert!(matches!(events[0], ParserEvent::AltScreenEnter));
         assert!(matches!(events[1], ParserEvent::AltScreenLeave));
         assert!(collect_bytes(&events).is_empty());
+    }
+
+    #[test]
+    fn dcs_is_passed_through_not_dropped() {
+        // A DCS sixel sequence: ESC P q ... ESC \. The whole thing should
+        // appear verbatim in the Bytes stream so the active VTE can render it.
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"before\x1bPq#0;2;0;0;0!100~-\x1b\\after", &mut events);
+        let bytes = collect_bytes(&events);
+        // The plain "before" and "after" survive, and the DCS round-trips.
+        assert!(bytes.windows(6).any(|w| w == b"before"));
+        assert!(bytes.windows(5).any(|w| w == b"after"));
+        assert!(bytes.windows(3).any(|w| w == b"\x1bPq"));
+        assert!(bytes.windows(2).any(|w| w == b"\x1b\\"));
+    }
+
+    #[test]
+    fn osc_color_queries_emit_events() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b]11;?\x07\x1b]10;?\x07\x1b]12;?\x1b\\\x1b]4;5;?\x07", &mut events);
+        let kinds: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ParserEvent::ColorQuery(k) => Some(*k),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ColorKind::Background,
+                ColorKind::Foreground,
+                ColorKind::Cursor,
+                ColorKind::Palette(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn keyboard_protocol_queries_emit_events() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        // kitty flag query, modifyOtherKeys query, primary & secondary DA.
+        p.feed(b"\x1b[?u\x1b[?4m\x1b[c\x1b[>c", &mut events);
+        let qs: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ParserEvent::KeyboardProtocolQuery(q) => Some(*q),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            qs,
+            vec![
+                KeyboardProtocolQuery::KittyQuery,
+                KeyboardProtocolQuery::ModifyOtherKeysQuery,
+                KeyboardProtocolQuery::DeviceAttributes,
+                KeyboardProtocolQuery::DeviceAttributes,
+            ]
+        );
     }
 
     #[test]

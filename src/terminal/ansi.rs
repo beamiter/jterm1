@@ -36,6 +36,7 @@ pub struct AnsiStyleState {
     pub reverse: bool,
     pub hidden: bool,
     pub overline: bool,
+    pub blink: bool,
     pub hyperlink: Option<String>,
 }
 
@@ -150,12 +151,14 @@ pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: 
             2 => style.dim = true,
             3 => style.italic = true,
             4 => style.underline_style = UnderlineStyle::Single,
+            5 | 6 => style.blink = true,
             9 => style.strikethrough = true,
             22 => {
                 style.bold = false;
                 style.dim = false;
             }
             23 => style.italic = false,
+            25 => style.blink = false,
             24 => {
                 style.underline_style = UnderlineStyle::None;
                 style.underline_color = None;
@@ -245,6 +248,7 @@ fn ansi_tag_name(style: &AnsiStyleState) -> Option<String> {
         && !style.reverse
         && !style.hidden
         && !style.overline
+        && !style.blink
         && style.hyperlink.is_none()
     {
         return None;
@@ -271,7 +275,7 @@ fn ansi_tag_name(style: &AnsiStyleState) -> Option<String> {
         None => "none".to_string(),
     };
     Some(format!(
-        "ansi-fg:{}-bg:{}-b{}-i{}-u{}-uc:{}-s{}-d{}-rv{}-hd{}-ov{}-lk:{}",
+        "ansi-fg:{}-bg:{}-b{}-i{}-u{}-uc:{}-s{}-d{}-rv{}-hd{}-ov{}-bl{}-lk:{}",
         rgba_key(style.foreground.as_ref()),
         rgba_key(style.background.as_ref()),
         style.bold as u8,
@@ -283,6 +287,7 @@ fn ansi_tag_name(style: &AnsiStyleState) -> Option<String> {
         style.reverse as u8,
         style.hidden as u8,
         style.overline as u8,
+        style.blink as u8,
         link_key,
     ))
 }
@@ -340,6 +345,16 @@ fn ensure_ansi_text_tag(buffer: &TextBuffer, style: &AnsiStyleState) -> Option<g
     }
     if style.strikethrough {
         tag.set_strikethrough(true);
+    }
+    if style.blink {
+        // GTK/Pango has no animated blink; mirror what VTE's "Allow Blink: off"
+        // does and just hint the attribute with mild emphasis (italic + reduced
+        // alpha) so the user can see the cell was tagged.
+        tag.set_style(gtk::pango::Style::Italic);
+        if let Some(mut fg) = style.foreground {
+            fg.set_alpha(fg.alpha() * 0.85);
+            tag.set_foreground_rgba(Some(&fg));
+        }
     }
     tag_table.add(&tag);
     Some(tag)
@@ -530,6 +545,67 @@ pub fn apply_ansi_runs_to_buffer(buffer: &TextBuffer, start_offset: usize, runs:
         }
         offset += len;
     }
+}
+
+/// Encode an `AnsiStyleState` back into a CSI SGR sequence such that feeding
+/// the result through `ansi_text_runs` reproduces the same style. Used by
+/// `grid.rs` to keep colors and attributes alive across the offline cursor-
+/// positioning replay — without this, colorized pager output (`less` with
+/// `LESS=R`, `git log --color`, `top`) loses all its color when the recorded
+/// block is rendered. Always begins with `0` (reset) so it's standalone.
+pub fn encode_sgr(style: &AnsiStyleState) -> String {
+    let mut parts: Vec<String> = vec!["0".into()];
+    if style.bold {
+        parts.push("1".into());
+    }
+    if style.dim {
+        parts.push("2".into());
+    }
+    if style.italic {
+        parts.push("3".into());
+    }
+    match style.underline_style {
+        UnderlineStyle::None => {}
+        UnderlineStyle::Single => parts.push("4".into()),
+        UnderlineStyle::Double => parts.push("21".into()),
+        UnderlineStyle::Curly => parts.push("4:3".into()),
+        UnderlineStyle::Dotted => parts.push("4:4".into()),
+        UnderlineStyle::Dashed => parts.push("4:5".into()),
+    }
+    if style.blink {
+        parts.push("5".into());
+    }
+    if style.reverse {
+        parts.push("7".into());
+    }
+    if style.hidden {
+        parts.push("8".into());
+    }
+    if style.strikethrough {
+        parts.push("9".into());
+    }
+    if style.overline {
+        parts.push("53".into());
+    }
+    let push_rgb = |parts: &mut Vec<String>, lead: &str, c: &RGBA| {
+        parts.push(format!(
+            "{lead};2;{};{};{}",
+            (c.red() * 255.0) as u8,
+            (c.green() * 255.0) as u8,
+            (c.blue() * 255.0) as u8
+        ));
+    };
+    if let Some(c) = style.foreground.as_ref() {
+        push_rgb(&mut parts, "38", c);
+    }
+    if let Some(c) = style.background.as_ref() {
+        push_rgb(&mut parts, "48", c);
+    }
+    if let Some(c) = style.underline_color.as_ref() {
+        push_rgb(&mut parts, "58", c);
+    }
+    // hyperlink is OSC 8, not SGR; encoded separately if needed.
+    format!("\x1b[{}m", parts.join(";"))
 }
 
 /// Truncate a run list to at most `max_chars` characters.

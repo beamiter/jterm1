@@ -83,10 +83,28 @@ pub fn has_cursor_positioning(bytes: &[u8]) -> bool {
 
 /// Replay `bytes` onto a `cols × rows` grid and return the resulting text.
 /// Trailing whitespace per row is trimmed; trailing blank rows are dropped.
+/// Equivalent to `render_to_ansi` with an empty palette — colors are dropped.
 pub fn render_to_text(bytes: &[u8], cols: usize, rows: usize) -> String {
+    render_to_ansi(bytes, cols, rows, &default_palette())
+}
+
+fn default_palette() -> [gtk4::gdk::RGBA; 16] {
+    [gtk4::gdk::RGBA::BLACK; 16]
+}
+
+/// Replay `bytes` onto a `cols × rows` grid and return the resulting text WITH
+/// re-emitted SGR escapes, so colorized pager output keeps its colors when the
+/// recorded block is rendered. The `palette` is needed to map indexed colors
+/// (SGR 30-37/40-47/90-97/100-107 + 38;5/48;5) to RGB.
+pub fn render_to_ansi(
+    bytes: &[u8],
+    cols: usize,
+    rows: usize,
+    palette: &[gtk4::gdk::RGBA; 16],
+) -> String {
     let cols = cols.max(MIN_COLS);
     let rows = rows.max(MIN_ROWS);
-    let mut grid = Grid::new(cols, rows);
+    let mut grid = Grid::new(cols, rows, *palette);
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -223,6 +241,19 @@ fn parse_params(params: &[u8]) -> Vec<u32> {
 }
 
 fn apply_csi(grid: &mut Grid, params: &[u8], final_b: u8) {
+    // SGR (m) updates the current cell style. Routed here before parsing as
+    // u32 so colon-delimited sub-parameters survive into `parse_sgr_params`.
+    if final_b == b'm' {
+        let s = std::str::from_utf8(params).unwrap_or("");
+        let parts: Vec<String> = if s.is_empty() {
+            vec!["0".into()]
+        } else {
+            s.split(';').map(String::from).collect()
+        };
+        super::ansi::parse_sgr_params(&mut grid.cur_state, &parts, &grid.palette);
+        grid.cur_style = grid.intern_style();
+        return;
+    }
     let p = parse_params(params);
     let p1 = |i: usize, dflt: u32| p.get(i).copied().filter(|v| *v != 0).unwrap_or(dflt);
     let p1_0 = |i: usize| p.get(i).copied().unwrap_or(0);
@@ -301,8 +332,18 @@ fn apply_csi(grid: &mut Grid, params: &[u8], final_b: u8) {
     }
 }
 
+/// One grid cell: a character + an index into `Grid::style_table`. Default
+/// style (index 0) is always present and represents "no SGR" — plain output.
+type Cell = (char, u16);
+
+const DEFAULT_STYLE: u16 = 0;
+
+fn blank_cell() -> Cell {
+    (' ', DEFAULT_STYLE)
+}
+
 struct Grid {
-    cells: Vec<Vec<char>>,
+    cells: Vec<Vec<Cell>>,
     cols: usize,
     rows: usize,
     row: usize,
@@ -314,12 +355,22 @@ struct Grid {
     /// trims to this so a 24-row grid receiving 5 lines doesn't pad with 19
     /// blanks.
     high_water: usize,
+    /// Interned styles — cells store a u16 index, the table holds unique states.
+    /// Index 0 is the default (no SGR), so plain output skips the table entirely.
+    style_table: Vec<super::ansi::AnsiStyleState>,
+    /// Currently-active SGR state (mutated by `m`-final CSI sequences).
+    cur_state: super::ansi::AnsiStyleState,
+    /// Interned index of `cur_state` — what new cells are written with.
+    cur_style: u16,
+    /// Palette used to resolve indexed SGR colors (30-37/40-47/90-97/100-107
+    /// and 38;5/48;5) to RGB. Threaded in from the active terminal's theme.
+    palette: [gtk4::gdk::RGBA; 16],
 }
 
 impl Grid {
-    fn new(cols: usize, rows: usize) -> Self {
+    fn new(cols: usize, rows: usize, palette: [gtk4::gdk::RGBA; 16]) -> Self {
         Self {
-            cells: vec![vec![' '; cols]; rows],
+            cells: vec![vec![blank_cell(); cols]; rows],
             cols,
             rows,
             row: 0,
@@ -328,12 +379,43 @@ impl Grid {
             scroll_top: 0,
             scroll_bot: rows - 1,
             high_water: 0,
+            style_table: vec![super::ansi::AnsiStyleState::default()],
+            cur_state: super::ansi::AnsiStyleState::default(),
+            cur_style: DEFAULT_STYLE,
+            palette,
         }
+    }
+
+    /// Find or insert `cur_state` in the style table and return its index.
+    fn intern_style(&mut self) -> u16 {
+        if self.cur_state == self.style_table[DEFAULT_STYLE as usize] {
+            return DEFAULT_STYLE;
+        }
+        for (i, existing) in self.style_table.iter().enumerate() {
+            if existing == &self.cur_state {
+                return i as u16;
+            }
+        }
+        // Cap to u16 to keep the table cheap; further unique styles all fold
+        // onto the last slot (worst case is colored-output style mashing).
+        if self.style_table.len() >= u16::MAX as usize {
+            return (self.style_table.len() - 1) as u16;
+        }
+        self.style_table.push(self.cur_state.clone());
+        (self.style_table.len() - 1) as u16
     }
 
     fn put_char(&mut self, c: char) {
         use unicode_width::UnicodeWidthChar;
-        let w = UnicodeWidthChar::width(c).unwrap_or(1).max(1);
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        // Zero-width chars (combining diacritics, ZWJ, VS16) must not advance
+        // the cursor — otherwise every column after the first accent in any
+        // non-ASCII output shifts right. Per-cell char buffers would be needed
+        // to preserve the mark in the offline grid; the alignment fix is the
+        // load-bearing change.
+        if w == 0 {
+            return;
+        }
         // A wide character at the last column wraps to the next row in a real
         // terminal (DEC's "wide char never split"). Mirror that here.
         if self.col + w > self.cols {
@@ -341,11 +423,11 @@ impl Grid {
             self.col = 0;
         }
         if self.row < self.rows && self.col < self.cols {
-            self.cells[self.row][self.col] = c;
+            self.cells[self.row][self.col] = (c, self.cur_style);
             // Mark the trailing cell of a wide char with a sentinel so column
             // bookkeeping stays right; `into_text` skips it when stringifying.
             if w == 2 && self.col + 1 < self.cols {
-                self.cells[self.row][self.col + 1] = '\0';
+                self.cells[self.row][self.col + 1] = ('\0', self.cur_style);
             }
             if self.row > self.high_water {
                 self.high_water = self.row;
@@ -360,7 +442,7 @@ impl Grid {
             for r in self.scroll_top..self.scroll_bot {
                 self.cells[r] = std::mem::take(&mut self.cells[r + 1]);
             }
-            self.cells[self.scroll_bot] = vec![' '; self.cols];
+            self.cells[self.scroll_bot] = vec![blank_cell(); self.cols];
             // Content was pushed into rows we had already touched; mark.
             if self.scroll_bot > self.high_water {
                 self.high_water = self.scroll_bot;
@@ -378,7 +460,7 @@ impl Grid {
             for r in (self.scroll_top + 1..=self.scroll_bot).rev() {
                 self.cells[r] = std::mem::take(&mut self.cells[r - 1]);
             }
-            self.cells[self.scroll_top] = vec![' '; self.cols];
+            self.cells[self.scroll_top] = vec![blank_cell(); self.cols];
         } else if self.row > 0 {
             self.row -= 1;
         }
@@ -387,11 +469,11 @@ impl Grid {
     fn erase_below(&mut self) {
         if self.row < self.rows {
             for c in self.col..self.cols {
-                self.cells[self.row][c] = ' ';
+                self.cells[self.row][c] = blank_cell();
             }
             for r in self.row + 1..self.rows {
                 for c in 0..self.cols {
-                    self.cells[r][c] = ' ';
+                    self.cells[r][c] = blank_cell();
                 }
             }
         }
@@ -400,12 +482,12 @@ impl Grid {
     fn erase_above(&mut self) {
         for r in 0..self.row {
             for c in 0..self.cols {
-                self.cells[r][c] = ' ';
+                self.cells[r][c] = blank_cell();
             }
         }
         if self.row < self.rows {
             for c in 0..=self.col.min(self.cols - 1) {
-                self.cells[self.row][c] = ' ';
+                self.cells[self.row][c] = blank_cell();
             }
         }
     }
@@ -413,7 +495,7 @@ impl Grid {
     fn erase_all(&mut self) {
         for r in 0..self.rows {
             for c in 0..self.cols {
-                self.cells[r][c] = ' ';
+                self.cells[r][c] = blank_cell();
             }
         }
         // Reset high-water: the screen is blank again. The cursor's row
@@ -424,7 +506,7 @@ impl Grid {
     fn erase_line_right(&mut self) {
         if self.row < self.rows {
             for c in self.col..self.cols {
-                self.cells[self.row][c] = ' ';
+                self.cells[self.row][c] = blank_cell();
             }
         }
     }
@@ -432,7 +514,7 @@ impl Grid {
     fn erase_line_left(&mut self) {
         if self.row < self.rows {
             for c in 0..=self.col.min(self.cols - 1) {
-                self.cells[self.row][c] = ' ';
+                self.cells[self.row][c] = blank_cell();
             }
         }
     }
@@ -440,7 +522,7 @@ impl Grid {
     fn erase_line(&mut self) {
         if self.row < self.rows {
             for c in 0..self.cols {
-                self.cells[self.row][c] = ' ';
+                self.cells[self.row][c] = blank_cell();
             }
         }
     }
@@ -454,7 +536,7 @@ impl Grid {
             for r in (self.row + 1..=self.scroll_bot).rev() {
                 self.cells[r] = std::mem::take(&mut self.cells[r - 1]);
             }
-            self.cells[self.row] = vec![' '; self.cols];
+            self.cells[self.row] = vec![blank_cell(); self.cols];
         }
     }
 
@@ -467,7 +549,7 @@ impl Grid {
             for r in self.row..self.scroll_bot {
                 self.cells[r] = std::mem::take(&mut self.cells[r + 1]);
             }
-            self.cells[self.scroll_bot] = vec![' '; self.cols];
+            self.cells[self.scroll_bot] = vec![blank_cell(); self.cols];
         }
     }
 
@@ -477,7 +559,7 @@ impl Grid {
             for r in self.scroll_top..self.scroll_bot {
                 self.cells[r] = std::mem::take(&mut self.cells[r + 1]);
             }
-            self.cells[self.scroll_bot] = vec![' '; self.cols];
+            self.cells[self.scroll_bot] = vec![blank_cell(); self.cols];
         }
     }
 
@@ -487,7 +569,7 @@ impl Grid {
             for r in (self.scroll_top + 1..=self.scroll_bot).rev() {
                 self.cells[r] = std::mem::take(&mut self.cells[r - 1]);
             }
-            self.cells[self.scroll_top] = vec![' '; self.cols];
+            self.cells[self.scroll_top] = vec![blank_cell(); self.cols];
         }
     }
 
@@ -505,14 +587,42 @@ impl Grid {
     fn into_text(self) -> String {
         let last = self.high_water.min(self.rows - 1);
         let mut out = String::new();
+        let mut cur_id: u16 = DEFAULT_STYLE;
+
         for r in 0..=last {
-            // Skip wide-char continuation sentinels so the trailing column of
-            // a CJK / emoji glyph doesn't leave a stray NUL in the output.
-            let line: String = self.cells[r].iter().filter(|&&c| c != '\0').collect();
-            out.push_str(line.trim_end_matches(' '));
+            // Trim trailing blanks-of-default-style — colored trailing cells
+            // (e.g. a status bar that paints to end-of-line) must be kept.
+            let line = &self.cells[r];
+            let mut end = line.len();
+            while end > 0 {
+                let (c, sid) = line[end - 1];
+                if (c == ' ' || c == '\0') && sid == DEFAULT_STYLE {
+                    end -= 1;
+                } else {
+                    break;
+                }
+            }
+            for &(c, sid) in &line[..end] {
+                if c == '\0' {
+                    // wide-char continuation sentinel — already emitted as
+                    // part of the previous char's glyph.
+                    continue;
+                }
+                if sid != cur_id {
+                    let style = &self.style_table[sid as usize];
+                    out.push_str(&super::ansi::encode_sgr(style));
+                    cur_id = sid;
+                }
+                out.push(c);
+            }
             if r < last {
                 out.push('\n');
             }
+        }
+        // Close any open style so the rendered block doesn't bleed SGR into
+        // following blocks.
+        if cur_id != DEFAULT_STYLE {
+            out.push_str("\x1b[0m");
         }
         // Trim trailing blank lines.
         while out.ends_with("\n\n") {
@@ -587,6 +697,31 @@ mod tests {
         assert_eq!(lines[0], "");
         assert_eq!(lines[1], "");
         assert_eq!(lines[2], "    hi");
+    }
+
+    #[test]
+    fn colors_survive_cursor_positioning_replay() {
+        // A clear-screen + home + colorized line. The recorded output must
+        // contain an SGR sequence so the rendered block keeps its color
+        // (previously stripped entirely by the no-SGR grid).
+        let palette = [gtk4::gdk::RGBA::BLACK; 16];
+        let bytes = b"\x1b[2J\x1b[H\x1b[31mred-text\x1b[0m plain";
+        let out = render_to_ansi(bytes, 80, 24, &palette);
+        assert!(out.contains("red-text"));
+        assert!(out.contains("plain"));
+        // The line carries an SGR escape and a reset.
+        assert!(out.contains("\x1b["), "expected SGR in output: {out:?}");
+    }
+
+    #[test]
+    fn combining_marks_do_not_shift_columns() {
+        // "é" written as `e` + U+0301 (combining acute). Both chars must end
+        // up in the same column so the trailing `|` lands at column 2, not 3.
+        let bytes = "e\u{301}|".as_bytes();
+        let out = render_to_text(bytes, 10, 1);
+        // Output is now base-only (combining mark dropped from the offline
+        // grid), but column alignment is preserved.
+        assert_eq!(out, "e|");
     }
 
     #[test]

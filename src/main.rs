@@ -2422,7 +2422,14 @@ impl SimpleComponent for AppModel {
                     self.tabs[ti].active_pane = pi;
                 }
             }
-            AppMsg::TitleChanged(_id, _title) => {}
+            AppMsg::TitleChanged(id, title) => {
+                if let Some(idx) = self.index_of(id) {
+                    if !self.tabs[idx].custom_title && !title.is_empty() {
+                        self.tabs[idx].title = title;
+                        self.rebuild_tab_strip(&sender);
+                    }
+                }
+            }
             AppMsg::Bell(id) => {
                 if let Some(idx) = self.index_of(id) {
                     if idx != self.active {
