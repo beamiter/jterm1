@@ -75,8 +75,17 @@ struct FinishedBlock {
     /// The "show N more lines" button, when output was truncated.
     show_more: Option<gtk::Button>,
     /// Full styled output runs, cached so the output view can be re-truncated
-    /// (reversible collapse) or rendered on demand (lazy load).
-    full_runs: Rc<Vec<AnsiTextRun>>,
+    /// (reversible collapse) or rendered on demand (lazy load). RefCell so
+    /// `VteInput::ApplyTheme` can swap in re-parsed runs with the new palette.
+    full_runs: Rc<RefCell<Vec<AnsiTextRun>>>,
+    /// Truncated head, parallel to `full_runs`. Also swapped on theme change.
+    head_runs: Rc<RefCell<Vec<AnsiTextRun>>>,
+    /// Raw ANSI output (as fed to `ansi::ansi_text_runs`), kept so a theme
+    /// change can re-parse with the new palette.
+    raw_output: Rc<String>,
+    /// Error-line highlight background, derived from the palette red. RefCell
+    /// so it can be refreshed when the theme changes.
+    err_bg: Rc<RefCell<String>>,
     /// Whether the output area is currently collapsed (hidden).
     collapsed: Rc<Cell<bool>>,
     /// Whether the truncated head (vs. full output) is currently shown.
@@ -107,6 +116,32 @@ struct FinishedBlock {
     duration_ms: u64,
     /// Wall-clock command-end time (ms since epoch), for export parity.
     end_time_ms: Option<u64>,
+}
+
+/// Which of a finished block's two TextViews is being selected (used by the
+/// cross-block drag-select gesture).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewKind {
+    Command,
+    Output,
+}
+
+impl ViewKind {
+    fn rank(self) -> u8 {
+        match self {
+            ViewKind::Command => 0,
+            ViewKind::Output => 1,
+        }
+    }
+}
+
+/// Anchor recorded at the start of a left-drag inside the block list — used to
+/// extend the selection across multiple finished blocks during the drag.
+#[derive(Clone, Copy, Debug)]
+struct DragAnchor {
+    block_id: u64,
+    kind: ViewKind,
+    offset: i32,
 }
 
 /// A command slower than this (ms) counts as "slow" for the slow filter.
@@ -215,6 +250,10 @@ struct Ctx {
     /// Source id of the periodic relative-time refresh timer, removed on
     /// shutdown so it stops firing (and stops anchoring this `Ctx`).
     relative_timer: RefCell<Option<glib::SourceId>>,
+    /// Source id of the /proc-based TUI fallback probe (250ms). Provides
+    /// fullscreen promotion for OSC-133-less shells and pipelined TUIs that
+    /// the smkx/program-name heuristics in `handle_event` miss.
+    tui_probe_timer: RefCell<Option<glib::SourceId>>,
     /// Rolling tail of the current command's output, bounded to `OUTPUT_TAIL_CAP`.
     /// Paired with `out_buf` (the bounded head) so huge output is captured as
     /// head + omission notice + tail instead of being held in full.
@@ -224,6 +263,14 @@ struct Ctx {
     /// Set when the typed-command reconstruction was invalidated by an escape
     /// sequence (arrow keys, history recall): finalize falls back to scraping.
     typed_unreliable: Cell<bool>,
+    /// Where the active cross-block drag-select started. None when no drag is
+    /// in progress, or when the drag started outside any finished block.
+    drag_anchor: Cell<Option<DragAnchor>>,
+    /// True while a cross-block drag is actively extending the selection — used
+    /// to suppress the normal "click on a block makes it the keyboard-selected
+    /// block" behavior and to claim the gesture so the per-TextView native
+    /// drag doesn't keep overwriting our cross-block selections.
+    drag_cross_block: Cell<bool>,
 }
 
 /// Bounded head retained verbatim for a command's captured output.
@@ -438,9 +485,12 @@ impl Component for BlockTerminal {
             filter_revealer: filter_revealer.clone(),
             filter_entry: filter_entry.clone(),
             relative_timer: RefCell::new(None),
+            tui_probe_timer: RefCell::new(None),
             out_tail: RefCell::new(VecDeque::new()),
             out_total: Cell::new(0),
             typed_unreliable: Cell::new(false),
+            drag_anchor: Cell::new(None),
+            drag_cross_block: Cell::new(false),
         });
 
         // `changed` fires during the viewport's size-allocate, after layout, so
@@ -503,6 +553,72 @@ impl Component for BlockTerminal {
                 }
             });
             sticky_header.add_controller(click);
+        }
+
+        // Cross-block drag-select: a left-button drag on the block list that
+        // crosses the boundary between two finished blocks extends the
+        // selection across them. Single-block drags stay handled by the native
+        // TextView gesture (we leave the gesture unclaimed in that case).
+        {
+            let ctx = ctx.clone();
+            let drag = gtk::GestureDrag::new();
+            drag.set_button(gtk::gdk::BUTTON_PRIMARY);
+            drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+            {
+                let ctx = ctx.clone();
+                drag.connect_drag_begin(move |_g, x, y| {
+                    let anchor = hit_test_block(&ctx, x, y).and_then(|(idx, kind, offset)| {
+                        let finished = ctx.finished.borrow();
+                        finished.get(idx).map(|b| DragAnchor {
+                            block_id: b.id,
+                            kind,
+                            offset,
+                        })
+                    });
+                    ctx.drag_anchor.set(anchor);
+                    ctx.drag_cross_block.set(false);
+                });
+            }
+            {
+                let ctx = ctx.clone();
+                drag.connect_drag_update(move |g, off_x, off_y| {
+                    let Some(anchor) = ctx.drag_anchor.get() else { return };
+                    let Some((sx, sy)) = g.start_point() else { return };
+                    let (x, y) = (sx + off_x, sy + off_y);
+                    let Some(cur) = hit_test_block(&ctx, x, y) else { return };
+                    // Determine which finished block the anchor is currently in.
+                    let finished = ctx.finished.borrow();
+                    let Some(anchor_idx) = finished.iter().position(|b| b.id == anchor.block_id)
+                    else {
+                        return;
+                    };
+                    drop(finished);
+                    let same_view = anchor_idx == cur.0 && anchor.kind == cur.1;
+                    if !ctx.drag_cross_block.get() && same_view {
+                        // Still inside the same view — let the native TextView
+                        // gesture do its thing.
+                        return;
+                    }
+                    ctx.drag_cross_block.set(true);
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                    apply_cross_block_selection(
+                        &ctx,
+                        (anchor_idx, anchor.kind, anchor.offset),
+                        cur,
+                    );
+                });
+            }
+            {
+                let ctx = ctx.clone();
+                drag.connect_drag_end(move |_g, _ox, _oy| {
+                    // Leave selections intact; just retire the anchor.
+                    ctx.drag_anchor.set(None);
+                    // Note: drag_cross_block stays set until the next drag
+                    // begins so a click released immediately after a cross-
+                    // block drag doesn't reset the cursor on selected blocks.
+                });
+            }
+            block_list.add_controller(drag);
         }
 
         // Forward keystrokes from the active VTE to our PTY, and reconstruct the
@@ -591,6 +707,22 @@ impl Component for BlockTerminal {
             *ctx.relative_timer.borrow_mut() = Some(id);
         }
 
+        // Fallback TUI promotion via `/proc/<fg-pgid>/comm`. The primary path —
+        // smkx (`\e[?1h`) plus the typed-command heuristic — fires inside
+        // `handle_event`, so OSC-133 shells with directly-typed TUIs already
+        // promote correctly. This probe covers the gap: shells without OSC 133
+        // integration (the `RawFallback` state never sees CommandStart), TUIs
+        // launched via pipelines / aliases / scripts where the typed command
+        // doesn't match a known basename, and apps that omit smkx.
+        {
+            let ctx_t = ctx.clone();
+            let id = glib::timeout_add_local(Duration::from_millis(250), move || {
+                tui_probe_tick(&ctx_t);
+                glib::ControlFlow::Continue
+            });
+            *ctx.tui_probe_timer.borrow_mut() = Some(id);
+        }
+
         // Install the reader: parser events drive the block state machine.
         {
             let ctx = ctx.clone();
@@ -624,13 +756,160 @@ impl Component for BlockTerminal {
             });
         }
 
+        // Bell: forward once, after VTE consumed the byte. Previously we scanned
+        // the parser's Bytes payload for 0x07 AND fed it to VTE, producing two
+        // bells per `\a`. Use VTE's own signal as the single source of truth.
         {
             let sender = sender.clone();
+            active_vte.connect_bell(move |_term| {
+                let _ = sender.output(VteOutput::Bell);
+            });
+        }
+
+        {
+            let sender = sender.clone();
+            let pty_focus = pty.clone();
+            let ctx_focus = ctx.clone();
             let focus_ctl = gtk::EventControllerFocus::new();
             focus_ctl.connect_enter(move |_| {
                 let _ = sender.output(VteOutput::Focused);
+                if ctx_focus.parser.borrow().focus_events() {
+                    pty_focus.write_bytes(b"\x1b[I");
+                }
             });
+            {
+                let pty_focus = pty.clone();
+                let ctx_focus = ctx.clone();
+                focus_ctl.connect_leave(move |_| {
+                    if ctx_focus.parser.borrow().focus_events() {
+                        pty_focus.write_bytes(b"\x1b[O");
+                    }
+                });
+            }
             active_vte.add_controller(focus_ctl);
+        }
+
+        // Mouse reporting: the active VTE has no real PTY, so VTE's built-in
+        // mouse reporting never fires (its dummy PTY never receives `?1000` etc.
+        // from the shell). We snoop the mode bits on our parser and synthesize
+        // xterm-style reports against our PTY when active. Capture phase so we
+        // run before VTE's selection handling; when no mode is active, we
+        // Proceed and VTE handles drag-to-select as usual.
+        {
+            let pty_m = pty.clone();
+            let ctx_m = ctx.clone();
+            let av = active_vte.clone();
+            // Bitmask of buttons currently held: bit n set when button n is down.
+            // Used by motion to compute `held` for ?1002, and by scroll to claim
+            // events. Buttons 1-3 fit in low bits comfortably.
+            let buttons_down: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+            // Last cursor position, in widget coords. Scroll callback has no
+            // (x, y) of its own in GTK4, so we mirror it from motion.
+            let last_pos: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
+
+            let click = gtk::GestureClick::new();
+            click.set_button(0); // any button
+            click.set_propagation_phase(gtk::PropagationPhase::Capture);
+            {
+                let pty_m = pty_m.clone();
+                let ctx_m = ctx_m.clone();
+                let av = av.clone();
+                let buttons_down = buttons_down.clone();
+                click.connect_pressed(move |g, _n, x, y| {
+                    let btn = g.current_button();
+                    let state = g.current_event_state();
+                    if let Some(bytes) =
+                        encode_mouse_event(&ctx_m, &av, MouseEv::Press(btn), x, y, state)
+                    {
+                        buttons_down.set(buttons_down.get() | (1u32 << btn.min(31)));
+                        pty_m.write_bytes(&bytes);
+                        g.set_state(gtk::EventSequenceState::Claimed);
+                    }
+                });
+            }
+            {
+                let pty_m = pty_m.clone();
+                let ctx_m = ctx_m.clone();
+                let av = av.clone();
+                let buttons_down = buttons_down.clone();
+                click.connect_released(move |g, _n, x, y| {
+                    let btn = g.current_button();
+                    let state = g.current_event_state();
+                    buttons_down.set(buttons_down.get() & !(1u32 << btn.min(31)));
+                    if let Some(bytes) =
+                        encode_mouse_event(&ctx_m, &av, MouseEv::Release(btn), x, y, state)
+                    {
+                        pty_m.write_bytes(&bytes);
+                        g.set_state(gtk::EventSequenceState::Claimed);
+                    }
+                });
+            }
+            active_vte.add_controller(click);
+
+            let motion = gtk::EventControllerMotion::new();
+            motion.set_propagation_phase(gtk::PropagationPhase::Capture);
+            {
+                let pty_m = pty_m.clone();
+                let ctx_m = ctx_m.clone();
+                let av = av.clone();
+                let buttons_down = buttons_down.clone();
+                let last_pos = last_pos.clone();
+                motion.connect_motion(move |_c, x, y| {
+                    last_pos.set((x, y));
+                    let down = buttons_down.get();
+                    let held = if down == 0 {
+                        None
+                    } else {
+                        // Lowest set bit = lowest-numbered held button.
+                        Some(down.trailing_zeros())
+                    };
+                    if let Some(bytes) = encode_mouse_event(
+                        &ctx_m,
+                        &av,
+                        MouseEv::Motion(held),
+                        x,
+                        y,
+                        gtk::gdk::ModifierType::empty(),
+                    ) {
+                        pty_m.write_bytes(&bytes);
+                    }
+                });
+            }
+            active_vte.add_controller(motion);
+
+            let scroll = gtk::EventControllerScroll::new(
+                gtk::EventControllerScrollFlags::VERTICAL
+                    | gtk::EventControllerScrollFlags::DISCRETE,
+            );
+            scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+            {
+                let pty_m = pty_m.clone();
+                let ctx_m = ctx_m.clone();
+                let av = av.clone();
+                let last_pos = last_pos.clone();
+                scroll.connect_scroll(move |_c, _dx, dy| {
+                    if ctx_m.parser.borrow().mouse_mode()
+                        == crate::parser::MouseMode::None
+                    {
+                        return glib::Propagation::Proceed;
+                    }
+                    let (x, y) = last_pos.get();
+                    let dir = if dy < 0.0 { -1 } else { 1 };
+                    if let Some(bytes) = encode_mouse_event(
+                        &ctx_m,
+                        &av,
+                        MouseEv::Wheel(dir),
+                        x,
+                        y,
+                        gtk::gdk::ModifierType::empty(),
+                    ) {
+                        pty_m.write_bytes(&bytes);
+                        return glib::Propagation::Stop;
+                    }
+                    glib::Propagation::Proceed
+                });
+            }
+            active_vte.add_controller(scroll);
         }
 
         // Block-local navigation (Warp-style). Capture phase so these fire before
@@ -830,7 +1109,7 @@ impl Component for BlockTerminal {
             }
             VteInput::Copy => copy_selection_to_clipboard(&self.ctx, false),
             VteInput::CopyOutputOnly => copy_selection_to_clipboard(&self.ctx, true),
-            VteInput::Paste => self.ctx.active_vte.paste_clipboard(),
+            VteInput::Paste => paste_from_clipboard(&self.ctx),
             VteInput::SetFontScale(scale) => self.ctx.active_vte.set_font_scale(scale),
             VteInput::SetFont(desc) => {
                 let fd = FontDescription::from_string(&desc);
@@ -838,8 +1117,14 @@ impl Component for BlockTerminal {
             }
             VteInput::SetScrollback(lines) => self.ctx.active_vte.set_scrollback_lines(lines),
             VteInput::ScrollLines(lines) => {
+                // Use the active VTE's cell height as the per-line step so a
+                // line-grain scroll request matches one terminal row regardless
+                // of what GTK derived from the ScrolledWindow's step_increment
+                // (which is geared to whole-page navigation).
                 let adj = self.ctx.scroll.vadjustment();
-                let delta = adj.step_increment() * lines as f64;
+                let cell_h = self.ctx.active_vte.char_height() as f64;
+                let step = if cell_h > 0.0 { cell_h } else { adj.step_increment() };
+                let delta = step * lines as f64;
                 let max_val = adj.upper() - adj.page_size();
                 let new_val = (adj.value() + delta).clamp(adj.lower(), max_val.max(adj.lower()));
                 adj.set_value(new_val);
@@ -856,8 +1141,43 @@ impl Component for BlockTerminal {
                 self.ctx
                     .active_vte
                     .set_color_cursor_foreground(Some(&config.cursor_foreground));
+                let palette = config.palette;
+                let truncate_lines = config.max_collapsed_output_lines as usize;
                 drop(config);
                 install_block_css(&self.config.borrow());
+                // Re-render finished blocks: the cached ANSI runs hold RGBA
+                // values from the previous palette, so a theme swap would leave
+                // their colors stale until rebuild. Re-parse from raw_output and
+                // swap the cached run vectors in place.
+                let new_err_bg = error_highlight_bg(&self.ctx);
+                for block in self.ctx.finished.borrow().iter() {
+                    let new_full = ansi::ansi_text_runs(&block.raw_output, &palette);
+                    let total = ansi::count_lines(&new_full);
+                    let do_trunc = truncate_lines > 0 && total > truncate_lines;
+                    let new_head = if do_trunc {
+                        let head_chars = ansi::char_offset_after_lines(&new_full, truncate_lines);
+                        ansi::truncate_runs(&new_full, head_chars)
+                    } else {
+                        new_full.clone()
+                    };
+                    *block.full_runs.borrow_mut() = new_full;
+                    *block.head_runs.borrow_mut() = new_head;
+                    *block.err_bg.borrow_mut() = new_err_bg.clone();
+                    if let Some(view) = &block.output_view {
+                        if !block.collapsed.get() {
+                            let full = block.full_runs.borrow();
+                            let head = block.head_runs.borrow();
+                            render_block_output(
+                                view,
+                                &head,
+                                &full,
+                                block.truncated.get(),
+                                &block.error_offsets,
+                                &new_err_bg,
+                            );
+                        }
+                    }
+                }
             }
             VteInput::Kill => self.ctx.pty.kill(),
             VteInput::FilterFailedBlocks => apply_filter(&self.ctx, BlockFilter::Failed),
@@ -896,6 +1216,9 @@ impl Component for BlockTerminal {
 /// the unbounded, growing state is freed here.
 fn teardown(ctx: &Rc<Ctx>) {
     if let Some(id) = ctx.relative_timer.borrow_mut().take() {
+        id.remove();
+    }
+    if let Some(id) = ctx.tui_probe_timer.borrow_mut().take() {
         id.remove();
     }
     for block in ctx.finished.borrow_mut().drain(..) {
@@ -1196,7 +1519,9 @@ fn expand_block_fully(ctx: &Rc<Ctx>, block: &FinishedBlock) {
         return;
     }
     let err_bg = error_highlight_bg(ctx);
-    render_block_output(view, &block.full_runs, &block.full_runs, false, &block.error_offsets, &err_bg);
+    let full = block.full_runs.borrow();
+    render_block_output(view, &full, &full, false, &block.error_offsets, &err_bg);
+    drop(full);
     block.truncated.set(false);
     block.collapsed.set(false);
     view.set_visible(true);
@@ -1267,12 +1592,12 @@ fn handle_data(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, data: &[u
 fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: ParserEvent) {
     match ev {
         ParserEvent::Bytes(bytes) => {
-            // Only walk the chunk for BEL/OSC-title when it actually contains the
-            // trigger bytes; plain high-throughput output then skips two O(n) scans.
-            if memchr::memchr2(0x07, 0x1b, &bytes).is_some() {
-                if contains_bell(&bytes) {
-                    let _ = sender.output(VteOutput::Bell);
-                }
+            // Only walk the chunk for OSC-title when it actually contains an
+            // escape; plain high-throughput output then skips the O(n) scan.
+            // Bell is forwarded via active_vte.connect_bell (installed in init)
+            // so it fires once after VTE has consumed the byte instead of
+            // racing with VTE's own bell.
+            if memchr::memchr(0x1b, &bytes).is_some() {
                 if let Some(title) = scan_title(&bytes) {
                     let _ = sender.output(VteOutput::TitleChanged(title));
                 }
@@ -1552,32 +1877,47 @@ const MIN_ACTIVE_ROWS: i64 = 8;
 const ACTIVE_CARD_VCHROME_PX: f64 = 22.0;
 
 /// Count the number of visual rows `bytes` occupy when rendered at `cols`
-/// columns, counting line wraps. ANSI escape sequences and UTF-8 continuation
-/// bytes are skipped so the width estimate is reasonable. Scanning stops once
-/// `cap` rows are reached, bounding the cost for huge output.
+/// columns, counting line wraps. ANSI escape sequences are skipped and
+/// UTF-8 codepoints are decoded so wide characters (CJK / emoji / fullwidth
+/// punctuation) advance by 2 columns. Scanning stops once `cap` rows are
+/// reached, bounding the cost for huge output.
 fn count_wrapped_rows(bytes: &[u8], cols: i64, cap: i64) -> i64 {
+    use unicode_width::UnicodeWidthChar;
     let cols = cols.max(1);
     let mut rows: i64 = 0;
     let mut col: i64 = 0;
-    let mut esc = false;
-    for &b in bytes {
-        if esc {
-            // Crude CSI/escape skip: terminates on a final byte (ASCII letter).
-            if b.is_ascii_alphabetic() {
-                esc = false;
+    let s = std::str::from_utf8(bytes)
+        .map(std::borrow::Cow::Borrowed)
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes));
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Crude escape skip: consume until an ASCII final byte (letter).
+            // Matches the original CSI heuristic and is good enough for height
+            // estimation; downstream rendering uses the full parser.
+            for nc in chars.by_ref() {
+                if nc.is_ascii_alphabetic() {
+                    break;
+                }
             }
             continue;
         }
-        match b {
-            0x1b => esc = true,
-            b'\n' => {
+        match c {
+            '\n' => {
                 rows += 1;
                 col = 0;
             }
-            b'\r' => col = 0,
-            // Advance one cell per character, ignoring UTF-8 continuation bytes.
-            b if b >= 0x20 && (b & 0xc0) != 0x80 => {
-                col += 1;
+            '\r' => col = 0,
+            c if (c as u32) >= 0x20 => {
+                let w = UnicodeWidthChar::width(c).unwrap_or(1) as i64;
+                if w == 0 {
+                    continue;
+                }
+                if col + w > cols {
+                    rows += 1;
+                    col = 0;
+                }
+                col += w;
                 if col >= cols {
                     rows += 1;
                     col = 0;
@@ -1732,26 +2072,34 @@ fn first_program_word(cmd: &str) -> Option<String> {
 /// full-screen TUI. Used at CommandStart for pre-emptive promotion. Anything
 /// not in this list still falls through to the smkx heuristic — this list
 /// only fixes the opening-frame size for the well-known cases.
+/// Known curses / full-screen TUI program names. Used both by the OSC-133-aware
+/// `looks_like_tui` (matching against the typed command line) and by the
+/// `/proc`-based fallback probe (matching against the kernel's `comm` field).
+const TUI_BASENAMES: &[&str] = &[
+    // process / system viewers
+    "top", "htop", "btop", "btm", "atop", "iotop", "nethogs", "nload",
+    "powertop", "iftop", "bmon",
+    // editors
+    "vim", "vi", "nvim", "neovim", "nano", "pico", "emacs",
+    // pagers
+    "less", "more", "most", "pager",
+    // file managers / explorers
+    "ranger", "nnn", "mc", "lf", "vifm",
+    // disk / inspection tools
+    "ncdu", "dust", "tig", "lazygit", "lazydocker", "k9s",
+    // misc
+    "watch", "man", "fzf", "tldr", "alsamixer", "ttyper",
+];
+
+fn is_tui_basename(name: &str) -> bool {
+    TUI_BASENAMES.contains(&name)
+}
+
 fn looks_like_tui(cmd: &str) -> bool {
-    const TUIS: &[&str] = &[
-        // process / system viewers
-        "top", "htop", "btop", "btm", "atop", "iotop", "nethogs", "nload",
-        "powertop", "iftop", "bmon",
-        // editors
-        "vim", "vi", "nvim", "neovim", "nano", "pico", "emacs",
-        // pagers
-        "less", "more", "most",
-        // file managers / explorers
-        "ranger", "nnn", "mc", "lf", "vifm",
-        // disk / inspection tools
-        "ncdu", "dust", "tig", "lazygit", "lazydocker", "k9s",
-        // misc
-        "watch", "man", "fzf", "tldr", "alsamixer", "ttyper",
-    ];
     let Some(name) = first_program_word(cmd) else {
         return false;
     };
-    if TUIS.contains(&name.as_str()) {
+    if is_tui_basename(&name) {
         return true;
     }
     // `git log/diff/show/blame` typically pipe through `less` (the user's PAGER)
@@ -1766,6 +2114,60 @@ fn looks_like_tui(cmd: &str) -> bool {
         return matches!(sub, "log" | "diff" | "show" | "blame" | "reflog");
     }
     false
+}
+
+/// Look up the kernel's `comm` for a process id. Returns the basename-ish
+/// short name (max 15 bytes — kernel limit). None if the file is gone (the
+/// process exited between `tcgetpgrp` and `read`).
+fn read_proc_comm(pid: i32) -> Option<String> {
+    let path = format!("/proc/{pid}/comm");
+    let s = std::fs::read_to_string(path).ok()?;
+    Some(s.trim_end_matches('\n').to_string())
+}
+
+/// 250ms /proc-based fallback for TUI promotion. The OSC-133-driven path in
+/// `handle_event` handles the common case; this picks up shells that lack
+/// OSC 133 (RawFallback never sees CommandStart), aliased / scripted TUIs
+/// whose typed name doesn't match a known basename, and apps that don't emit
+/// smkx. Demotes when the shell returns to the foreground.
+fn tui_probe_tick(ctx: &Rc<Ctx>) {
+    // Defer to the real alt-screen / OSC-133 paths when they're in charge.
+    if ctx.state.get() == BlockState::AltScreen {
+        return;
+    }
+    let fd = ctx.pty.master_fd_raw();
+    if fd < 0 {
+        return;
+    }
+    // tcgetpgrp returns the foreground process group of the PTY's slave side.
+    // Safety: `fd` is a valid open master fd owned by `ctx.pty`.
+    let fg_pgid = unsafe { nix::libc::tcgetpgrp(fd) };
+    if fg_pgid <= 0 {
+        return;
+    }
+    let shell_pid = ctx.pty.pid_i32();
+    if fg_pgid == shell_pid {
+        // Shell is the foreground process: if we previously promoted on a
+        // best-guess heuristic, retract that now so finished blocks come back.
+        if ctx.tui_promoted.replace(false) {
+            exit_fullscreen(ctx);
+        }
+        return;
+    }
+    // Some other process group is foreground. Check whether it looks like a TUI.
+    let Some(comm) = read_proc_comm(fg_pgid) else { return };
+    if is_tui_basename(&comm) {
+        if !ctx.tui_promoted.get() && !ctx.fullscreen.get() {
+            ctx.tui_promoted.set(true);
+            enter_fullscreen(ctx);
+            resize_active_to_fullscreen(ctx);
+        }
+    } else if ctx.tui_promoted.get() {
+        // Foreground is some non-TUI subprocess but we had promoted earlier —
+        // back off so the rest of the UI stays usable.
+        ctx.tui_promoted.set(false);
+        exit_fullscreen(ctx);
+    }
 }
 
 fn autoscroll(ctx: &Rc<Ctx>) {
@@ -2369,10 +2771,13 @@ fn build_finished_block(
     outer.set_hexpand(true);
 
     // Parse ANSI output into styled runs once; `plain_output` is the de-styled
-    // text used for the empty check and clipboard copy.
+    // text used for the empty check and clipboard copy. Wrapped in `Rc<RefCell>`
+    // so `ApplyTheme` can swap in re-parsed runs without rebuilding the widget.
     let palette = ctx.config.borrow().palette;
-    let runs: Rc<Vec<AnsiTextRun>> = Rc::new(ansi::ansi_text_runs(output, &palette));
-    let plain_output: String = runs.iter().map(|r| r.text.as_str()).collect();
+    let raw_output: Rc<String> = Rc::new(output.to_string());
+    let runs_vec = ansi::ansi_text_runs(output, &palette);
+    let plain_output: String = runs_vec.iter().map(|r| r.text.as_str()).collect();
+    let runs: Rc<RefCell<Vec<AnsiTextRun>>> = Rc::new(RefCell::new(runs_vec));
 
     // Detect error-line offsets (only meaningful for failed commands).
     let error_offsets = if exit_code != 0 {
@@ -2558,8 +2963,10 @@ fn build_finished_block(
     url::attach_url_handlers(&command_view);
     outer.append(&command_view);
 
-    // Background for error-line highlight, derived from the palette red.
-    let err_bg = error_highlight_bg(ctx);
+    // Background for error-line highlight, derived from the palette red. Held
+    // in an `Rc<RefCell>` so theme changes also refresh the cached value used by
+    // the show-more / collapse closures.
+    let err_bg: Rc<RefCell<String>> = Rc::new(RefCell::new(error_highlight_bg(ctx)));
     let error_offsets_rc: Rc<Vec<i32>> = Rc::new(error_offsets.clone());
 
     // Output view with reversible truncation + lazy rendering. `truncated` tracks
@@ -2567,7 +2974,7 @@ fn build_finished_block(
     // area is hidden; `rendered` guards lazy first-render.
     let truncate_lines = ctx.config.borrow().max_collapsed_output_lines as usize;
     let lazy_threshold = ctx.config.borrow().lazy_load_threshold as usize;
-    let total_lines = ansi::count_lines(&runs);
+    let total_lines = ansi::count_lines(&runs.borrow());
     let do_truncate = truncate_lines > 0 && total_lines > truncate_lines;
     // Failed blocks always render eagerly + expanded so the error is on screen.
     let lazy = lazy_threshold > 0 && total_lines > lazy_threshold && exit_code == 0;
@@ -2577,11 +2984,15 @@ fn build_finished_block(
     let truncated = Rc::new(Cell::new(do_truncate));
     let rendered = Rc::new(Cell::new(false));
 
-    let head_runs: Rc<Vec<AnsiTextRun>> = if do_truncate {
-        let head_chars = ansi::char_offset_after_lines(&runs, truncate_lines);
-        Rc::new(ansi::truncate_runs(&runs, head_chars))
-    } else {
-        runs.clone()
+    let head_runs: Rc<RefCell<Vec<AnsiTextRun>>> = {
+        let full = runs.borrow();
+        let head_vec = if do_truncate {
+            let head_chars = ansi::char_offset_after_lines(&full, truncate_lines);
+            ansi::truncate_runs(&full, head_chars)
+        } else {
+            full.clone()
+        };
+        Rc::new(RefCell::new(head_vec))
     };
 
     let mut output_view: Option<gtk::TextView> = None;
@@ -2599,7 +3010,14 @@ fn build_finished_block(
         // Render eagerly unless this block starts collapsed (lazy/no-output);
         // collapsed blocks render on first expand.
         if !collapsed.get() {
-            render_block_output(&view, &head_runs, &runs, truncated.get(), &error_offsets_rc, &err_bg);
+            render_block_output(
+                &view,
+                &head_runs.borrow(),
+                &runs.borrow(),
+                truncated.get(),
+                &error_offsets_rc,
+                &err_bg.borrow(),
+            );
             rendered.set(true);
         }
         outer.append(&view);
@@ -2620,7 +3038,14 @@ fn build_finished_block(
                 btn.connect_clicked(move |btn| {
                     let now_truncated = !truncated.get();
                     truncated.set(now_truncated);
-                    render_block_output(&view, &head_runs, &full, now_truncated, &errors, &err_bg);
+                    render_block_output(
+                        &view,
+                        &head_runs.borrow(),
+                        &full.borrow(),
+                        now_truncated,
+                        &errors,
+                        &err_bg.borrow(),
+                    );
                     let label = if now_truncated {
                         format!("▼ show {hidden} more lines")
                     } else {
@@ -2653,7 +3078,14 @@ fn build_finished_block(
             collapsed.set(now_collapsed);
             if !now_collapsed && !rendered.get() {
                 if let Some(v) = &output_view {
-                    render_block_output(v, &head_runs, &full, truncated.get(), &errors, &err_bg);
+                    render_block_output(
+                        v,
+                        &head_runs.borrow(),
+                        &full.borrow(),
+                        truncated.get(),
+                        &errors,
+                        &err_bg.borrow(),
+                    );
                 }
                 rendered.set(true);
             }
@@ -2691,6 +3123,9 @@ fn build_finished_block(
         output_view,
         show_more,
         full_runs: runs,
+        head_runs,
+        raw_output,
+        err_bg,
         collapsed,
         truncated,
         pinned,
@@ -3001,6 +3436,158 @@ fn set_clipboard(text: &str) {
     }
 }
 
+enum MouseEv {
+    Press(u32),
+    Release(u32),
+    /// Motion event; `held` is the lowest-numbered held button if any.
+    Motion(Option<u32>),
+    /// Wheel scroll; -1 = up, +1 = down.
+    Wheel(i32),
+}
+
+/// Translate a pointer event to the xterm mouse-report bytes the shell expects,
+/// or `None` if the current mode/encoding doesn't ask for this event. Returning
+/// `None` lets the gesture controller fall through to VTE's native handling
+/// (drag-to-select etc.).
+fn encode_mouse_event(
+    ctx: &Rc<Ctx>,
+    av: &vte4::Terminal,
+    ev: MouseEv,
+    x: f64,
+    y: f64,
+    state: gtk::gdk::ModifierType,
+) -> Option<Vec<u8>> {
+    use crate::parser::{MouseEncoding, MouseMode};
+    let parser = ctx.parser.borrow();
+    let mode = parser.mouse_mode();
+    let enc = parser.mouse_encoding();
+    drop(parser);
+    if mode == MouseMode::None {
+        return None;
+    }
+
+    let cw = (av.char_width().max(1)) as f64;
+    let ch = (av.char_height().max(1)) as f64;
+    let col = ((x / cw).floor() as i32 + 1).max(1);
+    let row = ((y / ch).floor() as i32 + 1).max(1);
+
+    let (mut b, is_release) = match ev {
+        MouseEv::Press(btn) => {
+            let code = match btn {
+                1 => 0u32,
+                2 => 1,
+                3 => 2,
+                _ => return None,
+            };
+            (code, false)
+        }
+        MouseEv::Release(btn) => {
+            if mode == MouseMode::X10 {
+                return None;
+            }
+            let code = match btn {
+                1 => 0u32,
+                2 => 1,
+                3 => 2,
+                _ => return None,
+            };
+            (code, true)
+        }
+        MouseEv::Motion(held) => {
+            // Normal/X10: no motion. ButtonEvent: only while a button is held.
+            // AnyEvent: report all motion.
+            match mode {
+                MouseMode::None | MouseMode::X10 | MouseMode::Normal => return None,
+                MouseMode::ButtonEvent if held.is_none() => return None,
+                _ => {}
+            }
+            // 0x20 = motion bit; held button (or 3 = no buttons) in low 2 bits.
+            let held_code = match held {
+                Some(1) => 0u32,
+                Some(2) => 1,
+                Some(3) => 2,
+                _ => 3,
+            };
+            (held_code | 0x20, false)
+        }
+        MouseEv::Wheel(dir) => {
+            // Wheel reports use bits 0x40 + direction (0 up, 1 down). Never
+            // generate a release.
+            let code = 0x40u32 | if dir < 0 { 0 } else { 1 };
+            (code, false)
+        }
+    };
+
+    if state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        b |= 4;
+    }
+    if state.contains(gtk::gdk::ModifierType::ALT_MASK) {
+        b |= 8;
+    }
+    if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+        b |= 16;
+    }
+
+    Some(match enc {
+        MouseEncoding::Sgr => {
+            let term = if is_release { 'm' } else { 'M' };
+            format!("\x1b[<{};{};{}{}", b, col, row, term).into_bytes()
+        }
+        MouseEncoding::Urxvt => {
+            // urxvt: same button code as legacy (release collapses to 3) but
+            // sent as a decimal in `\e[<b>;<col>;<row>M`.
+            let mut bb = b;
+            if is_release {
+                bb = 3;
+            }
+            format!("\x1b[{};{};{}M", bb + 32, col, row).into_bytes()
+        }
+        MouseEncoding::Default | MouseEncoding::Utf8 => {
+            // Legacy: 3 bytes after `\e[M`. Clamp >223 cells (release encodes 3).
+            let mut bb = b;
+            if is_release {
+                bb = 3;
+            }
+            let cx = (col.min(223) as u32) as u8 + 32;
+            let cy = (row.min(223) as u32) as u8 + 32;
+            let bb_byte = (bb + 32).min(255) as u8;
+            vec![0x1b, b'[', b'M', bb_byte, cx, cy]
+        }
+    })
+}
+
+/// Paste the system clipboard into the shell, honoring bracketed paste mode.
+///
+/// The active VTE in block view has no real PTY of its own — VTE's built-in
+/// `paste_clipboard()` would generate `\e[200~`/`\e[201~` only if its dummy PTY
+/// had `?2004` enabled, which it never does. We track the mode on our own
+/// parser and bracket the write here. Bypasses the `commit` handler entirely
+/// so control bytes in pasted text are not mangled by the typed-cmd filter.
+fn paste_from_clipboard(ctx: &Rc<Ctx>) {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let clipboard = display.clipboard();
+    let pty = ctx.pty.clone();
+    let bracketed = ctx.parser.borrow().bracketed_paste();
+    clipboard.read_text_async(gtk::gio::Cancellable::NONE, move |res| {
+        let Ok(Some(text)) = res else {
+            return;
+        };
+        // Most shells strip a trailing newline themselves; we don't.
+        let bytes = text.as_bytes();
+        if bracketed {
+            let mut out = Vec::with_capacity(bytes.len() + 12);
+            out.extend_from_slice(b"\x1b[200~");
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\x1b[201~");
+            pty.write_bytes(&out);
+        } else {
+            pty.write_bytes(bytes);
+        }
+    });
+}
+
 /// Resolve a Copy action in block mode by trying (in priority order):
 /// (1) a Warp-style whole-block selection, (2) the live VTE selection,
 /// (3) any finished-block TextView with an active TextBuffer selection.
@@ -3033,6 +3620,11 @@ fn copy_selection_to_clipboard(ctx: &Rc<Ctx>, alt_held: bool) {
         }
     }
 
+    // Walk all finished blocks in display order, gathering every non-empty
+    // selection. After a cross-block drag this returns the joined text from
+    // every spanned view; for a plain single-view selection it falls through
+    // to the existing single-buffer behavior.
+    let mut parts: Vec<String> = Vec::new();
     for b in ctx.finished.borrow().iter() {
         for view in [Some(&b.command_view), b.output_view.as_ref()]
             .into_iter()
@@ -3042,10 +3634,105 @@ fn copy_selection_to_clipboard(ctx: &Rc<Ctx>, alt_held: bool) {
             if let Some((start, end)) = buf.selection_bounds() {
                 let text = buf.text(&start, &end, false);
                 if !text.is_empty() {
-                    set_clipboard(&text);
-                    return;
+                    parts.push(text.to_string());
                 }
             }
+        }
+    }
+    if !parts.is_empty() {
+        set_clipboard(&parts.join("\n"));
+    }
+}
+
+/// Hit-test a point in `block_list` coordinates against every finished block's
+/// command + output TextView. Returns the block index, which view was hit, and
+/// the character offset under the pointer. None when the point is not inside
+/// any block's text view.
+fn hit_test_block(ctx: &Rc<Ctx>, list_x: f64, list_y: f64) -> Option<(usize, ViewKind, i32)> {
+    let finished = ctx.finished.borrow();
+    for (idx, block) in finished.iter().enumerate() {
+        if !block.widget.is_visible() {
+            continue;
+        }
+        for (kind, view) in [
+            (ViewKind::Command, Some(&block.command_view)),
+            (ViewKind::Output, block.output_view.as_ref()),
+        ] {
+            let Some(view) = view else { continue };
+            if !view.is_visible() {
+                continue;
+            }
+            let pt = gtk::graphene::Point::new(list_x as f32, list_y as f32);
+            let Some(local) = ctx.block_list.compute_point(view, &pt) else {
+                continue;
+            };
+            let (lx, ly) = (local.x() as f64, local.y() as f64);
+            if lx < 0.0
+                || ly < 0.0
+                || lx > view.width() as f64
+                || ly > view.height() as f64
+            {
+                continue;
+            }
+            let (bx, by) = view.window_to_buffer_coords(
+                gtk::TextWindowType::Widget,
+                lx as i32,
+                ly as i32,
+            );
+            let iter = view.iter_at_location(bx, by).unwrap_or_else(|| {
+                // Past end of text: clamp to end of buffer.
+                view.buffer().end_iter()
+            });
+            return Some((idx, kind, iter.offset()));
+        }
+    }
+    None
+}
+
+/// Apply a selection spanning `anchor` → `target` across one or more finished
+/// blocks. Each individual TextView's buffer is updated independently; views
+/// outside the range have their selections cleared.
+fn apply_cross_block_selection(
+    ctx: &Rc<Ctx>,
+    anchor: (usize, ViewKind, i32),
+    target: (usize, ViewKind, i32),
+) {
+    // Normalize anchor/target into (begin, end) in display order.
+    let key = |p: &(usize, ViewKind, i32)| (p.0, p.1.rank());
+    let (begin, end) = if key(&anchor) <= key(&target) {
+        (anchor, target)
+    } else {
+        (target, anchor)
+    };
+    let finished = ctx.finished.borrow();
+    for (idx, block) in finished.iter().enumerate() {
+        for (kind, view) in [
+            (ViewKind::Command, Some(&block.command_view)),
+            (ViewKind::Output, block.output_view.as_ref()),
+        ] {
+            let Some(view) = view else { continue };
+            let buf = view.buffer();
+            let pos = (idx, kind.rank());
+            let begin_pos = (begin.0, begin.1.rank());
+            let end_pos = (end.0, end.1.rank());
+            if pos < begin_pos || pos > end_pos {
+                // Outside range — clear any existing selection by collapsing
+                // it to the buffer's start.
+                let iter = buf.start_iter();
+                buf.select_range(&iter, &iter);
+                continue;
+            }
+            let start_iter = if pos == begin_pos {
+                buf.iter_at_offset(begin.2)
+            } else {
+                buf.start_iter()
+            };
+            let end_iter = if pos == end_pos {
+                buf.iter_at_offset(end.2)
+            } else {
+                buf.end_iter()
+            };
+            buf.select_range(&start_iter, &end_iter);
         }
     }
 }
@@ -3100,32 +3787,6 @@ fn strip_ansi(input: &[u8]) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-/// True if `bytes` contains a BEL that is not an OSC string terminator.
-fn contains_bell(bytes: &[u8]) -> bool {
-    let mut in_osc = false;
-    let mut prev_esc = false;
-    for &b in bytes {
-        if in_osc {
-            // OSC ends on BEL (0x07) or ST (ESC \).
-            if b == 0x07 || (prev_esc && b == b'\\') {
-                in_osc = false;
-            }
-            prev_esc = b == 0x1b;
-            continue;
-        }
-        match b {
-            0x07 => return true,
-            0x1b => prev_esc = true,
-            b']' if prev_esc => {
-                in_osc = true;
-                prev_esc = false;
-            }
-            _ => prev_esc = false,
-        }
-    }
-    false
 }
 
 /// Naive substring search; we only call it with short literal needles like
@@ -3415,7 +4076,9 @@ fn scroll_to_first_error(ctx: &Rc<Ctx>, idx: usize) {
         }
         if let Some(view) = &block.output_view {
             if block.truncated.get() || block.collapsed.get() {
-                render_block_output(view, &block.full_runs, &block.full_runs, false, &block.error_offsets, &err_bg);
+                let full = block.full_runs.borrow();
+                render_block_output(view, &full, &full, false, &block.error_offsets, &err_bg);
+                drop(full);
                 block.truncated.set(false);
                 block.collapsed.set(false);
                 view.set_visible(true);

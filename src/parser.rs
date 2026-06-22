@@ -48,9 +48,51 @@ enum State {
     Ignore,
 }
 
+/// Which mouse-tracking mode the shell asked for. The active VTE in block-view
+/// has no real PTY, so VTE never auto-generates mouse reports; the caller drives
+/// reporting itself by reading this state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseMode {
+    #[default]
+    None,
+    /// `?9` — only button presses (no release).
+    X10,
+    /// `?1000` — button press + release.
+    Normal,
+    /// `?1002` — press/release + motion while a button is held.
+    ButtonEvent,
+    /// `?1003` — press/release + all motion.
+    AnyEvent,
+}
+
+/// Wire format for mouse reports. Set by `?1006`, `?1015`, `?1005` (or default
+/// xterm encoding if none enabled).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseEncoding {
+    /// Legacy `\e[M` + 3 bytes (button + 32, col + 32, row + 32).
+    #[default]
+    Default,
+    /// `?1006` — SGR: `\e[<b;col;row;{M|m}`.
+    Sgr,
+    /// `?1015` — urxvt: `\e[b;col;row;M`.
+    Urxvt,
+    /// `?1005` — UTF-8 encoded coordinates.
+    Utf8,
+}
+
 pub struct Parser {
     state: State,
     passthrough: Vec<u8>,
+    /// `?2004` — shell asked for paste content to be bracketed with `\e[200~`
+    /// / `\e[201~`. The caller wraps its own `Paste` write when this is on.
+    bracketed_paste: bool,
+    /// Which mouse mode is currently active (highest-priority "h" wins).
+    mouse_mode: MouseMode,
+    /// Active mouse encoding flags. SGR/Urxvt/Utf8 are toggled independently; a
+    /// later "h" replaces the encoding choice.
+    mouse_encoding: MouseEncoding,
+    /// `?1004` — shell asked for `\e[I` / `\e[O` on focus enter/leave.
+    focus_events: bool,
 }
 
 fn is_alt_screen_mode(params: &[u8]) -> bool {
@@ -68,6 +110,89 @@ impl Parser {
         Parser {
             state: State::default(),
             passthrough: Vec::with_capacity(4096),
+            bracketed_paste: false,
+            mouse_mode: MouseMode::None,
+            mouse_encoding: MouseEncoding::Default,
+            focus_events: false,
+        }
+    }
+
+    /// True while the shell has `?2004` enabled — callers should wrap pasted
+    /// content with `\e[200~` / `\e[201~` before writing to the PTY.
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    /// Currently active mouse-tracking mode, or `None` when reporting is off.
+    pub fn mouse_mode(&self) -> MouseMode {
+        self.mouse_mode
+    }
+
+    /// Wire encoding the next mouse report should use.
+    pub fn mouse_encoding(&self) -> MouseEncoding {
+        self.mouse_encoding
+    }
+
+    /// True while `?1004` is enabled — callers should emit `\e[I` on focus-in,
+    /// `\e[O` on focus-out.
+    pub fn focus_events(&self) -> bool {
+        self.focus_events
+    }
+
+    /// Apply each `?N` token from a `CSI ? Pm h/l` to the snooped state.
+    /// `enable` = true for `h`, false for `l`. Unknown modes are ignored —
+    /// they still pass through to the VTE.
+    fn update_dec_private_modes(&mut self, params: &[u8], enable: bool) {
+        for token in params.split(|&c| c == b';') {
+            // Each token may itself start with `?` if the shell sent
+            // `CSI ?1;?2 h`; tolerate that.
+            let token = token.strip_prefix(b"?").unwrap_or(token);
+            let n: u32 = match std::str::from_utf8(token).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => continue,
+            };
+            match n {
+                2004 => self.bracketed_paste = enable,
+                9 => self.mouse_mode = if enable { MouseMode::X10 } else { MouseMode::None },
+                1000 => self.mouse_mode = if enable { MouseMode::Normal } else { MouseMode::None },
+                1002 => {
+                    self.mouse_mode = if enable {
+                        MouseMode::ButtonEvent
+                    } else {
+                        MouseMode::None
+                    }
+                }
+                1003 => {
+                    self.mouse_mode = if enable {
+                        MouseMode::AnyEvent
+                    } else {
+                        MouseMode::None
+                    }
+                }
+                1004 => self.focus_events = enable,
+                1005 => {
+                    self.mouse_encoding = if enable {
+                        MouseEncoding::Utf8
+                    } else {
+                        MouseEncoding::Default
+                    }
+                }
+                1006 => {
+                    self.mouse_encoding = if enable {
+                        MouseEncoding::Sgr
+                    } else {
+                        MouseEncoding::Default
+                    }
+                }
+                1015 => {
+                    self.mouse_encoding = if enable {
+                        MouseEncoding::Urxvt
+                    } else {
+                        MouseEncoding::Default
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -82,16 +207,34 @@ impl Parser {
             };
         }
 
-        for &b in data {
-            match &mut self.state {
-                State::Ground => match b {
-                    0x1b => {
+        // Ground-state fast-path: bulk-copy runs of bytes until the next ESC.
+        // The previous per-byte loop dominated cost on heavy text streams; ESC
+        // is the only byte that exits Ground, so memchr lets us hop directly
+        // to the next state transition.
+        let mut i = 0usize;
+        let len = data.len();
+        while i < len {
+            if matches!(self.state, State::Ground) {
+                match memchr::memchr(0x1b, &data[i..]) {
+                    Some(off) => {
+                        if off > 0 {
+                            self.passthrough.extend_from_slice(&data[i..i + off]);
+                        }
+                        i += off + 1;
                         self.state = State::Esc;
+                        continue;
                     }
-                    _ => {
-                        self.passthrough.push(b);
+                    None => {
+                        self.passthrough.extend_from_slice(&data[i..]);
+                        break;
                     }
-                },
+                }
+            }
+
+            let b = data[i];
+            i += 1;
+            match &mut self.state {
+                State::Ground => unreachable!("handled by fast-path above"),
 
                 State::Esc => match b {
                     b'[' => {
@@ -131,6 +274,14 @@ impl Parser {
                             flush!();
                             events.push(ParserEvent::AltScreenLeave);
                         } else {
+                            // Snoop DEC private mode set/reset for the modes the
+                            // active VTE in block view cannot service for us
+                            // (bracketed paste, mouse, focus). Still pass the
+                            // CSI through verbatim so the VTE updates its own
+                            // mirror state.
+                            if (b == b'h' || b == b'l') && params.first() == Some(&b'?') {
+                                self.update_dec_private_modes(&params[1..], b == b'h');
+                            }
                             // Pass the complete sequence through as one contiguous run.
                             self.passthrough.push(0x1b);
                             self.passthrough.push(b'[');

@@ -332,17 +332,26 @@ impl Grid {
     }
 
     fn put_char(&mut self, c: char) {
-        if self.col >= self.cols {
+        use unicode_width::UnicodeWidthChar;
+        let w = UnicodeWidthChar::width(c).unwrap_or(1).max(1);
+        // A wide character at the last column wraps to the next row in a real
+        // terminal (DEC's "wide char never split"). Mirror that here.
+        if self.col + w > self.cols {
             self.line_feed();
             self.col = 0;
         }
         if self.row < self.rows && self.col < self.cols {
             self.cells[self.row][self.col] = c;
+            // Mark the trailing cell of a wide char with a sentinel so column
+            // bookkeeping stays right; `into_text` skips it when stringifying.
+            if w == 2 && self.col + 1 < self.cols {
+                self.cells[self.row][self.col + 1] = '\0';
+            }
             if self.row > self.high_water {
                 self.high_water = self.row;
             }
         }
-        self.col += 1;
+        self.col += w;
     }
 
     fn line_feed(&mut self) {
@@ -497,7 +506,9 @@ impl Grid {
         let last = self.high_water.min(self.rows - 1);
         let mut out = String::new();
         for r in 0..=last {
-            let line: String = self.cells[r].iter().collect();
+            // Skip wide-char continuation sentinels so the trailing column of
+            // a CJK / emoji glyph doesn't leave a stray NUL in the output.
+            let line: String = self.cells[r].iter().filter(|&&c| c != '\0').collect();
             out.push_str(line.trim_end_matches(' '));
             if r < last {
                 out.push('\n');
