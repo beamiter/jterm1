@@ -247,6 +247,10 @@ struct Ctx {
     filter_revealer: gtk::Revealer,
     /// The live-filter text entry.
     filter_entry: gtk::SearchEntry,
+    /// Slide-down search bar over the active VTE — feeds `search_set_regex`
+    /// to drive VTE's native scrollback search (Ctrl+Shift+F).
+    vte_search_revealer: gtk::Revealer,
+    vte_search_entry: gtk::SearchEntry,
     /// Source id of the periodic relative-time refresh timer, removed on
     /// shutdown so it stops firing (and stops anchoring this `Ctx`).
     relative_timer: RefCell<Option<glib::SourceId>>,
@@ -393,6 +397,19 @@ impl Component for BlockTerminal {
         filter_revealer.set_child(Some(&filter_entry));
         filter_revealer.set_reveal_child(false);
         root.append(&filter_revealer);
+
+        // Ctrl+Shift+F search bar over the active VTE scrollback — feeds
+        // `search_set_regex` so we use VTE's native matcher rather than a
+        // home-grown one.
+        let vte_search_entry = gtk::SearchEntry::new();
+        vte_search_entry.set_placeholder_text(Some("Search terminal scrollback…"));
+        vte_search_entry.add_css_class("block-filter-entry");
+        let vte_search_revealer = gtk::Revealer::new();
+        vte_search_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+        vte_search_revealer.set_child(Some(&vte_search_entry));
+        vte_search_revealer.set_reveal_child(false);
+        root.append(&vte_search_revealer);
+
         root.append(&overlay);
 
         // The persistent active card. `input_enabled` must stay true so VTE emits
@@ -484,6 +501,8 @@ impl Component for BlockTerminal {
             filter_query: RefCell::new(String::new()),
             filter_revealer: filter_revealer.clone(),
             filter_entry: filter_entry.clone(),
+            vte_search_revealer: vte_search_revealer.clone(),
+            vte_search_entry: vte_search_entry.clone(),
             relative_timer: RefCell::new(None),
             tui_probe_timer: RefCell::new(None),
             out_tail: RefCell::new(VecDeque::new()),
@@ -700,6 +719,69 @@ impl Component for BlockTerminal {
             });
         }
 
+        // VTE scrollback search — bind regex on every keystroke so the highlight
+        // tracks what the user is typing; Enter/Shift+Enter step through matches.
+        // PCRE2_MULTILINE (0x00000400) keeps `^`/`$` working line-wise across the
+        // scrollback buffer, matching VTE's own search bindings.
+        const PCRE2_MULTILINE: u32 = 0x0000_0400;
+        {
+            let ctx = ctx.clone();
+            vte_search_entry.connect_search_changed(move |e| {
+                let q = e.text().to_string();
+                if q.is_empty() {
+                    ctx.active_vte.search_set_regex(None, 0);
+                    return;
+                }
+                match vte4::Regex::for_search(&q, PCRE2_MULTILINE) {
+                    Ok(re) => {
+                        ctx.active_vte.search_set_regex(Some(&re), 0);
+                        ctx.active_vte.search_set_wrap_around(true);
+                        // Move to the most recent match immediately so the user
+                        // sees feedback without hitting Enter first.
+                        ctx.active_vte.search_find_previous();
+                    }
+                    Err(_) => {
+                        // Invalid partial pattern (e.g. lone `(`) — keep the
+                        // previous regex active rather than blanking matches mid-edit.
+                    }
+                }
+            });
+        }
+        {
+            let ctx = ctx.clone();
+            vte_search_entry.connect_activate(move |_| {
+                ctx.active_vte.search_find_previous();
+            });
+        }
+        {
+            let ctx = ctx.clone();
+            vte_search_entry.connect_stop_search(move |_| {
+                ctx.vte_search_revealer.set_reveal_child(false);
+                ctx.vte_search_entry.set_text("");
+                ctx.active_vte.search_set_regex(None, 0);
+                ctx.active_vte.grab_focus();
+            });
+        }
+        // Shift+Enter on the search entry → next (forward) match. Hooked via a
+        // capture-phase key controller because `connect_activate` swallows
+        // plain Enter without telling us which modifiers were down.
+        {
+            let key_ctl = gtk::EventControllerKey::new();
+            key_ctl.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let ctx = ctx.clone();
+            key_ctl.connect_key_pressed(move |_c, keyval, _kc, state| {
+                use gtk::gdk::Key;
+                use gtk::gdk::ModifierType as Mod;
+                let shift = state.contains(Mod::SHIFT_MASK);
+                if shift && matches!(keyval, Key::Return | Key::KP_Enter) {
+                    ctx.active_vte.search_find_next();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            vte_search_entry.add_controller(key_ctl);
+        }
+
         // Periodically refresh the relative-time labels ("2m ago"). The source id
         // is stored so `shutdown` can remove it; otherwise this closure (holding an
         // `Rc<Ctx>`) keeps the whole pane alive forever after it is closed.
@@ -768,6 +850,22 @@ impl Component for BlockTerminal {
             let sender = sender.clone();
             active_vte.connect_bell(move |_term| {
                 let _ = sender.output(VteOutput::Bell);
+            });
+        }
+
+        // Window title: VTE re-parses OSC 0/2 correctly (handling cross-PTY-read
+        // boundaries and OSC nesting), so dispatching through its signal is more
+        // robust than our own byte scan and removes the per-chunk memchr.
+        {
+            let sender = sender.clone();
+            active_vte.connect_window_title_changed(move |term| {
+                let title = term
+                    .window_title()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                if !title.is_empty() {
+                    let _ = sender.output(VteOutput::TitleChanged(title));
+                }
             });
         }
 
@@ -1090,6 +1188,13 @@ impl Component for BlockTerminal {
                 // Ctrl+L: clear visible finished blocks + send form feed.
                 if ctrl && !shift && !alt && matches!(keyval, Key::l | Key::L) {
                     clear_visible_blocks(&ctx);
+                    return glib::Propagation::Stop;
+                }
+
+                // Ctrl+Shift+F: open VTE scrollback search bar.
+                if ctrl && shift && !alt && matches!(keyval, Key::f | Key::F) {
+                    ctx.vte_search_revealer.set_reveal_child(true);
+                    ctx.vte_search_entry.grab_focus();
                     return glib::Propagation::Stop;
                 }
 
@@ -1597,16 +1702,13 @@ fn handle_data(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, data: &[u
 fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: ParserEvent) {
     match ev {
         ParserEvent::Bytes(bytes) => {
-            // Only walk the chunk for OSC-title when it actually contains an
-            // escape; plain high-throughput output then skips the O(n) scan.
-            // Bell is forwarded via active_vte.connect_bell (installed in init)
-            // so it fires once after VTE has consumed the byte instead of
-            // racing with VTE's own bell.
-            if memchr::memchr(0x1b, &bytes).is_some() {
-                if let Some(title) = scan_title(&bytes) {
-                    let _ = sender.output(VteOutput::TitleChanged(title));
-                }
-            }
+            // OSC titles (0/1/2) are dispatched via VTE's `window-title-changed`
+            // signal installed in init — VTE re-parses the OSC properly, handles
+            // OSC across PTY read boundaries, and gives us the final string via
+            // `window_title()`. Bell is forwarded via active_vte.connect_bell
+            // (installed in init) so it fires once after VTE has consumed the
+            // byte instead of racing with VTE's own bell.
+            //
             // Idle (no integration yet): treat as raw fallback once real output flows.
             if ctx.state.get() == BlockState::Idle {
                 ctx.state.set(BlockState::RawFallback);
@@ -1775,11 +1877,28 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             ctx.state.set(ctx.prev_state.get());
         }
         ParserEvent::ClipboardSet(text) => {
-            if let Some(display) = gtk::gdk::Display::default() {
-                display.clipboard().set_text(&text);
+            // OSC 52 SET silently overwrites the system clipboard from any app
+            // the shell hosts (including ssh-attached remote processes). Behind
+            // a config gate (default off) — a malicious or buggy remote can
+            // otherwise replace the user's clipboard without consent.
+            if ctx.config.borrow().allow_remote_clipboard_write {
+                if let Some(display) = gtk::gdk::Display::default() {
+                    display.clipboard().set_text(&text);
+                }
             }
         }
-        ParserEvent::ApcSequence(_) => {}
+        ParserEvent::ApcSequence(payload) => {
+            // APC (`\e_ … \e\\`) is used by Kitty graphics and a few other
+            // protocols. VTE currently consumes APC silently in its string
+            // state machine — feeding it through is a no-op visually today,
+            // but stays correct if/when a future VTE adds APC handling, and
+            // avoids the byte-leak risk of dropping it on a parser change.
+            let mut wrapped = Vec::with_capacity(payload.len() + 4);
+            wrapped.extend_from_slice(b"\x1b_");
+            wrapped.extend_from_slice(&payload);
+            wrapped.extend_from_slice(b"\x1b\\");
+            ctx.active_vte.feed(&wrapped);
+        }
         // ── Request/response protocols ────────────────────────────────────────
         // The active VTE in block mode has no PTY to write a reply to, so any
         // app-initiated query whose response is generated by the terminal must
@@ -1796,9 +1915,15 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                 // XTQMODKEYS: report modifyOtherKeys level 0 (off) so apps fall
                 // back to legacy CSI keys instead of waiting for an enhanced reply.
                 KeyboardProtocolQuery::ModifyOtherKeysQuery => b"\x1b[>4;0m".to_vec(),
-                // Primary device attributes: identify as a VT220 with no
-                // optional features (enough to satisfy apps that probe this).
-                KeyboardProtocolQuery::DeviceAttributes => b"\x1b[?62;c".to_vec(),
+                // Primary DA (CSI c): identify as VT220 with no optional features
+                // (enough to satisfy apps that probe this).
+                KeyboardProtocolQuery::PrimaryDeviceAttributes => b"\x1b[?62;c".to_vec(),
+                // Secondary DA (CSI > c): `CSI > Pp ; Pv ; Pc c`. Pp = terminal
+                // type (65 = VT520-class), Pv = firmware version (100 = jterm1
+                // 1.x), Pc = ROM cartridge (always 0). Replying primary-DA's
+                // `CSI ? ... c` format here confuses terminfo / capability
+                // probes that key off the leading `>`.
+                KeyboardProtocolQuery::SecondaryDeviceAttributes => b"\x1b[>65;100;0c".to_vec(),
                 // Tertiary DA (CSI = c): DCS reply with a unit identifier.
                 KeyboardProtocolQuery::TertiaryDeviceAttributes => {
                     b"\x1bP!|00000000\x1b\\".to_vec()
@@ -4049,43 +4174,6 @@ fn contains_seq(haystack: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-/// Extract a window title from an OSC 0/2 sequence, if present.
-fn scan_title(bytes: &[u8]) -> Option<String> {
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == 0x1b && bytes[i + 1] == b']' {
-            let start = i + 2;
-            let mut j = start;
-            while j < bytes.len() && bytes[j] != 0x07 && bytes[j] != 0x1b {
-                j += 1;
-            }
-            let payload = &bytes[start..j];
-            if let Some(rest) = payload
-                .strip_prefix(b"0;")
-                .or_else(|| payload.strip_prefix(b"2;"))
-            {
-                let title = String::from_utf8_lossy(rest).into_owned();
-                if !title.is_empty() {
-                    return Some(title);
-                }
-            }
-            // Advance past the terminator. For ST (`ESC \`) eat both bytes so
-            // the next iteration doesn't see the trailing `\` as the start of
-            // a fresh title scan.
-            i = j;
-            if i < bytes.len() && bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\'
-            {
-                i += 2;
-            } else if i < bytes.len() {
-                i += 1;
-            }
-            continue;
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Current wall-clock time in milliseconds since the Unix epoch.

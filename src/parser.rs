@@ -25,8 +25,11 @@ pub enum KeyboardProtocolQuery {
     KittyQuery,
     /// `CSI ? 4 m` — XTQMODKEYS modifyOtherKeys query.
     ModifyOtherKeysQuery,
-    /// `CSI c` / `CSI 0 c` / `CSI > c` — primary/secondary device attributes.
-    DeviceAttributes,
+    /// `CSI c` / `CSI 0 c` — primary device attributes (DA1).
+    PrimaryDeviceAttributes,
+    /// `CSI > c` / `CSI > 0 c` — secondary device attributes (DA2). Different
+    /// reply format from DA1 (`CSI > Pp ; Pv ; Pc c` vs `CSI ? ... c`).
+    SecondaryDeviceAttributes,
     /// `CSI = c` / `CSI = 0 c` — tertiary device attributes (DA3).
     TertiaryDeviceAttributes,
     /// `CSI > q` — XTVERSION (xterm name/version request).
@@ -345,7 +348,8 @@ impl Parser {
                             //
                             // `CSI ? u`                       — kitty keyboard query
                             // `CSI ? 4 m`                     — XTQMODKEYS query
-                            // `CSI c`, `CSI 0 c`, `CSI > c`   — primary/secondary DA
+                            // `CSI c`, `CSI 0 c`              — primary DA (DA1)
+                            // `CSI > c`, `CSI > 0 c`          — secondary DA (DA2)
                             // `CSI = c`, `CSI = 0 c`          — tertiary DA (DA3)
                             // `CSI > q`                       — XTVERSION
                             // `CSI 5 n` / `CSI 6 n`           — DSR status / cursor pos
@@ -360,9 +364,14 @@ impl Parser {
                                         KeyboardProtocolQuery::ModifyOtherKeysQuery,
                                     ));
                                 }
-                                (b'c', b"") | (b'c', b"0") | (b'c', b">") | (b'c', b">0") => {
+                                (b'c', b"") | (b'c', b"0") => {
                                     events.push(ParserEvent::KeyboardProtocolQuery(
-                                        KeyboardProtocolQuery::DeviceAttributes,
+                                        KeyboardProtocolQuery::PrimaryDeviceAttributes,
+                                    ));
+                                }
+                                (b'c', b">") | (b'c', b">0") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::SecondaryDeviceAttributes,
                                     ));
                                 }
                                 (b'c', b"=") | (b'c', b"=0") => {
@@ -788,8 +797,30 @@ mod tests {
             vec![
                 KeyboardProtocolQuery::KittyQuery,
                 KeyboardProtocolQuery::ModifyOtherKeysQuery,
-                KeyboardProtocolQuery::DeviceAttributes,
-                KeyboardProtocolQuery::DeviceAttributes,
+                KeyboardProtocolQuery::PrimaryDeviceAttributes,
+                KeyboardProtocolQuery::SecondaryDeviceAttributes,
+            ]
+        );
+    }
+
+    #[test]
+    fn da1_da2_da3_emit_distinct_events() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[0c\x1b[>0c\x1b[=0c", &mut events);
+        let qs: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ParserEvent::KeyboardProtocolQuery(q) => Some(*q),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            qs,
+            vec![
+                KeyboardProtocolQuery::PrimaryDeviceAttributes,
+                KeyboardProtocolQuery::SecondaryDeviceAttributes,
+                KeyboardProtocolQuery::TertiaryDeviceAttributes,
             ]
         );
     }

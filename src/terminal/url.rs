@@ -94,6 +94,33 @@ pub fn get_url_at_position(buffer: &TextBuffer, iter: &gtk::TextIter) -> Option<
     get_url_bounds_at_position(buffer, iter).map(|(_, _, url)| url)
 }
 
+/// If `iter` lies inside an `osc8-link:` tag span, return that span's bounds
+/// and the URI. Used by the hover handler to underline OSC 8 hyperlinks the
+/// same way plain-text URLs are underlined.
+pub fn get_osc8_bounds_at_position(
+    _buffer: &TextBuffer,
+    iter: &gtk::TextIter,
+) -> Option<(gtk::TextIter, gtk::TextIter, String)> {
+    let tag = iter.tags().into_iter().find(|t| {
+        t.name()
+            .map(|n| n.starts_with("osc8-link:"))
+            .unwrap_or(false)
+    })?;
+    let uri = tag.name()?.strip_prefix("osc8-link:")?.to_string();
+    let mut start = *iter;
+    if !start.starts_tag(Some(&tag)) {
+        start.backward_to_tag_toggle(Some(&tag));
+    }
+    let mut end = *iter;
+    if !end.ends_tag(Some(&tag)) {
+        end.forward_to_tag_toggle(Some(&tag));
+    }
+    if start.offset() >= end.offset() {
+        return None;
+    }
+    Some((start, end, uri))
+}
+
 /// Attach Ctrl+click-to-open and hover-underline controllers to a read-only
 /// output/command `TextView`.
 pub fn attach_url_handlers(view: &gtk::TextView) {
@@ -153,14 +180,13 @@ pub fn attach_url_handlers(view: &gtk::TextView) {
             buffer.remove_tag(&tag, &start, &end);
 
             if let Some(iter) = view.iter_at_location(bx, by) {
-                let osc8 = get_url_at_position(&buffer, &iter).is_some()
-                    && get_url_bounds_at_position(&buffer, &iter).is_none();
                 if let Some((us, ue, _)) = get_url_bounds_at_position(&buffer, &iter) {
                     buffer.apply_tag(&tag, &us, &ue);
                     view.set_cursor(gtk::gdk::Cursor::from_name("pointer", None).as_ref());
                     return;
                 }
-                if osc8 {
+                if let Some((us, ue, _)) = get_osc8_bounds_at_position(&buffer, &iter) {
+                    buffer.apply_tag(&tag, &us, &ue);
                     view.set_cursor(gtk::gdk::Cursor::from_name("pointer", None).as_ref());
                     return;
                 }

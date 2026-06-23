@@ -182,6 +182,11 @@ pub struct Config {
     /// Compact (denser) block-mode spacing, matching Warp's compact density.
     pub(crate) block_compact: bool,
     pub(crate) editor_input: bool,
+    /// Allow OSC 52 SET (`\e]52;c;<base64>\e\\`) from remote/local apps to
+    /// overwrite the system clipboard. Off by default — a malicious or buggy
+    /// remote process can otherwise silently replace the user's clipboard
+    /// (OWASP-style concern). Most users enable this only on trusted hosts.
+    pub(crate) allow_remote_clipboard_write: bool,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
 }
@@ -382,6 +387,7 @@ struct FileConfig {
     block_history_compress: Option<bool>,
     block_compact: Option<bool>,
     editor_input: Option<bool>,
+    allow_remote_clipboard_write: Option<bool>,
     remote_hosts: Vec<RemoteHost>,
 }
 
@@ -427,6 +433,7 @@ fn load_file_config() -> FileConfig {
         block_history_compress: table.get("block_history_compress").and_then(|v| v.as_bool()),
         block_compact: table.get("block_compact").and_then(|v| v.as_bool()),
         editor_input: table.get("editor_input").and_then(|v| v.as_bool()),
+        allow_remote_clipboard_write: table.get("allow_remote_clipboard_write").and_then(|v| v.as_bool()),
         remote_hosts,
     }
 }
@@ -619,6 +626,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         block_history_compress,
         block_compact,
         editor_input: fc.editor_input.unwrap_or(true),
+        allow_remote_clipboard_write: fc.allow_remote_clipboard_write.unwrap_or(false),
         remote_hosts: fc.remote_hosts,
     };
 
