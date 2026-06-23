@@ -275,6 +275,12 @@ struct Ctx {
     /// block" behavior and to claim the gesture so the per-TextView native
     /// drag doesn't keep overwriting our cross-block selections.
     drag_cross_block: Cell<bool>,
+    /// VTE geometry snapshot taken at CommandStart, used by the offline grid
+    /// emulator when scraping output. Without it, a window resize mid-command
+    /// would replay absolute-positioning sequences against the new column
+    /// count and misalign columns the program had already painted.
+    captured_cols: Cell<i64>,
+    captured_rows: Cell<i64>,
 }
 
 /// Bounded head retained verbatim for a command's captured output.
@@ -510,6 +516,8 @@ impl Component for BlockTerminal {
             typed_unreliable: Cell::new(false),
             drag_anchor: Cell::new(None),
             drag_cross_block: Cell::new(false),
+            captured_cols: Cell::new(0),
+            captured_rows: Cell::new(0),
         });
 
         // `changed` fires during the viewport's size-allocate, after layout, so
@@ -1780,6 +1788,12 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             ctx.start_time.set(Some(Instant::now()));
             ctx.has_command.set(true);
             ctx.state.set(BlockState::CollectingOutput);
+            // Snapshot the PTY geometry the child sees at command start, so a
+            // window resize before CommandEnd doesn't break grid replay
+            // (`tput cup` / `tput cols`-driven layouts assume the size in
+            // effect when the program first read it).
+            ctx.captured_cols.set(ctx.active_vte.column_count());
+            ctx.captured_rows.set(ctx.active_vte.row_count());
             // Pre-emptive TUI promotion. The smkx heuristic only fires after we
             // see the program's first output — by then it has already called
             // ioctl(TIOCGWINSZ) on a small PTY and rendered its first frame
@@ -2010,24 +2024,44 @@ fn append_captured(ctx: &Rc<Ctx>, bytes: &[u8]) {
 /// produced no more than the caps allow, this is the exact output; otherwise the
 /// elided middle is replaced by a one-line notice.
 fn captured_output(ctx: &Rc<Ctx>) -> Vec<u8> {
+    match captured_parts(ctx) {
+        CapturedParts::Whole(bytes) => bytes,
+        CapturedParts::Split { head, tail, omitted } => {
+            let mut out = head;
+            out.extend_from_slice(format!("\n…({omitted} bytes omitted)…\n").as_bytes());
+            out.extend_from_slice(&tail);
+            out
+        }
+    }
+}
+
+/// Split form of the captured output: either the full stream, or head and tail
+/// with an omission count. The grid emulator path replays each side
+/// independently so the omission marker doesn't corrupt SGR / cursor state.
+enum CapturedParts {
+    Whole(Vec<u8>),
+    Split { head: Vec<u8>, tail: Vec<u8>, omitted: usize },
+}
+
+fn captured_parts(ctx: &Rc<Ctx>) -> CapturedParts {
     let head = ctx.out_buf.borrow();
     let total = ctx.out_total.get();
     if total <= head.len() {
-        return head.clone();
+        return CapturedParts::Whole(head.clone());
     }
     let tail: Vec<u8> = ctx.out_tail.borrow().iter().copied().collect();
     if head.len() + tail.len() >= total {
-        // Head and tail meet or overlap: stitch without loss.
         let skip = head.len().saturating_sub(total - tail.len());
         let mut out = head.clone();
         out.extend_from_slice(&tail[skip..]);
-        out
+        CapturedParts::Whole(out)
     } else {
         let omitted = total - head.len() - tail.len();
-        let mut out = head.clone();
-        out.extend_from_slice(format!("\n…({omitted} bytes omitted)…\n").as_bytes());
-        out.extend_from_slice(&tail);
-        out
+        CapturedParts::Split {
+            head: head.clone(),
+            tail,
+            omitted,
+        }
     }
 }
 
@@ -2041,39 +2075,65 @@ fn captured_output(ctx: &Rc<Ctx>) -> Vec<u8> {
 /// case the raw stream is fine to display as-is).
 fn scrape_command_output(ctx: &Rc<Ctx>) -> Option<String> {
     use vte4::TerminalExt;
-    let bytes = captured_output(ctx);
-    if bytes.is_empty() {
+    let parts = captured_parts(ctx);
+    let needs_grid = match &parts {
+        CapturedParts::Whole(b) => !b.is_empty() && super::grid::has_cursor_positioning(b),
+        CapturedParts::Split { head, tail, .. } => {
+            !(head.is_empty() && tail.is_empty())
+                && (super::grid::has_cursor_positioning(head)
+                    || super::grid::has_cursor_positioning(tail))
+        }
+    };
+    if !needs_grid {
         return None;
     }
-    if !super::grid::has_cursor_positioning(&bytes) {
-        return None;
+    // Use the geometry captured at CommandStart so absolute-addressing
+    // sequences (`tput cup`) replay against the same column count the child
+    // actually saw. Falls back to the live size if no command was active.
+    let captured_cols = ctx.captured_cols.get();
+    let captured_rows = ctx.captured_rows.get();
+    let cols = if captured_cols > 0 {
+        captured_cols
+    } else {
+        ctx.active_vte.column_count()
     }
-    let cols = ctx.active_vte.column_count().max(1) as usize;
-    let viewport_rows = ctx.active_vte.row_count().max(1) as usize;
-    // Tall grid for long streamed output. The VTE's row count is the user's
-    // viewport (e.g. 24) — replaying a 5000-line command at viewport height
-    // means the top 4976 lines scroll off and only the bottom 24 survive. So
-    // we estimate the lines the program emitted (newline count + slack) and
-    // use that as the grid's row count, capped to a sane max.
-    //
-    // This stays correct for repaint-style output (pagers, dashboards):
-    //   - `less -X` repaints with `\e[2J\e[H<page>`; `\e[2J` wipes the whole
-    //     virtual screen regardless of size, so the final page lands on rows
-    //     0..viewport_rows and the trailing tall-area rows are blank and trimmed.
-    //   - TUIs that absolute-address rows beyond the viewport already need
-    //     alt-screen mode (separate code path) and don't reach this function.
-    let newline_count = bytes.iter().filter(|&&b| b == b'\n').count();
-    const TALL_GRID_CAP: usize = 10_000;
-    let rows = newline_count
-        .saturating_add(viewport_rows)
-        .max(viewport_rows)
-        .min(TALL_GRID_CAP);
-    // Pass the active palette so the grid emulator can resolve indexed SGR
-    // colors and re-emit them as truecolor escapes. Without this, recorded
-    // blocks from colorized pagers (`less` with `LESS=R`, `git log --color`,
-    // `top`) render plain black-and-white.
+    .max(1) as usize;
+    let viewport_rows = if captured_rows > 0 {
+        captured_rows
+    } else {
+        ctx.active_vte.row_count()
+    }
+    .max(1) as usize;
     let palette = ctx.config.borrow().palette;
-    Some(super::grid::render_to_ansi(&bytes, cols, rows, &palette))
+    // Tall grid budget: viewport plus an estimated newline count, capped at
+    // TALL_GRID_CAP rows. The cap holds at ~`cols`·`TALL_GRID_CAP` cells
+    // (~80·10000 = 800k cells, ~2 MB after attrs) — anything larger should be
+    // displayed via the raw-bytes fallback path the caller already provides.
+    const TALL_GRID_CAP: usize = 10_000;
+    let render = |bytes: &[u8]| -> String {
+        let newline_count = bytes.iter().filter(|&&b| b == b'\n').count();
+        let rows = newline_count
+            .saturating_add(viewport_rows)
+            .max(viewport_rows)
+            .min(TALL_GRID_CAP);
+        super::grid::render_to_ansi(bytes, cols, rows, &palette)
+    };
+    Some(match parts {
+        CapturedParts::Whole(bytes) => render(&bytes),
+        CapturedParts::Split { head, tail, omitted } => {
+            // Replay head and tail through independent grid emulators, then
+            // join with the omission marker as text. Feeding the marker
+            // through the grid would let stray SGR state from the head leak
+            // into the tail (or vice versa), discolouring the join.
+            let mut out = render(&head);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!("…({omitted} bytes omitted)…\n"));
+            out.push_str(&render(&tail));
+            out
+        }
+    })
 }
 
 /// When `JTERM1_DUMP_BLOCKS=<path>` is set, append each finalized block to
