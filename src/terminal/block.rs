@@ -2155,12 +2155,20 @@ fn dump_block_to_log(path: &str, command: &str, output: &str) -> std::io::Result
 /// prompt + an input line visible without ballooning to the full screen.
 const MIN_ACTIVE_ROWS: i64 = 8;
 
-/// Total vertical pixels the active card's CSS chrome adds around the inner VTE:
-/// `.block-active` margin (6px × 2) + border (1px × 2) + padding (4px × 2). Used
-/// to size the full-viewport grid to what actually fits, so the pinned grid is
-/// achievable and the PTY is not resized every frame (see `update_active_height`).
-/// Keep in sync with the `.block-active` rule in the dynamic CSS.
-const ACTIVE_CARD_VCHROME_PX: f64 = 22.0;
+/// Total vertical pixels the active card's CSS chrome adds around the inner VTE
+/// (`.block-active` margin + border + padding). Read from the live style context
+/// so theme tweaks (custom CSS, dynamic font scaling) don't desync from a
+/// hard-coded constant — a stale value here causes the holder's natural height
+/// and our set_size target to drift by one row, triggering a SIGWINCH-per-frame
+/// storm on continuously-repainting alt-screen apps (top, htop).
+#[allow(deprecated)]
+fn active_card_vchrome_px(holder: &gtk::Box) -> f64 {
+    let sc = holder.style_context();
+    let m = sc.margin();
+    let b = sc.border();
+    let p = sc.padding();
+    (m.top() + m.bottom() + b.top() + b.bottom() + p.top() + p.bottom()) as f64
+}
 
 /// Count the number of visual rows `bytes` occupy when rendered at `cols`
 /// columns, counting line wraps. ANSI escape sequences are skipped and
@@ -2286,7 +2294,8 @@ fn update_active_height(ctx: &Rc<Ctx>) {
     // disagree every frame, the PTY is resized continuously, and an actively
     // repainting alt-screen app (top, vim) jitters vertically. Reserving the chrome
     // gives the holder slack so the size settles.
-    let max_rows = (((page_px - ACTIVE_CARD_VCHROME_PX).max(ch as f64)) as i64 / ch).max(1);
+    let chrome = active_card_vchrome_px(&ctx.active_holder);
+    let max_rows = (((page_px - chrome).max(ch as f64)) as i64 / ch).max(1);
 
     let cols = ctx.active_vte.column_count().max(1);
     // Alt-screen apps and no-OSC133 shells behave as a normal full-screen terminal
@@ -2346,7 +2355,8 @@ fn resize_active_to_fullscreen(ctx: &Rc<Ctx>) {
         return;
     }
     let cols = ctx.active_vte.column_count().max(1);
-    let max_rows = (((page_px - ACTIVE_CARD_VCHROME_PX).max(ch as f64)) as i64 / ch)
+    let chrome = active_card_vchrome_px(&ctx.active_holder);
+    let max_rows = (((page_px - chrome).max(ch as f64)) as i64 / ch)
         .max(MIN_ACTIVE_ROWS);
     if std::env::var_os("JTERM1_DBG").is_some() {
         eprintln!(
