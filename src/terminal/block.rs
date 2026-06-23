@@ -2148,9 +2148,33 @@ fn current_command_text(ctx: &Rc<Ctx>) -> String {
     if !typed.is_empty() && !ctx.typed_unreliable.get() {
         return typed;
     }
-    strip_ansi(&ctx.cmd_buf.borrow())
-        .lines()
-        .next_back()
+    scrape_cmd_line(ctx)
+}
+
+/// Render `cmd_buf` to text, honoring cursor-positioning escapes. Shells with
+/// keystroke-driven repaint (rsh, fish, zsh+zle) emit
+/// `MoveToColumn(0)+Clear(FromCursorDown)+reprint(prompt+buffer)` on every
+/// keystroke / history-recall. `strip_ansi` deletes those escapes without
+/// applying them, so the stripped text concatenates every rendered state on
+/// a single line ("prompt sudo apt update" repeated). Replaying through the
+/// grid emulator collapses the repaints to the final visible state. Returns
+/// the last non-empty line, trimmed.
+fn scrape_cmd_line(ctx: &Rc<Ctx>) -> String {
+    use vte4::TerminalExt;
+    let cmd_buf = ctx.cmd_buf.borrow();
+    if cmd_buf.is_empty() {
+        return String::new();
+    }
+    let text = if super::grid::has_cursor_positioning(&cmd_buf) {
+        let cols = ctx.active_vte.column_count().max(1) as usize;
+        let rows = ctx.active_vte.row_count().max(1) as usize;
+        super::grid::render_to_text(&cmd_buf, cols, rows)
+    } else {
+        strip_ansi(&cmd_buf)
+    };
+    text.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim()
         .to_string()
@@ -2330,12 +2354,7 @@ fn finalize_block(ctx: &Rc<Ctx>) {
     let command = if !typed.is_empty() && !ctx.typed_unreliable.get() {
         typed
     } else {
-        strip_ansi(&ctx.cmd_buf.borrow())
-            .lines()
-            .next_back()
-            .unwrap_or("")
-            .trim()
-            .to_string()
+        scrape_cmd_line(ctx)
     };
     if command.is_empty() {
         // Nothing meaningful to record; just reset.
