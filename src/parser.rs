@@ -25,8 +25,16 @@ pub enum KeyboardProtocolQuery {
     KittyQuery,
     /// `CSI ? 4 m` — XTQMODKEYS modifyOtherKeys query.
     ModifyOtherKeysQuery,
-    /// `CSI > c` / `CSI c` — secondary/primary device attributes.
+    /// `CSI c` / `CSI 0 c` / `CSI > c` — primary/secondary device attributes.
     DeviceAttributes,
+    /// `CSI = c` / `CSI = 0 c` — tertiary device attributes (DA3).
+    TertiaryDeviceAttributes,
+    /// `CSI > q` — XTVERSION (xterm name/version request).
+    XtVersion,
+    /// `CSI 5 n` — DSR: report device status (reply `\e[0n` = OK).
+    DeviceStatus,
+    /// `CSI 6 n` — DSR: report cursor position (reply `\e[<row>;<col>R`).
+    CursorPosition,
 }
 
 /// Events emitted by the stream parser.
@@ -50,6 +58,10 @@ pub enum ParserEvent {
     AltScreenLeave,
     /// OSC 52 — application set clipboard content.
     ClipboardSet(String),
+    /// OSC 52 with `?` — app is asking for current clipboard content.
+    /// We reply with an empty payload (`\e]52;c;\e\\`) so probers (tmux/vim)
+    /// know we accept SET but don't expose clipboard contents to the shell.
+    ClipboardQuery,
     /// APC sequence (ESC _) — Kitty graphics protocol or similar.
     ApcSequence(Vec<u8>),
     /// OSC 10/11/12/4 with a `?` — app is asking the terminal what color it uses.
@@ -334,6 +346,9 @@ impl Parser {
                             // `CSI ? u`                       — kitty keyboard query
                             // `CSI ? 4 m`                     — XTQMODKEYS query
                             // `CSI c`, `CSI 0 c`, `CSI > c`   — primary/secondary DA
+                            // `CSI = c`, `CSI = 0 c`          — tertiary DA (DA3)
+                            // `CSI > q`                       — XTVERSION
+                            // `CSI 5 n` / `CSI 6 n`           — DSR status / cursor pos
                             match (b, params.as_slice()) {
                                 (b'u', b"?") => {
                                     events.push(ParserEvent::KeyboardProtocolQuery(
@@ -348,6 +363,26 @@ impl Parser {
                                 (b'c', b"") | (b'c', b"0") | (b'c', b">") | (b'c', b">0") => {
                                     events.push(ParserEvent::KeyboardProtocolQuery(
                                         KeyboardProtocolQuery::DeviceAttributes,
+                                    ));
+                                }
+                                (b'c', b"=") | (b'c', b"=0") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::TertiaryDeviceAttributes,
+                                    ));
+                                }
+                                (b'q', b">") | (b'q', b">0") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::XtVersion,
+                                    ));
+                                }
+                                (b'n', b"5") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::DeviceStatus,
+                                    ));
+                                }
+                                (b'n', b"6") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::CursorPosition,
                                     ));
                                 }
                                 _ => {}
@@ -556,15 +591,15 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         }
     }
 
-    // OSC 52 ; <selection> ; <base64-data> — clipboard set
+    // OSC 52 ; <selection> ; <base64-data | ?> — clipboard set / query
     if let Some(rest) = s.strip_prefix("52;") {
         if let Some(data_start) = rest.find(';') {
             let b64_data = &rest[data_start + 1..];
-            if b64_data != "?" {
-                if let Ok(decoded) = base64_decode(b64_data.as_bytes()) {
-                    if let Ok(text) = String::from_utf8(decoded) {
-                        events.push(ParserEvent::ClipboardSet(text));
-                    }
+            if b64_data == "?" {
+                events.push(ParserEvent::ClipboardQuery);
+            } else if let Ok(decoded) = base64_decode(b64_data.as_bytes()) {
+                if let Ok(text) = String::from_utf8(decoded) {
+                    events.push(ParserEvent::ClipboardSet(text));
                 }
             }
         }

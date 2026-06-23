@@ -1790,17 +1790,36 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             ctx.pty.write_bytes(reply.as_bytes());
         }
         ParserEvent::KeyboardProtocolQuery(q) => {
-            let reply: &[u8] = match q {
+            let reply: Vec<u8> = match q {
                 // Kitty progressive-enhancement flags: reply with 0 (nothing on).
-                KeyboardProtocolQuery::KittyQuery => b"\x1b[?0u",
+                KeyboardProtocolQuery::KittyQuery => b"\x1b[?0u".to_vec(),
                 // XTQMODKEYS: report modifyOtherKeys level 0 (off) so apps fall
                 // back to legacy CSI keys instead of waiting for an enhanced reply.
-                KeyboardProtocolQuery::ModifyOtherKeysQuery => b"\x1b[>4;0m",
+                KeyboardProtocolQuery::ModifyOtherKeysQuery => b"\x1b[>4;0m".to_vec(),
                 // Primary device attributes: identify as a VT220 with no
                 // optional features (enough to satisfy apps that probe this).
-                KeyboardProtocolQuery::DeviceAttributes => b"\x1b[?62;c",
+                KeyboardProtocolQuery::DeviceAttributes => b"\x1b[?62;c".to_vec(),
+                // Tertiary DA (CSI = c): DCS reply with a unit identifier.
+                KeyboardProtocolQuery::TertiaryDeviceAttributes => {
+                    b"\x1bP!|00000000\x1b\\".to_vec()
+                }
+                // XTVERSION (CSI > q): DCS reply identifying the emulator.
+                KeyboardProtocolQuery::XtVersion => b"\x1bP>|jterm1(1.0)\x1b\\".to_vec(),
+                // DSR (CSI 5 n): report "OK".
+                KeyboardProtocolQuery::DeviceStatus => b"\x1b[0n".to_vec(),
+                // CPR (CSI 6 n): report 1-indexed cursor row;col from active VTE.
+                KeyboardProtocolQuery::CursorPosition => {
+                    let (col, row) = ctx.active_vte.cursor_position();
+                    format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+                }
             };
-            ctx.pty.write_bytes(reply);
+            ctx.pty.write_bytes(&reply);
+        }
+        // OSC 52 with `?`: app asking us to send the clipboard back. We don't
+        // currently expose the system clipboard to remote apps for security
+        // reasons; reply with an empty payload so the requestor doesn't hang.
+        ParserEvent::ClipboardQuery => {
+            ctx.pty.write_bytes(b"\x1b]52;c;\x1b\\");
         }
     }
 }
@@ -1905,7 +1924,25 @@ fn scrape_command_output(ctx: &Rc<Ctx>) -> Option<String> {
         return None;
     }
     let cols = ctx.active_vte.column_count().max(1) as usize;
-    let rows = ctx.active_vte.row_count().max(1) as usize;
+    let viewport_rows = ctx.active_vte.row_count().max(1) as usize;
+    // Tall grid for long streamed output. The VTE's row count is the user's
+    // viewport (e.g. 24) — replaying a 5000-line command at viewport height
+    // means the top 4976 lines scroll off and only the bottom 24 survive. So
+    // we estimate the lines the program emitted (newline count + slack) and
+    // use that as the grid's row count, capped to a sane max.
+    //
+    // This stays correct for repaint-style output (pagers, dashboards):
+    //   - `less -X` repaints with `\e[2J\e[H<page>`; `\e[2J` wipes the whole
+    //     virtual screen regardless of size, so the final page lands on rows
+    //     0..viewport_rows and the trailing tall-area rows are blank and trimmed.
+    //   - TUIs that absolute-address rows beyond the viewport already need
+    //     alt-screen mode (separate code path) and don't reach this function.
+    let newline_count = bytes.iter().filter(|&&b| b == b'\n').count();
+    const TALL_GRID_CAP: usize = 10_000;
+    let rows = newline_count
+        .saturating_add(viewport_rows)
+        .max(viewport_rows)
+        .min(TALL_GRID_CAP);
     // Pass the active palette so the grid emulator can resolve indexed SGR
     // colors and re-emit them as truecolor escapes. Without this, recorded
     // blocks from colorized pagers (`less` with `LESS=R`, `git log --color`,
@@ -3672,8 +3709,18 @@ fn encode_mouse_event(
 
     let cw = (av.char_width().max(1)) as f64;
     let ch = (av.char_height().max(1)) as f64;
-    let col = ((x / cw).floor() as i32 + 1).max(1);
-    let row = ((y / ch).floor() as i32 + 1).max(1);
+    // GTK4 widgets paint inside their CSS padding; the mouse x/y we get from
+    // the gesture/motion controllers are widget-local (relative to allocation
+    // top-left), not grid-local. Subtract the padding so the column/row we
+    // report matches the cell under the pointer. Without this, clicks land one
+    // cell too low/right in TUIs like htop, vim's mouse, and tmux pane select.
+    use gtk::prelude::WidgetExt;
+    #[allow(deprecated)]
+    let padding = av.style_context().padding();
+    let inner_x = (x - padding.left() as f64).max(0.0);
+    let inner_y = (y - padding.top() as f64).max(0.0);
+    let col = ((inner_x / cw).floor() as i32 + 1).max(1);
+    let row = ((inner_y / ch).floor() as i32 + 1).max(1);
 
     let (mut b, is_release) = match ev {
         MouseEv::Press(btn) => {

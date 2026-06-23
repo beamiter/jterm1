@@ -53,12 +53,20 @@ pub fn has_cursor_positioning(bytes: &[u8]) -> bool {
                         | b'J' | b'K'
                         | b'r' | b's' | b'u'
                         | b'L' | b'M' | b'S' | b'T'
+                        | b'@' | b'P' | b'X' | b'b'
                 ) {
                     return true;
                 }
                 i = j + 1;
             }
             b'M' => return true, // RI (reverse index) scrolls
+            b'P' | b'_' => {
+                // DCS (sixel) or APC (kitty graphics) — `strip_ansi` doesn't
+                // know how to consume the binary payload, so route to the grid
+                // emulator which terminator-aware-skips it and stamps a
+                // placeholder.
+                return true;
+            }
             b']' => {
                 // Skip OSC string to terminator (BEL or ESC \).
                 let mut j = i + 2;
@@ -128,10 +136,13 @@ pub fn render_to_ansi(
                         i = j + 1;
                     }
                     b']' => {
-                        // Skip OSC.
-                        let mut j = i + 2;
+                        // Find the OSC payload bounds and its terminator.
+                        let body_start = i + 2;
+                        let mut j = body_start;
+                        let mut term_end = j;
                         while j < bytes.len() {
                             if bytes[j] == 0x07 {
+                                term_end = j;
                                 j += 1;
                                 break;
                             }
@@ -139,10 +150,31 @@ pub fn render_to_ansi(
                                 && j + 1 < bytes.len()
                                 && bytes[j + 1] == b'\\'
                             {
+                                term_end = j;
                                 j += 2;
                                 break;
                             }
                             j += 1;
+                        }
+                        // OSC 8 hyperlinks: payload is `8;<params>;<uri>`. We
+                        // capture <uri> into cur_state so subsequent cells get
+                        // tagged with the link, and `into_text` re-emits OSC 8
+                        // around runs of linked cells. All other OSCs (0/1/2
+                        // titles, 4/10/11 color queries, 52 clipboard, 133
+                        // shell integration) are not visible state for the
+                        // rendered grid and stay dropped.
+                        let payload = &bytes[body_start..term_end];
+                        if payload.starts_with(b"8;") {
+                            let rest = &payload[2..];
+                            if let Some(pos) = rest.iter().position(|&b| b == b';') {
+                                let uri = &rest[pos + 1..];
+                                grid.cur_state.hyperlink = if uri.is_empty() {
+                                    None
+                                } else {
+                                    Some(String::from_utf8_lossy(uri).into_owned())
+                                };
+                                grid.cur_style = grid.intern_style();
+                            }
                         }
                         i = j;
                     }
@@ -159,12 +191,84 @@ pub fn render_to_ansi(
                         grid.col = 0;
                         i += 2;
                     }
+                    b'P' | b'_' | b'^' | b'X' => {
+                        // DCS (\eP), APC (\e_), PM (\e^), SOS (\eX) — string
+                        // sequences terminated by ST (\e\) or BEL. The most
+                        // common producers are sixel images (\eP...q...\e\)
+                        // and the kitty graphics protocol (\e_G...;...\e\).
+                        // Skip the payload entirely; without this branch the
+                        // default `_ => i += 2` arm would dump the binary
+                        // payload as text into the rendered block. When the
+                        // payload is non-trivial, emit a short placeholder so
+                        // the user knows a graphic was here.
+                        let kind = bytes[i + 1];
+                        let body_start = i + 2;
+                        let mut j = body_start;
+                        while j < bytes.len() {
+                            if bytes[j] == 0x07 {
+                                break;
+                            }
+                            if bytes[j] == 0x1b
+                                && j + 1 < bytes.len()
+                                && bytes[j + 1] == b'\\'
+                            {
+                                break;
+                            }
+                            j += 1;
+                        }
+                        let payload_len = j.saturating_sub(body_start);
+                        // Skip past terminator if present.
+                        let skip_term = if j < bytes.len() {
+                            if bytes[j] == 0x07 { 1 } else { 2 }
+                        } else {
+                            0
+                        };
+                        // Emit a placeholder only for sizable graphics-style
+                        // payloads (DCS and APC). PM/SOS are rare and usually
+                        // empty; skip silently.
+                        if payload_len > 16 && (kind == b'P' || kind == b'_') {
+                            let label = if kind == b'_' {
+                                "[graphic]"
+                            } else {
+                                "[image]"
+                            };
+                            for c in label.chars() {
+                                grid.put_char(c);
+                            }
+                        }
+                        i = j + skip_term;
+                    }
                     b'(' | b')' | b'*' | b'+' => {
-                        // Charset selection — skip the designator byte.
+                        // SCS — Select Character Set. ESC ( c designates G0,
+                        // ESC ) c designates G1. We support the bare minimum:
+                        // `0` = DEC special line-drawing graphics, anything
+                        // else = ASCII (the default). Pagers, dialog boxes,
+                        // `tput`, and TUI frames all rely on this to draw
+                        // borders; without it lines render as raw letters.
+                        if i + 2 < bytes.len() {
+                            let target = bytes[i + 1];
+                            let cs = bytes[i + 2];
+                            let line_drawing = cs == b'0';
+                            match target {
+                                b'(' => grid.g0_line_drawing = line_drawing,
+                                b')' => grid.g1_line_drawing = line_drawing,
+                                _ => {}
+                            }
+                        }
                         i += 3;
                     }
                     _ => i += 2,
                 }
+            }
+            0x0e => {
+                // SO: invoke G1 into GL.
+                grid.gl_is_g1 = true;
+                i += 1;
+            }
+            0x0f => {
+                // SI: invoke G0 into GL.
+                grid.gl_is_g1 = false;
+                i += 1;
             }
             b'\n' => {
                 // Treat LF as CR+LF for output: PTYs run with ONLCR by default,
@@ -314,6 +418,14 @@ fn apply_csi(grid: &mut Grid, params: &[u8], final_b: u8) {
         b'M' => grid.delete_lines(p1(0, 1) as usize),
         b'S' => grid.scroll_up(p1(0, 1) as usize),
         b'T' => grid.scroll_down(p1(0, 1) as usize),
+        // ICH (CSI Pn @) — insert N blank chars at cursor, shift rest right.
+        b'@' => grid.insert_chars(p1(0, 1) as usize),
+        // DCH (CSI Pn P) — delete N chars at cursor, shift rest left.
+        b'P' => grid.delete_chars(p1(0, 1) as usize),
+        // ECH (CSI Pn X) — erase N chars starting at cursor in place.
+        b'X' => grid.erase_chars(p1(0, 1) as usize),
+        // REP (CSI Pn b) — repeat the last printable char N times.
+        b'b' => grid.repeat_last(p1(0, 1) as usize),
         b's' => grid.save_cursor(),
         b'u' => grid.restore_cursor(),
         b'r' => {
@@ -365,6 +477,15 @@ struct Grid {
     /// Palette used to resolve indexed SGR colors (30-37/40-47/90-97/100-107
     /// and 38;5/48;5) to RGB. Threaded in from the active terminal's theme.
     palette: [gtk4::gdk::RGBA; 16],
+    /// Last printable char written — REP (CSI Pn b) repeats this.
+    last_char: Option<char>,
+    /// DEC special line-drawing charset selected for G0/G1 (`ESC ( 0` etc.).
+    /// When the active GL slot is line-drawing, ASCII letters in j..x map to
+    /// box-drawing glyphs.
+    g0_line_drawing: bool,
+    g1_line_drawing: bool,
+    /// Which slot GL currently points at — SI (0x0f) invokes G0, SO (0x0e) G1.
+    gl_is_g1: bool,
 }
 
 impl Grid {
@@ -383,6 +504,58 @@ impl Grid {
             cur_state: super::ansi::AnsiStyleState::default(),
             cur_style: DEFAULT_STYLE,
             palette,
+            last_char: None,
+            g0_line_drawing: false,
+            g1_line_drawing: false,
+            gl_is_g1: false,
+        }
+    }
+
+    /// Cell used by erase/insert operations. Honors BCE: if the current SGR
+    /// state has a non-default background, the "blank" cells inherit it so
+    /// status-bar painting that clears with bg-color survives the replay.
+    fn bg_cell(&mut self) -> Cell {
+        if self.cur_state.background.is_some() {
+            (' ', self.cur_style)
+        } else {
+            blank_cell()
+        }
+    }
+
+    fn line_drawing_active(&self) -> bool {
+        if self.gl_is_g1 {
+            self.g1_line_drawing
+        } else {
+            self.g0_line_drawing
+        }
+    }
+
+    /// Map a DEC special-graphics character to its Unicode box-drawing glyph.
+    fn translate_line_drawing(c: char) -> char {
+        match c {
+            'j' => '┘',
+            'k' => '┐',
+            'l' => '┌',
+            'm' => '└',
+            'n' => '┼',
+            'q' => '─',
+            't' => '├',
+            'u' => '┤',
+            'v' => '┴',
+            'w' => '┬',
+            'x' => '│',
+            'a' => '▒',
+            '`' => '◆',
+            'f' => '°',
+            'g' => '±',
+            '~' => '·',
+            'o' => '⎺',
+            'y' => '≤',
+            'z' => '≥',
+            '{' => 'π',
+            '|' => '≠',
+            '}' => '£',
+            _ => c,
         }
     }
 
@@ -407,6 +580,13 @@ impl Grid {
 
     fn put_char(&mut self, c: char) {
         use unicode_width::UnicodeWidthChar;
+        // Line-drawing charset translates a small set of ASCII letters into
+        // box-drawing glyphs. Apply before width measurement.
+        let c = if self.line_drawing_active() && c.is_ascii() {
+            Self::translate_line_drawing(c)
+        } else {
+            c
+        };
         let w = UnicodeWidthChar::width(c).unwrap_or(0);
         // Zero-width chars (combining diacritics, ZWJ, VS16) must not advance
         // the cursor — otherwise every column after the first accent in any
@@ -422,6 +602,7 @@ impl Grid {
             self.line_feed();
             self.col = 0;
         }
+        self.last_char = Some(c);
         if self.row < self.rows && self.col < self.cols {
             self.cells[self.row][self.col] = (c, self.cur_style);
             // Mark the trailing cell of a wide char with a sentinel so column
@@ -439,10 +620,11 @@ impl Grid {
     fn line_feed(&mut self) {
         if self.row == self.scroll_bot {
             // Scroll the region up by one.
+            let bg = self.bg_cell();
             for r in self.scroll_top..self.scroll_bot {
                 self.cells[r] = std::mem::take(&mut self.cells[r + 1]);
             }
-            self.cells[self.scroll_bot] = vec![blank_cell(); self.cols];
+            self.cells[self.scroll_bot] = vec![bg; self.cols];
             // Content was pushed into rows we had already touched; mark.
             if self.scroll_bot > self.high_water {
                 self.high_water = self.scroll_bot;
@@ -457,10 +639,11 @@ impl Grid {
 
     fn reverse_index(&mut self) {
         if self.row == self.scroll_top {
+            let bg = self.bg_cell();
             for r in (self.scroll_top + 1..=self.scroll_bot).rev() {
                 self.cells[r] = std::mem::take(&mut self.cells[r - 1]);
             }
-            self.cells[self.scroll_top] = vec![blank_cell(); self.cols];
+            self.cells[self.scroll_top] = vec![bg; self.cols];
         } else if self.row > 0 {
             self.row -= 1;
         }
@@ -468,34 +651,37 @@ impl Grid {
 
     fn erase_below(&mut self) {
         if self.row < self.rows {
+            let bg = self.bg_cell();
             for c in self.col..self.cols {
-                self.cells[self.row][c] = blank_cell();
+                self.cells[self.row][c] = bg;
             }
             for r in self.row + 1..self.rows {
                 for c in 0..self.cols {
-                    self.cells[r][c] = blank_cell();
+                    self.cells[r][c] = bg;
                 }
             }
         }
     }
 
     fn erase_above(&mut self) {
+        let bg = self.bg_cell();
         for r in 0..self.row {
             for c in 0..self.cols {
-                self.cells[r][c] = blank_cell();
+                self.cells[r][c] = bg;
             }
         }
         if self.row < self.rows {
             for c in 0..=self.col.min(self.cols - 1) {
-                self.cells[self.row][c] = blank_cell();
+                self.cells[self.row][c] = bg;
             }
         }
     }
 
     fn erase_all(&mut self) {
+        let bg = self.bg_cell();
         for r in 0..self.rows {
             for c in 0..self.cols {
-                self.cells[r][c] = blank_cell();
+                self.cells[r][c] = bg;
             }
         }
         // Reset high-water: the screen is blank again. The cursor's row
@@ -505,25 +691,91 @@ impl Grid {
 
     fn erase_line_right(&mut self) {
         if self.row < self.rows {
+            let bg = self.bg_cell();
             for c in self.col..self.cols {
-                self.cells[self.row][c] = blank_cell();
+                self.cells[self.row][c] = bg;
             }
         }
     }
 
     fn erase_line_left(&mut self) {
         if self.row < self.rows {
+            let bg = self.bg_cell();
             for c in 0..=self.col.min(self.cols - 1) {
-                self.cells[self.row][c] = blank_cell();
+                self.cells[self.row][c] = bg;
             }
         }
     }
 
     fn erase_line(&mut self) {
         if self.row < self.rows {
+            let bg = self.bg_cell();
             for c in 0..self.cols {
-                self.cells[self.row][c] = blank_cell();
+                self.cells[self.row][c] = bg;
             }
+        }
+    }
+
+    /// ICH — insert `n` blank cells at the cursor, shifting the rest of the
+    /// row right (off-screen cells fall off the end).
+    fn insert_chars(&mut self, n: usize) {
+        if self.row >= self.rows {
+            return;
+        }
+        let n = n.min(self.cols.saturating_sub(self.col));
+        if n == 0 {
+            return;
+        }
+        let bg = self.bg_cell();
+        let row = &mut self.cells[self.row];
+        // Shift right from col..cols-n  →  col+n..cols.
+        for c in (self.col + n..self.cols).rev() {
+            row[c] = row[c - n];
+        }
+        for c in self.col..self.col + n {
+            row[c] = bg;
+        }
+    }
+
+    /// DCH — delete `n` cells at the cursor, shifting the rest of the row
+    /// left and padding the right edge with the current background.
+    fn delete_chars(&mut self, n: usize) {
+        if self.row >= self.rows {
+            return;
+        }
+        let n = n.min(self.cols.saturating_sub(self.col));
+        if n == 0 {
+            return;
+        }
+        let bg = self.bg_cell();
+        let row = &mut self.cells[self.row];
+        for c in self.col..self.cols.saturating_sub(n) {
+            row[c] = row[c + n];
+        }
+        for c in self.cols.saturating_sub(n)..self.cols {
+            row[c] = bg;
+        }
+    }
+
+    /// ECH — erase `n` cells in place starting at cursor. Cursor unmoved,
+    /// nothing shifts; cells become blanks (with current bg if BCE applies).
+    fn erase_chars(&mut self, n: usize) {
+        if self.row >= self.rows {
+            return;
+        }
+        let bg = self.bg_cell();
+        let end = (self.col + n).min(self.cols);
+        for c in self.col..end {
+            self.cells[self.row][c] = bg;
+        }
+    }
+
+    /// REP — repeat the last printed char `n` times. Apps like `seq | column`
+    /// or fancy progress bars use this to compress runs of the same glyph.
+    fn repeat_last(&mut self, n: usize) {
+        let Some(c) = self.last_char else { return };
+        for _ in 0..n {
+            self.put_char(c);
         }
     }
 
@@ -532,11 +784,12 @@ impl Grid {
             return;
         }
         let n = n.min(self.scroll_bot - self.row + 1);
+        let bg = self.bg_cell();
         for _ in 0..n {
             for r in (self.row + 1..=self.scroll_bot).rev() {
                 self.cells[r] = std::mem::take(&mut self.cells[r - 1]);
             }
-            self.cells[self.row] = vec![blank_cell(); self.cols];
+            self.cells[self.row] = vec![bg; self.cols];
         }
     }
 
@@ -545,31 +798,34 @@ impl Grid {
             return;
         }
         let n = n.min(self.scroll_bot - self.row + 1);
+        let bg = self.bg_cell();
         for _ in 0..n {
             for r in self.row..self.scroll_bot {
                 self.cells[r] = std::mem::take(&mut self.cells[r + 1]);
             }
-            self.cells[self.scroll_bot] = vec![blank_cell(); self.cols];
+            self.cells[self.scroll_bot] = vec![bg; self.cols];
         }
     }
 
     fn scroll_up(&mut self, n: usize) {
         let n = n.min(self.scroll_bot - self.scroll_top + 1);
+        let bg = self.bg_cell();
         for _ in 0..n {
             for r in self.scroll_top..self.scroll_bot {
                 self.cells[r] = std::mem::take(&mut self.cells[r + 1]);
             }
-            self.cells[self.scroll_bot] = vec![blank_cell(); self.cols];
+            self.cells[self.scroll_bot] = vec![bg; self.cols];
         }
     }
 
     fn scroll_down(&mut self, n: usize) {
         let n = n.min(self.scroll_bot - self.scroll_top + 1);
+        let bg = self.bg_cell();
         for _ in 0..n {
             for r in (self.scroll_top + 1..=self.scroll_bot).rev() {
                 self.cells[r] = std::mem::take(&mut self.cells[r - 1]);
             }
-            self.cells[self.scroll_top] = vec![blank_cell(); self.cols];
+            self.cells[self.scroll_top] = vec![bg; self.cols];
         }
     }
 
@@ -588,6 +844,7 @@ impl Grid {
         let last = self.high_water.min(self.rows - 1);
         let mut out = String::new();
         let mut cur_id: u16 = DEFAULT_STYLE;
+        let mut cur_link: Option<&str> = None;
 
         for r in 0..=last {
             // Trim trailing blanks-of-default-style — colored trailing cells
@@ -611,6 +868,20 @@ impl Grid {
                 if sid != cur_id {
                     let style = &self.style_table[sid as usize];
                     out.push_str(&super::ansi::encode_sgr(style));
+                    // OSC 8 hyperlink transitions are emitted separately —
+                    // SGR encoding doesn't include them.
+                    let new_link = style.hyperlink.as_deref();
+                    if new_link != cur_link {
+                        match new_link {
+                            Some(uri) => {
+                                out.push_str("\x1b]8;;");
+                                out.push_str(uri);
+                                out.push_str("\x1b\\");
+                            }
+                            None => out.push_str("\x1b]8;;\x1b\\"),
+                        }
+                        cur_link = new_link;
+                    }
                     cur_id = sid;
                 }
                 out.push(c);
@@ -619,10 +890,13 @@ impl Grid {
                 out.push('\n');
             }
         }
-        // Close any open style so the rendered block doesn't bleed SGR into
-        // following blocks.
+        // Close any open style + hyperlink so the rendered block doesn't bleed
+        // into following blocks.
         if cur_id != DEFAULT_STYLE {
             out.push_str("\x1b[0m");
+        }
+        if cur_link.is_some() {
+            out.push_str("\x1b]8;;\x1b\\");
         }
         // Trim trailing blank lines.
         while out.ends_with("\n\n") {
@@ -722,6 +996,90 @@ mod tests {
         // Output is now base-only (combining mark dropped from the offline
         // grid), but column alignment is preserved.
         assert_eq!(out, "e|");
+    }
+
+    #[test]
+    fn ich_shifts_chars_right() {
+        // Write "abcde", move cursor to col 1 (b), insert 2 blanks → "a  bcd"
+        // (e fell off the end if we had a tiny grid, but with cols 80 it stays).
+        let bytes = b"abcde\x1b[1;2H\x1b[2@";
+        let out = render_to_text(bytes, 80, 24);
+        assert_eq!(out, "a  bcde");
+    }
+
+    #[test]
+    fn dch_shifts_chars_left() {
+        // Write "abcde", move to col 1 (b), delete 2 chars → "ade".
+        let bytes = b"abcde\x1b[1;2H\x1b[2P";
+        let out = render_to_text(bytes, 80, 24);
+        assert_eq!(out, "ade");
+    }
+
+    #[test]
+    fn ech_erases_in_place() {
+        // Write "abcde", move to col 1 (b), erase 2 chars → "a  de" (cursor unmoved).
+        let bytes = b"abcde\x1b[1;2H\x1b[2X";
+        let out = render_to_text(bytes, 80, 24);
+        assert_eq!(out, "a  de");
+    }
+
+    #[test]
+    fn rep_repeats_last_char() {
+        // "a" then REP 4 → "aaaaa".
+        let bytes = b"a\x1b[4b";
+        let out = render_to_text(bytes, 80, 24);
+        assert_eq!(out, "aaaaa");
+    }
+
+    #[test]
+    fn sixel_payload_is_replaced_with_placeholder() {
+        // \eP q ...payload... \e\  — sixel-style DCS. The binary body must not
+        // leak into the rendered output; the placeholder takes its place.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"before \x1bPq");
+        bytes.extend(std::iter::repeat(b'#').take(200));
+        bytes.extend_from_slice(b"\x1b\\ after");
+        let out = render_to_text(&bytes, 80, 24);
+        assert!(!out.contains("##########"), "raw payload leaked: {out:?}");
+        assert!(out.contains("[image]"), "placeholder missing: {out:?}");
+        assert!(out.contains("before"));
+        assert!(out.contains("after"));
+    }
+
+    #[test]
+    fn kitty_apc_payload_is_replaced_with_placeholder() {
+        // \e_G ...payload... \e\
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"x\x1b_G");
+        bytes.extend(std::iter::repeat(b'a').take(50));
+        bytes.extend_from_slice(b"\x1b\\y");
+        let out = render_to_text(&bytes, 80, 24);
+        assert!(!out.contains("aaaaaaaaaa"), "raw payload leaked: {out:?}");
+        assert!(out.contains("[graphic]"));
+        assert!(out.starts_with('x'));
+        assert!(out.ends_with('y'));
+    }
+
+    #[test]
+    fn osc8_hyperlinks_survive_replay() {
+        // `\e]8;;https://x.example\e\\` link \e]8;;\e\\ plain
+        // Replay must preserve both the link and the URI on the rendered text.
+        let palette = [gtk4::gdk::RGBA::BLACK; 16];
+        let bytes = b"\x1b[2J\x1b[H\x1b]8;;https://x.example\x1b\\link\x1b]8;;\x1b\\ plain";
+        let out = render_to_ansi(bytes, 80, 24, &palette);
+        assert!(out.contains("link"));
+        assert!(out.contains("https://x.example"), "uri missing: {out:?}");
+        // Both the opener and the closer were emitted.
+        assert!(out.matches("\x1b]8;;").count() >= 2, "expected open+close: {out:?}");
+    }
+
+    #[test]
+    fn dec_line_drawing_translates_letters() {
+        // ESC ( 0  selects DEC graphics for G0. Then "lqk" should render as
+        // ┌─┐ (upper-left, horizontal, upper-right).
+        let bytes = b"\x1b(0lqk\x1b(B";
+        let out = render_to_text(bytes, 80, 24);
+        assert_eq!(out, "┌─┐");
     }
 
     #[test]
