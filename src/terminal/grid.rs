@@ -844,7 +844,7 @@ impl Grid {
         let last = self.high_water.min(self.rows - 1);
         let mut out = String::new();
         let mut cur_id: u16 = DEFAULT_STYLE;
-        let mut cur_link: Option<&str> = None;
+        let mut cur_link: Option<String> = None;
 
         for r in 0..=last {
             // Trim trailing blanks-of-default-style — colored trailing cells
@@ -859,33 +859,26 @@ impl Grid {
                     break;
                 }
             }
+            // Build a parallel char/style array, skipping wide-char continuation
+            // sentinels so the bidi pass sees the logical text exactly once per
+            // glyph (matching what the user sees / what BiDi rules assume).
+            let mut chars: Vec<char> = Vec::with_capacity(end);
+            let mut sids: Vec<u16> = Vec::with_capacity(end);
             for &(c, sid) in &line[..end] {
                 if c == '\0' {
-                    // wide-char continuation sentinel — already emitted as
-                    // part of the previous char's glyph.
                     continue;
                 }
-                if sid != cur_id {
-                    let style = &self.style_table[sid as usize];
-                    out.push_str(&super::ansi::encode_sgr(style));
-                    // OSC 8 hyperlink transitions are emitted separately —
-                    // SGR encoding doesn't include them.
-                    let new_link = style.hyperlink.as_deref();
-                    if new_link != cur_link {
-                        match new_link {
-                            Some(uri) => {
-                                out.push_str("\x1b]8;;");
-                                out.push_str(uri);
-                                out.push_str("\x1b\\");
-                            }
-                            None => out.push_str("\x1b]8;;\x1b\\"),
-                        }
-                        cur_link = new_link;
-                    }
-                    cur_id = sid;
-                }
-                out.push(c);
+                chars.push(c);
+                sids.push(sid);
             }
+            emit_bidi_line(
+                &chars,
+                &sids,
+                &self.style_table,
+                &mut out,
+                &mut cur_id,
+                &mut cur_link,
+            );
             if r < last {
                 out.push('\n');
             }
@@ -904,6 +897,118 @@ impl Grid {
         }
         out
     }
+}
+
+/// Append one grid row to `out` in visual order. LTR-only rows take a fast
+/// path; rows with any RTL character are reordered via UAX#9 and
+/// directionally-mirrored brackets are flipped inside RTL runs. SGR / OSC 8
+/// state is updated through the borrowed cursors so it persists across rows.
+fn emit_bidi_line(
+    chars: &[char],
+    sids: &[u16],
+    style_table: &[super::ansi::AnsiStyleState],
+    out: &mut String,
+    cur_id: &mut u16,
+    cur_link: &mut Option<String>,
+) {
+    let emit_char = |c: char,
+                     sid: u16,
+                     out: &mut String,
+                     cur_id: &mut u16,
+                     cur_link: &mut Option<String>| {
+        if sid != *cur_id {
+            let style = &style_table[sid as usize];
+            out.push_str(&super::ansi::encode_sgr(style));
+            let new_link = style.hyperlink.as_deref();
+            if new_link != cur_link.as_deref() {
+                match new_link {
+                    Some(uri) => {
+                        out.push_str("\x1b]8;;");
+                        out.push_str(uri);
+                        out.push_str("\x1b\\");
+                        *cur_link = Some(uri.to_string());
+                    }
+                    None => {
+                        out.push_str("\x1b]8;;\x1b\\");
+                        *cur_link = None;
+                    }
+                }
+            }
+            *cur_id = sid;
+        }
+        out.push(c);
+    };
+
+    // Fast path for ASCII-only / LTR-only rows — avoids building a String and
+    // running the bidi algorithm for every line of a `git log` output.
+    if !chars.iter().any(|c| needs_bidi(*c)) {
+        for (i, &c) in chars.iter().enumerate() {
+            emit_char(c, sids[i], out, cur_id, cur_link);
+        }
+        return;
+    }
+
+    use unicode_bidi::ParagraphBidiInfo;
+    use unicode_bidi_mirroring::get_mirrored;
+
+    // Build the logical text + a byte_offset → char_index map so we can look
+    // up the style id of any char emitted by the visual-run walker.
+    let mut text = String::with_capacity(chars.len());
+    let mut byte_to_char: Vec<usize> = Vec::with_capacity(chars.len() * 2 + 1);
+    for (ci, &c) in chars.iter().enumerate() {
+        let start = text.len();
+        text.push(c);
+        for _ in start..text.len() {
+            byte_to_char.push(ci);
+        }
+    }
+    byte_to_char.push(chars.len());
+
+    let info = ParagraphBidiInfo::new(&text, None);
+    if !info.has_rtl() {
+        for (i, &c) in chars.iter().enumerate() {
+            emit_char(c, sids[i], out, cur_id, cur_link);
+        }
+        return;
+    }
+    let (levels, runs) = info.visual_runs(0..text.len());
+    for run in runs {
+        if run.start >= levels.len() {
+            continue;
+        }
+        let is_rtl = levels[run.start].is_rtl();
+        let slice = &text[run.clone()];
+        if is_rtl {
+            // Walk chars in reverse, mirroring paired-bracket / mirrored
+            // characters per UAX#9 rule L4.
+            for (rel, ch) in slice.char_indices().rev() {
+                let ci = byte_to_char[run.start + rel];
+                let glyph = get_mirrored(ch).unwrap_or(ch);
+                emit_char(glyph, sids[ci], out, cur_id, cur_link);
+            }
+        } else {
+            for (rel, ch) in slice.char_indices() {
+                let ci = byte_to_char[run.start + rel];
+                emit_char(ch, sids[ci], out, cur_id, cur_link);
+            }
+        }
+    }
+}
+
+/// Cheap pre-check: any code point that the bidi algorithm could possibly
+/// reorder. Avoids paying for `ParagraphBidiInfo::new` on every ASCII line.
+/// The check is intentionally generous — false positives only cost one extra
+/// bidi pass; false negatives would render RTL output in logical order.
+fn needs_bidi(c: char) -> bool {
+    let n = c as u32;
+    // Hebrew, Arabic, Syriac, Thaana, NKo, Samaritan, Mandaic + the broader
+    // RTL ranges, plus Arabic supplements / Hebrew presentation forms.
+    (0x0590..=0x08FF).contains(&n)
+        || (0xFB1D..=0xFDFF).contains(&n)
+        || (0xFE70..=0xFEFF).contains(&n)
+        // Supplementary RTL blocks (Imperial Aramaic … Mende Kikakui, etc.).
+        || (0x10800..=0x10FFF).contains(&n)
+        || (0x1E800..=0x1EFFF).contains(&n)
 }
 
 #[cfg(test)]
@@ -1089,5 +1194,38 @@ mod tests {
         let bytes = b"old long content\rnew\x1b[K";
         let out = render_to_text(bytes, 80, 24);
         assert_eq!(out, "new");
+    }
+
+    #[test]
+    fn bidi_arabic_renders_rtl() {
+        // Pure RTL line: Arabic letters BAA, MEEM, KAF (logical order).
+        // Visually each glyph should be emitted in reverse logical order.
+        let bytes = "\u{0628}\u{0645}\u{0643}".as_bytes(); // ب م ك
+        let out = render_to_text(bytes, 80, 24);
+        // Reordered visually right-to-left: KAF, MEEM, BAA
+        assert_eq!(out, "\u{0643}\u{0645}\u{0628}");
+    }
+
+    #[test]
+    fn bidi_mirrors_brackets_in_rtl_run() {
+        // RTL run containing a paired bracket should flip to its mirror.
+        // Hebrew alef, opening parenthesis, hebrew bet — visually the
+        // parenthesis becomes ')'.
+        let bytes = "\u{05D0}(\u{05D1}".as_bytes();
+        let out = render_to_text(bytes, 80, 24);
+        assert!(
+            out.chars().any(|c| c == ')'),
+            "expected mirrored bracket in {:?}",
+            out
+        );
+        assert!(!out.contains('('));
+    }
+
+    #[test]
+    fn bidi_ltr_only_lines_are_unchanged() {
+        // Sanity: ASCII-only output goes through the fast path identical to
+        // pre-bidi behavior.
+        let out = render_to_text(b"hello world\n123 abc", 80, 24);
+        assert_eq!(out, "hello world\n123 abc");
     }
 }
