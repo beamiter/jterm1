@@ -26,8 +26,9 @@ use vte4::{TerminalExt, TerminalExtManual};
 use super::ansi::{self, AnsiTextRun};
 use super::url;
 use crate::config::Config;
-use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserEvent};
+use crate::parser::{ColorKind, Parser, ParserEvent};
 use crate::pty::OwnedPty;
+use crate::vte_pty::VtePty;
 
 pub use super::vte::{VteInit, VteInput, VteOutput};
 
@@ -164,6 +165,11 @@ const HINT_TEXT: &str =
 struct Ctx {
     config: Rc<RefCell<Config>>,
     pty: Rc<OwnedPty>,
+    /// MITM PTY pair: VTE owns the slave side (via vte4::Pty::foreign_sync),
+    /// jterm1 owns the master and splices VTE's writes back onto the shell PTY.
+    /// Lets libvte natively answer PTY-mediated queries (DSR / DA / OSC color /
+    /// mouse / focus / bracketed paste) instead of jterm1 synthesising replies.
+    vte_pty: Rc<VtePty>,
     active_vte: vte4::Terminal,
     block_list: gtk::Box,
     active_holder: gtk::Box,
@@ -418,10 +424,28 @@ impl Component for BlockTerminal {
 
         root.append(&overlay);
 
-        // The persistent active card. `input_enabled` must stay true so VTE emits
-        // the `commit` signal we forward to our PTY; it has no child PTY of its
-        // own, so VTE's own write goes nowhere — only our forward matters.
+        // The persistent active card. With the MITM PTY pair installed below,
+        // VTE *does* have a real PTY: typed keystrokes and PTY-mediated query
+        // replies (DSR / DA / OSC color / mouse / focus / bracketed paste) all
+        // travel out via VTE's writer and are spliced onto the shell PTY by
+        // the vte_pty reader. The `commit` signal is still hooked, but only as
+        // an observer for typed_cmd reconstruction — VTE itself does the write.
         let active_vte = super::vte::create_terminal(&init.config.borrow());
+        // Install the MITM PTY pair. Failures here would mean we silently
+        // regress to the old dummy-PTY behavior; surface them via stderr so
+        // they show up in dev runs rather than as mysterious missing replies.
+        let vte_pty = match VtePty::new() {
+            Ok(p) => Rc::new(p),
+            Err(e) => {
+                eprintln!("VtePty::new failed, falling back to dummy PTY: {e}");
+                // Re-allocate a no-op shim by aborting the wiring below. We
+                // panic here rather than silently divergent state — the dummy
+                // PTY fallback never worked in production and isn't worth
+                // maintaining a second code path for.
+                panic!("VtePty allocation failed");
+            }
+        };
+        active_vte.set_pty(Some(vte_pty.vte_pty()));
         // The active cell's height is driven explicitly via `set_size`/height_request
         // in `update_active_height`, so the VTE must NOT vexpand — otherwise it (and,
         // by inherited compute_expand, its holder) would stretch to fill the viewport
@@ -465,6 +489,7 @@ impl Component for BlockTerminal {
         let ctx = Rc::new(Ctx {
             config: init.config.clone(),
             pty: pty.clone(),
+            vte_pty: vte_pty.clone(),
             active_vte: active_vte.clone(),
             block_list: block_list.clone(),
             active_holder: active_holder.clone(),
@@ -648,13 +673,25 @@ impl Component for BlockTerminal {
             block_list.add_controller(drag);
         }
 
-        // Forward keystrokes from the active VTE to our PTY, and reconstruct the
-        // typed command line while we are between prompt-end and command-start.
+        // VTE → shell splice. The MITM PTY pair's master side is the channel
+        // VTE writes to (keystrokes + answers to PTY-mediated queries). We
+        // forward every byte verbatim to the shell PTY.
         {
-            let pty = pty.clone();
+            let shell_pty = pty.clone();
+            vte_pty.start_reader(move |data| {
+                shell_pty.write_bytes(&data);
+            });
+        }
+
+        // Observer-only `commit` hook: VTE handles the actual write to its
+        // own PTY now, but we still need to reconstruct the typed command
+        // line for OSC 133-less shells. An escape sequence here (arrow keys,
+        // history recall, accepted autosuggestion) means the typed buffer is
+        // no longer the authoritative source — finalize falls back to
+        // scraping the echoed command line instead.
+        {
             let ctx = ctx.clone();
             active_vte.connect_commit(move |_term, text, _size| {
-                pty.write_bytes(text.as_bytes());
                 if ctx.state.get() == BlockState::AwaitingCommand {
                     // An escape sequence (arrow keys, history recall, line edits,
                     // accepted autosuggestion) cannot be reconstructed from commit
@@ -680,9 +717,13 @@ impl Component for BlockTerminal {
             });
         }
 
-        // Track size changes and resize the PTY accordingly.
+        // Track size changes and resize the PTY accordingly. Both the shell
+        // PTY and the MITM PTY (VTE side) need the same winsize so SIGWINCH
+        // reaches the right process and `tput cols` reports the same value
+        // on either end of the splice.
         {
             let pty = pty.clone();
+            let vte_pty_t = vte_pty.clone();
             let last = Rc::new(Cell::new((0i64, 0i64)));
             active_vte.add_tick_callback(move |term, _clock| {
                 let cols = term.column_count();
@@ -693,6 +734,7 @@ impl Component for BlockTerminal {
                         eprintln!("[DBG] PTY resize -> {}x{}", cols, rows);
                     }
                     pty.resize(cols as u16, rows as u16);
+                    vte_pty_t.resize(cols as u16, rows as u16);
                 }
                 glib::ControlFlow::Continue
             });
@@ -877,151 +919,27 @@ impl Component for BlockTerminal {
             });
         }
 
+        // Focus tracking: emit `Focused` upward so the host window can clear
+        // its inactive-tab highlight. VTE itself handles the `?1004` focus
+        // in/out reports — when enabled it writes `\e[I`/`\e[O` out its slave
+        // PTY on its own GTK focus signals, and the vte_pty reader splices
+        // those bytes to the shell. We do NOT also write here, or apps would
+        // see two focus reports per focus change.
         {
             let sender = sender.clone();
-            let pty_focus = pty.clone();
-            let ctx_focus = ctx.clone();
             let focus_ctl = gtk::EventControllerFocus::new();
             focus_ctl.connect_enter(move |_| {
                 let _ = sender.output(VteOutput::Focused);
-                if ctx_focus.parser.borrow().focus_events() {
-                    pty_focus.write_bytes(b"\x1b[I");
-                }
             });
-            {
-                let pty_focus = pty.clone();
-                let ctx_focus = ctx.clone();
-                focus_ctl.connect_leave(move |_| {
-                    if ctx_focus.parser.borrow().focus_events() {
-                        pty_focus.write_bytes(b"\x1b[O");
-                    }
-                });
-            }
             active_vte.add_controller(focus_ctl);
         }
 
-        // Mouse reporting: the active VTE has no real PTY, so VTE's built-in
-        // mouse reporting never fires (its dummy PTY never receives `?1000` etc.
-        // from the shell). We snoop the mode bits on our parser and synthesize
-        // xterm-style reports against our PTY when active. Capture phase so we
-        // run before VTE's selection handling; when no mode is active, we
-        // Proceed and VTE handles drag-to-select as usual.
-        {
-            let pty_m = pty.clone();
-            let ctx_m = ctx.clone();
-            let av = active_vte.clone();
-            // Bitmask of buttons currently held: bit n set when button n is down.
-            // Used by motion to compute `held` for ?1002, and by scroll to claim
-            // events. Buttons 1-3 fit in low bits comfortably.
-            let buttons_down: Rc<Cell<u32>> = Rc::new(Cell::new(0));
-            // Last cursor position, in widget coords. Scroll callback has no
-            // (x, y) of its own in GTK4, so we mirror it from motion.
-            let last_pos: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
-
-            let click = gtk::GestureClick::new();
-            click.set_button(0); // any button
-            click.set_propagation_phase(gtk::PropagationPhase::Capture);
-            {
-                let pty_m = pty_m.clone();
-                let ctx_m = ctx_m.clone();
-                let av = av.clone();
-                let buttons_down = buttons_down.clone();
-                click.connect_pressed(move |g, _n, x, y| {
-                    let btn = g.current_button();
-                    let state = g.current_event_state();
-                    if let Some(bytes) =
-                        encode_mouse_event(&ctx_m, &av, MouseEv::Press(btn), x, y, state)
-                    {
-                        buttons_down.set(buttons_down.get() | (1u32 << btn.min(31)));
-                        pty_m.write_bytes(&bytes);
-                        g.set_state(gtk::EventSequenceState::Claimed);
-                    }
-                });
-            }
-            {
-                let pty_m = pty_m.clone();
-                let ctx_m = ctx_m.clone();
-                let av = av.clone();
-                let buttons_down = buttons_down.clone();
-                click.connect_released(move |g, _n, x, y| {
-                    let btn = g.current_button();
-                    let state = g.current_event_state();
-                    buttons_down.set(buttons_down.get() & !(1u32 << btn.min(31)));
-                    if let Some(bytes) =
-                        encode_mouse_event(&ctx_m, &av, MouseEv::Release(btn), x, y, state)
-                    {
-                        pty_m.write_bytes(&bytes);
-                        g.set_state(gtk::EventSequenceState::Claimed);
-                    }
-                });
-            }
-            active_vte.add_controller(click);
-
-            let motion = gtk::EventControllerMotion::new();
-            motion.set_propagation_phase(gtk::PropagationPhase::Capture);
-            {
-                let pty_m = pty_m.clone();
-                let ctx_m = ctx_m.clone();
-                let av = av.clone();
-                let buttons_down = buttons_down.clone();
-                let last_pos = last_pos.clone();
-                motion.connect_motion(move |_c, x, y| {
-                    last_pos.set((x, y));
-                    let down = buttons_down.get();
-                    let held = if down == 0 {
-                        None
-                    } else {
-                        // Lowest set bit = lowest-numbered held button.
-                        Some(down.trailing_zeros())
-                    };
-                    if let Some(bytes) = encode_mouse_event(
-                        &ctx_m,
-                        &av,
-                        MouseEv::Motion(held),
-                        x,
-                        y,
-                        gtk::gdk::ModifierType::empty(),
-                    ) {
-                        pty_m.write_bytes(&bytes);
-                    }
-                });
-            }
-            active_vte.add_controller(motion);
-
-            let scroll = gtk::EventControllerScroll::new(
-                gtk::EventControllerScrollFlags::VERTICAL
-                    | gtk::EventControllerScrollFlags::DISCRETE,
-            );
-            scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
-            {
-                let pty_m = pty_m.clone();
-                let ctx_m = ctx_m.clone();
-                let av = av.clone();
-                let last_pos = last_pos.clone();
-                scroll.connect_scroll(move |_c, _dx, dy| {
-                    if ctx_m.parser.borrow().mouse_mode()
-                        == crate::parser::MouseMode::None
-                    {
-                        return glib::Propagation::Proceed;
-                    }
-                    let (x, y) = last_pos.get();
-                    let dir = if dy < 0.0 { -1 } else { 1 };
-                    if let Some(bytes) = encode_mouse_event(
-                        &ctx_m,
-                        &av,
-                        MouseEv::Wheel(dir),
-                        x,
-                        y,
-                        gtk::gdk::ModifierType::empty(),
-                    ) {
-                        pty_m.write_bytes(&bytes);
-                        return glib::Propagation::Stop;
-                    }
-                    glib::Propagation::Proceed
-                });
-            }
-            active_vte.add_controller(scroll);
-        }
+        // Mouse reporting is handled natively by VTE now that it has a real
+        // PTY: when an app enables ?1000/?1002/?1003/?1006 etc., VTE writes
+        // the encoded mouse report out its slave on the next pointer event,
+        // and the vte_pty reader splices it to the shell. The previous
+        // capture-phase GestureClick/EventControllerMotion/Scroll hooks
+        // would now double-report — removed.
 
         // Block-local navigation (Warp-style). Capture phase so these fire before
         // the VTE's own key handling; all combos are unbound globally, so the
@@ -1756,7 +1674,13 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                 }
                 _ => {}
             }
-            ctx.active_vte.feed(&bytes);
+            // Splice the shell's stream onto the MITM PTY's master. VTE reads
+            // it from the slave side; it cannot tell the bytes were not
+            // delivered by a kernel PTY. Anything VTE needs to write back
+            // (PTY-mediated query replies, selection paste, mouse / focus /
+            // bracketed-paste reports) flows out the master and into the
+            // `vte_pty` reader, which forwards to the shell PTY.
+            ctx.vte_pty.write_bytes(&bytes);
         }
         ParserEvent::PromptStart => {
             // Finalize the previous command (deferred from its CommandEnd).
@@ -1922,37 +1846,14 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             let reply = build_color_query_reply(ctx, kind);
             ctx.pty.write_bytes(reply.as_bytes());
         }
-        ParserEvent::KeyboardProtocolQuery(q) => {
-            let reply: Vec<u8> = match q {
-                // Kitty progressive-enhancement flags: reply with 0 (nothing on).
-                KeyboardProtocolQuery::KittyQuery => b"\x1b[?0u".to_vec(),
-                // XTQMODKEYS: report modifyOtherKeys level 0 (off) so apps fall
-                // back to legacy CSI keys instead of waiting for an enhanced reply.
-                KeyboardProtocolQuery::ModifyOtherKeysQuery => b"\x1b[>4;0m".to_vec(),
-                // Primary DA (CSI c): identify as VT220 with no optional features
-                // (enough to satisfy apps that probe this).
-                KeyboardProtocolQuery::PrimaryDeviceAttributes => b"\x1b[?62;c".to_vec(),
-                // Secondary DA (CSI > c): `CSI > Pp ; Pv ; Pc c`. Pp = terminal
-                // type (65 = VT520-class), Pv = firmware version (100 = jterm1
-                // 1.x), Pc = ROM cartridge (always 0). Replying primary-DA's
-                // `CSI ? ... c` format here confuses terminfo / capability
-                // probes that key off the leading `>`.
-                KeyboardProtocolQuery::SecondaryDeviceAttributes => b"\x1b[>65;100;0c".to_vec(),
-                // Tertiary DA (CSI = c): DCS reply with a unit identifier.
-                KeyboardProtocolQuery::TertiaryDeviceAttributes => {
-                    b"\x1bP!|00000000\x1b\\".to_vec()
-                }
-                // XTVERSION (CSI > q): DCS reply identifying the emulator.
-                KeyboardProtocolQuery::XtVersion => b"\x1bP>|jterm1(1.0)\x1b\\".to_vec(),
-                // DSR (CSI 5 n): report "OK".
-                KeyboardProtocolQuery::DeviceStatus => b"\x1b[0n".to_vec(),
-                // CPR (CSI 6 n): report 1-indexed cursor row;col from active VTE.
-                KeyboardProtocolQuery::CursorPosition => {
-                    let (col, row) = ctx.active_vte.cursor_position();
-                    format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
-                }
-            };
-            ctx.pty.write_bytes(&reply);
+        ParserEvent::KeyboardProtocolQuery(_q) => {
+            // CSI queries (DA1/DA2/DA3, DSR, CPR, XTVERSION, kitty `?u`,
+            // XTQMODKEYS) are passed through to VTE via the Bytes arm above.
+            // With the MITM PTY in place, VTE answers them natively on its
+            // own slave fd; the reply lands in `vte_pty`'s reader and is
+            // spliced to the shell. The event is retained only as an
+            // observer hook in case future callers want to react to a
+            // probe; no reply synthesis is needed here.
         }
         // OSC 52 with `?`: app asking us to send the clipboard back. We don't
         // currently expose the system clipboard to remote apps for security
@@ -3872,166 +3773,13 @@ fn set_clipboard(text: &str) {
     }
 }
 
-enum MouseEv {
-    Press(u32),
-    Release(u32),
-    /// Motion event; `held` is the lowest-numbered held button if any.
-    Motion(Option<u32>),
-    /// Wheel scroll; -1 = up, +1 = down.
-    Wheel(i32),
-}
-
-/// Translate a pointer event to the xterm mouse-report bytes the shell expects,
-/// or `None` if the current mode/encoding doesn't ask for this event. Returning
-/// `None` lets the gesture controller fall through to VTE's native handling
-/// (drag-to-select etc.).
-fn encode_mouse_event(
-    ctx: &Rc<Ctx>,
-    av: &vte4::Terminal,
-    ev: MouseEv,
-    x: f64,
-    y: f64,
-    state: gtk::gdk::ModifierType,
-) -> Option<Vec<u8>> {
-    use crate::parser::{MouseEncoding, MouseMode};
-    let parser = ctx.parser.borrow();
-    let mode = parser.mouse_mode();
-    let enc = parser.mouse_encoding();
-    drop(parser);
-    if mode == MouseMode::None {
-        return None;
-    }
-
-    let cw = (av.char_width().max(1)) as f64;
-    let ch = (av.char_height().max(1)) as f64;
-    // GTK4 widgets paint inside their CSS padding; the mouse x/y we get from
-    // the gesture/motion controllers are widget-local (relative to allocation
-    // top-left), not grid-local. Subtract the padding so the column/row we
-    // report matches the cell under the pointer. Without this, clicks land one
-    // cell too low/right in TUIs like htop, vim's mouse, and tmux pane select.
-    use gtk::prelude::WidgetExt;
-    #[allow(deprecated)]
-    let padding = av.style_context().padding();
-    let inner_x = (x - padding.left() as f64).max(0.0);
-    let inner_y = (y - padding.top() as f64).max(0.0);
-    let col = ((inner_x / cw).floor() as i32 + 1).max(1);
-    let row = ((inner_y / ch).floor() as i32 + 1).max(1);
-
-    let (mut b, is_release) = match ev {
-        MouseEv::Press(btn) => {
-            let code = match btn {
-                1 => 0u32,
-                2 => 1,
-                3 => 2,
-                _ => return None,
-            };
-            (code, false)
-        }
-        MouseEv::Release(btn) => {
-            if mode == MouseMode::X10 {
-                return None;
-            }
-            let code = match btn {
-                1 => 0u32,
-                2 => 1,
-                3 => 2,
-                _ => return None,
-            };
-            (code, true)
-        }
-        MouseEv::Motion(held) => {
-            // Normal/X10: no motion. ButtonEvent: only while a button is held.
-            // AnyEvent: report all motion.
-            match mode {
-                MouseMode::None | MouseMode::X10 | MouseMode::Normal => return None,
-                MouseMode::ButtonEvent if held.is_none() => return None,
-                _ => {}
-            }
-            // 0x20 = motion bit; held button (or 3 = no buttons) in low 2 bits.
-            let held_code = match held {
-                Some(1) => 0u32,
-                Some(2) => 1,
-                Some(3) => 2,
-                _ => 3,
-            };
-            (held_code | 0x20, false)
-        }
-        MouseEv::Wheel(dir) => {
-            // Wheel reports use bits 0x40 + direction (0 up, 1 down). Never
-            // generate a release.
-            let code = 0x40u32 | if dir < 0 { 0 } else { 1 };
-            (code, false)
-        }
-    };
-
-    if state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
-        b |= 4;
-    }
-    if state.contains(gtk::gdk::ModifierType::ALT_MASK) {
-        b |= 8;
-    }
-    if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-        b |= 16;
-    }
-
-    Some(match enc {
-        MouseEncoding::Sgr => {
-            let term = if is_release { 'm' } else { 'M' };
-            format!("\x1b[<{};{};{}{}", b, col, row, term).into_bytes()
-        }
-        MouseEncoding::Urxvt => {
-            // urxvt: same button code as legacy (release collapses to 3) but
-            // sent as a decimal in `\e[<b>;<col>;<row>M`.
-            let mut bb = b;
-            if is_release {
-                bb = 3;
-            }
-            format!("\x1b[{};{};{}M", bb + 32, col, row).into_bytes()
-        }
-        MouseEncoding::Default | MouseEncoding::Utf8 => {
-            // Legacy: 3 bytes after `\e[M`. Clamp >223 cells (release encodes 3).
-            let mut bb = b;
-            if is_release {
-                bb = 3;
-            }
-            let cx = (col.min(223) as u32) as u8 + 32;
-            let cy = (row.min(223) as u32) as u8 + 32;
-            let bb_byte = (bb + 32).min(255) as u8;
-            vec![0x1b, b'[', b'M', bb_byte, cx, cy]
-        }
-    })
-}
-
-/// Paste the system clipboard into the shell, honoring bracketed paste mode.
-///
-/// The active VTE in block view has no real PTY of its own — VTE's built-in
-/// `paste_clipboard()` would generate `\e[200~`/`\e[201~` only if its dummy PTY
-/// had `?2004` enabled, which it never does. We track the mode on our own
-/// parser and bracket the write here. Bypasses the `commit` handler entirely
-/// so control bytes in pasted text are not mangled by the typed-cmd filter.
+/// Paste the system clipboard via VTE's native handler. VTE reads the
+/// clipboard itself, consults its own `?2004` state to decide whether to
+/// bracket, and writes the bytes out its slave PTY. The vte_pty reader
+/// then splices them to the shell. We no longer track bracketed-paste
+/// mode in jterm1's parser for this purpose.
 fn paste_from_clipboard(ctx: &Rc<Ctx>) {
-    let Some(display) = gtk::gdk::Display::default() else {
-        return;
-    };
-    let clipboard = display.clipboard();
-    let pty = ctx.pty.clone();
-    let bracketed = ctx.parser.borrow().bracketed_paste();
-    clipboard.read_text_async(gtk::gio::Cancellable::NONE, move |res| {
-        let Ok(Some(text)) = res else {
-            return;
-        };
-        // Most shells strip a trailing newline themselves; we don't.
-        let bytes = text.as_bytes();
-        if bracketed {
-            let mut out = Vec::with_capacity(bytes.len() + 12);
-            out.extend_from_slice(b"\x1b[200~");
-            out.extend_from_slice(bytes);
-            out.extend_from_slice(b"\x1b[201~");
-            pty.write_bytes(&out);
-        } else {
-            pty.write_bytes(bytes);
-        }
-    });
+    ctx.active_vte.paste_clipboard();
 }
 
 /// Resolve a Copy action in block mode by trying (in priority order):
