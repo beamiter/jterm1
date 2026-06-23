@@ -2345,6 +2345,81 @@ fn exit_fullscreen(ctx: &Rc<Ctx>) {
     rebuild_minimap(ctx);
 }
 
+/// Drop a leading prompt+command echo from the captured output, when present.
+///
+/// Some shells (rsh, zsh+zle with multi-line prompts, fish, history-recall flows)
+/// emit OSC 133;C *before* the final prompt-repaint + command echo lands in the
+/// byte stream. Those bytes then end up at the start of `out_buf` — so the
+/// recorded block's output starts with a colored prompt line and a `> cmd` line
+/// that duplicate the block widget's own header / command label. Worse, when
+/// those leading bytes carry cursor-positioning escapes (CR + clear-line, common
+/// in repaints), `scrape_command_output` routes the whole stream through the
+/// grid emulator; the prompt SGR survives but the surrounding repaint clobbers
+/// nothing useful and the user sees raw `\e[…m` glyphs at the top of the block.
+///
+/// Heuristic: look at the *first* non-empty (ANSI-stripped) line of the output.
+/// If it looks like a prompt + command echo, drop it. Otherwise leave the
+/// output untouched. We deliberately do NOT scan later lines: real program
+/// output can coincidentally end with the command name (`tools` ends with `ls`,
+/// a `git log` line can mention the command, etc.), and stripping past it
+/// would chop real output. The echo, when present, is always at the very top.
+fn strip_leading_command_echo(output: &str, command: &str) -> String {
+    let cmd = command.trim();
+    if cmd.is_empty() || output.is_empty() {
+        return output.to_string();
+    }
+    let bytes = output.as_bytes();
+    let mut line_start = 0usize;
+    // Tolerate up to a couple of blank leading lines before the candidate.
+    for _ in 0..3 {
+        let line_end = match bytes[line_start..].iter().position(|&b| b == b'\n') {
+            Some(off) => line_start + off,
+            None => return output.to_string(),
+        };
+        let plain = strip_ansi(&bytes[line_start..line_end]);
+        let trimmed = plain.trim();
+        if trimmed.is_empty() {
+            line_start = line_end + 1;
+            if line_start >= bytes.len() {
+                return output.to_string();
+            }
+            continue;
+        }
+        if is_command_echo_line(trimmed, cmd) {
+            return String::from_utf8_lossy(&bytes[line_end + 1..]).into_owned();
+        }
+        return output.to_string();
+    }
+    output.to_string()
+}
+
+/// Returns true if `line` (already trimmed, ANSI-stripped) looks like a shell
+/// prompt followed by the user's command. Accepts either the bare command
+/// (`sudo apt update`) or `<prompt-stuff> <marker> <cmd>` where marker is one
+/// of the conventional prompt-terminator characters.
+fn is_command_echo_line(line: &str, cmd: &str) -> bool {
+    if line == cmd {
+        return true;
+    }
+    if !line.ends_with(cmd) {
+        return false;
+    }
+    let prefix = &line[..line.len() - cmd.len()];
+    // Must have a whitespace separator immediately before the command, so we
+    // don't match suffix coincidences like "tools" ending in "ls".
+    if !prefix.ends_with(|c: char| c.is_whitespace()) {
+        return false;
+    }
+    let prefix_trim = prefix.trim_end();
+    if prefix_trim.is_empty() {
+        // " sudo apt update" with only leading whitespace — treat as echo.
+        return true;
+    }
+    // Require a recognizable prompt terminator somewhere in the prefix.
+    const MARKERS: &[char] = &['>', '$', '#', '%', ')', ']', '›', '❯', '»', '➜'];
+    prefix_trim.chars().any(|c| MARKERS.contains(&c))
+}
+
 /// Snapshot the current command + output into a finished block, then reset the
 /// active card for the next command.
 fn finalize_block(ctx: &Rc<Ctx>) {
@@ -2375,6 +2450,8 @@ fn finalize_block(ctx: &Rc<Ctx>) {
             String::from_utf8_lossy(&bytes).into_owned()
         }
     };
+    // Drop leading prompt+command echo (see `strip_leading_command_echo` doc).
+    let output = strip_leading_command_echo(&output, &command);
     if std::env::var_os("JTERM1_DBG").is_some() {
         eprintln!(
             "[DBG] finalize cmd={:?} out_len={} out_lines={} first={:?} last={:?}",
