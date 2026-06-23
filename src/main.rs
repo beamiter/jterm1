@@ -10,6 +10,7 @@ mod process;
 mod pty;
 mod session;
 mod terminal;
+mod vte_pty;
 
 use relm4::prelude::*;
 use relm4::adw;
