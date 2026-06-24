@@ -5,6 +5,7 @@ mod config;
 mod dialogs;
 mod file_tree;
 mod keybindings;
+mod notebook;
 mod palette;
 mod parser;
 mod process;
@@ -79,6 +80,8 @@ enum AppMsg {
     SetTabFilter(String),
     /// File tree: insert a file's shell-quoted path into the active terminal.
     FileTreeActivateFile(String),
+    /// File tree: open a `.jtnb.md` notebook viewer.
+    OpenNotebook(std::path::PathBuf),
     /// File tree: reroot to the active tab's working directory.
     FileTreeGotoCwd,
     /// File tree: move the root up to its parent directory.
@@ -2479,7 +2482,11 @@ impl SimpleComponent for AppModel {
                     .get()
                     .unwrap_or_default();
                 if !file_path.is_empty() {
-                    sender.input(AppMsg::FileTreeActivateFile(file_path));
+                    if file_path.ends_with(".jtnb.md") {
+                        sender.input(AppMsg::OpenNotebook(std::path::PathBuf::from(file_path)));
+                    } else {
+                        sender.input(AppMsg::FileTreeActivateFile(file_path));
+                    }
                 }
             });
         }
@@ -2894,6 +2901,9 @@ impl SimpleComponent for AppModel {
                     term.emit(VteInput::WriteInput(snippet.into_bytes()));
                     term.emit(VteInput::GrabFocus);
                 }
+            }
+            AppMsg::OpenNotebook(path) => {
+                notebook::open_notebook_dialog(&self.window, &path);
             }
             AppMsg::PaletteTypeCommand(cmd) => {
                 if let Some(term) = self.active_terminal() {
