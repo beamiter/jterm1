@@ -1,0 +1,8 @@
+name: "Git: interactive rebase"
+description: "Rebase current branch onto target interactively"
+command: "git rebase -i {{target}}"
+tags: [git]
+args:
+  - name: target
+    description: "Target branch or ref"
+    default: "main"

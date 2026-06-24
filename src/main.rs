@@ -12,6 +12,7 @@ mod pty;
 mod session;
 mod terminal;
 mod vte_pty;
+mod workflows;
 
 use relm4::prelude::*;
 use relm4::adw;
@@ -93,6 +94,12 @@ enum AppMsg {
     PaletteAskAi(String),
     /// Open the session AI panel (Ctrl+Shift+A by default).
     OpenAiPanel,
+    /// Palette `:` prefix or Ctrl+Shift+Y: the user picked a workflow whose
+    /// definition lives at this path. The handler reloads + locates it (so
+    /// edits between palette-open and Accept are still honoured), opens the
+    /// param-fill dialog, and on submit types the rendered command into the
+    /// active pane.
+    PaletteRunWorkflow(std::path::PathBuf),
     Ignore,
 }
 
@@ -223,6 +230,10 @@ struct AppModel {
     /// Inline Ctrl+R history popover anchored to the active terminal widget.
     /// One per app — opening it on a different terminal moves it.
     history_popover: Rc<RefCell<Option<gtk::Popover>>>,
+    /// Workflows loaded from disk. Refreshed on demand each time the palette
+    /// is opened (cheap — handful of small YAML files) so users see edits
+    /// without a restart.
+    workflows: Rc<RefCell<Vec<workflows::Workflow>>>,
 }
 
 /// Strip one layer of markdown code fence (```bash … ``` or ``` … ```) if it
@@ -321,6 +332,47 @@ impl AppModel {
             .and_then(|p| p.cwd.clone())
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_dir())
+    }
+
+    /// Re-scan the user's workflow directory. Called before each palette
+    /// open so users see new/edited YAMLs without a restart. Cheap: a few
+    /// short files, parsed once.
+    fn reload_workflows(&self) {
+        let dirs = vec![workflows::user_workflow_dir()];
+        let loaded = workflows::load_all(&dirs);
+        *self.workflows.borrow_mut() = loaded;
+    }
+
+    /// Look up a workflow by source path (the palette gives us a path, not
+    /// an index, because the workflow list can be rebuilt between
+    /// gather() and accept). If the workflow has no args, render and type
+    /// immediately; otherwise open the param-fill dialog.
+    fn run_workflow_from_path(
+        &self,
+        path: std::path::PathBuf,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let workflow = self
+            .workflows
+            .borrow()
+            .iter()
+            .find(|w| w.source_path.as_deref() == Some(path.as_path()))
+            .cloned();
+        let Some(workflow) = workflow else {
+            log::warn!("workflow not found: {}", path.display());
+            return;
+        };
+        if workflow.args.is_empty() {
+            match workflows::render(&workflow, &std::collections::HashMap::new()) {
+                Ok(rendered) => sender.input(AppMsg::PaletteTypeCommand(rendered)),
+                Err(e) => log::warn!("workflow render failed: {e}"),
+            }
+            return;
+        }
+        let sender_clone = sender.clone();
+        dialogs::show_workflow_param_dialog(&self.window, workflow, move |rendered| {
+            sender_clone.input(AppMsg::PaletteTypeCommand(rendered));
+        });
     }
 
     /// `?` palette accept handler: run the natural-language query through the
@@ -1642,25 +1694,30 @@ impl AppModel {
                 self.tab_strip.set_visible(self.sidebar_visible);
             }
             Action::ToggleCommandPalette => {
+                self.reload_workflows();
                 dialogs::toggle_command_palette(
                     &self.window,
                     &self.kbmap,
+                    &self.workflows,
                     &self.command_palette_dialog,
                     sender,
                 );
             }
             Action::OpenPalette => {
+                self.reload_workflows();
                 let history = self.config.borrow().block_history_path.clone();
                 dialogs::toggle_palette(
                     &self.window,
                     &self.kbmap,
                     history.as_deref().map(std::path::Path::new),
+                    &self.workflows,
                     &self.command_palette_dialog,
                     sender,
                     palette::PaletteMode::All,
                 );
             }
             Action::OpenHistoryPalette => {
+                self.reload_workflows();
                 let history = self.config.borrow().block_history_path.clone();
                 if let Some(term) = self.active_terminal() {
                     let anchor = term.widget();
@@ -1668,10 +1725,24 @@ impl AppModel {
                         &anchor,
                         &self.kbmap,
                         history.as_deref().map(std::path::Path::new),
+                        &self.workflows,
                         &self.history_popover,
                         sender,
                     );
                 }
+            }
+            Action::OpenWorkflows => {
+                self.reload_workflows();
+                let history = self.config.borrow().block_history_path.clone();
+                dialogs::toggle_palette(
+                    &self.window,
+                    &self.kbmap,
+                    history.as_deref().map(std::path::Path::new),
+                    &self.workflows,
+                    &self.command_palette_dialog,
+                    sender,
+                    palette::PaletteMode::Workflows,
+                );
             }
             Action::ToggleSettings => {
                 dialogs::toggle_settings(
@@ -2534,6 +2605,7 @@ impl SimpleComponent for AppModel {
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
             history_popover: Rc::new(RefCell::new(None)),
+            workflows: Rc::new(RefCell::new(Vec::new())),
         };
 
         let widgets = view_output!();
@@ -2834,6 +2906,9 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::OpenAiPanel => {
                 self.show_ai_session_panel(&sender);
+            }
+            AppMsg::PaletteRunWorkflow(path) => {
+                self.run_workflow_from_path(path, &sender);
             }
             AppMsg::FileTreeGotoCwd => self.file_tree_goto_current_cwd(),
             AppMsg::FileTreeGoUp => self.file_tree_go_up(),

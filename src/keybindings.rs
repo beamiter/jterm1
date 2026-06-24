@@ -62,6 +62,9 @@ pub(crate) enum Action {
     /// Open the session-level AI panel for free-form questions about the
     /// current shell context (Ctrl+Shift+A by default).
     OpenAiPanel,
+    /// Open the palette focused on parameterised command templates
+    /// ("workflows", `:` prefix). Ctrl+Shift+Y by default.
+    OpenWorkflows,
 }
 
 impl Action {
@@ -130,6 +133,7 @@ impl Action {
             Action::ClearBlockFilter => "Clear block filter",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::OpenAiPanel => "Open AI panel",
+            Action::OpenWorkflows => "Open workflows",
         }
     }
 
@@ -187,6 +191,7 @@ impl Action {
             Action::ClearBlockFilter => Some("clear_block_filter"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
             Action::OpenAiPanel => Some("open_ai_panel"),
+            Action::OpenWorkflows => Some("open_workflows"),
         }
     }
 
@@ -242,6 +247,7 @@ impl Action {
             Action::ClearBlockFilter,
             Action::ToggleDebugDashboard,
             Action::OpenAiPanel,
+            Action::OpenWorkflows,
         ]
     }
 }
@@ -481,6 +487,7 @@ impl KeybindingMap {
         bind("Ctrl+Shift+Up", Action::FocusPaneUp);
         bind("Ctrl+Shift+Down", Action::FocusPaneDown);
         bind("Ctrl+Shift+A", Action::OpenAiPanel);
+        bind("Ctrl+Shift+Y", Action::OpenWorkflows);
 
         KeybindingMap { bindings }
     }

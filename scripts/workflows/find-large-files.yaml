@@ -1,0 +1,14 @@
+name: "Find large files"
+description: "Locate the biggest files under a directory, sorted descending"
+command: "find {{dir}} -type f -size +{{min_size}} -exec du -h {} + | sort -rh | head -n {{count}}"
+tags: [fs, debug]
+args:
+  - name: dir
+    description: "Search root"
+    default: "."
+  - name: min_size
+    description: "Minimum file size (e.g. 100M, 1G)"
+    default: "50M"
+  - name: count
+    description: "How many entries to show"
+    default: "20"

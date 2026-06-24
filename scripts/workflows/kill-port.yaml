@@ -1,0 +1,11 @@
+name: "Kill process on port"
+description: "Find and kill whatever is listening on a TCP port"
+command: "lsof -ti tcp:{{port}} | xargs -r kill -{{signal}}"
+tags: [net, debug]
+args:
+  - name: port
+    description: "TCP port"
+    default: "3000"
+  - name: signal
+    description: "Signal to send (TERM/KILL/HUP)"
+    default: "TERM"

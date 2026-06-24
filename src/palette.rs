@@ -10,6 +10,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use std::path::Path;
 
 use crate::keybindings::{Action, KeybindingMap};
+use crate::workflows::Workflow;
 
 /// Which sources the palette will draw from. The mode is the *default* — the
 /// user can still narrow further with a prefix in the query text.
@@ -24,6 +25,8 @@ pub(crate) enum PaletteMode {
     /// `?` prefix: AI natural-language → shell command. The remaining text
     /// becomes the user prompt; gather returns a single "Ask AI" entry.
     Ai,
+    /// `:` prefix: parameterised command templates ("workflows").
+    Workflows,
 }
 
 /// Parsed query: a mode (possibly tightened by a prefix) and the remaining
@@ -36,8 +39,8 @@ pub(crate) struct Query {
 
 impl Query {
     /// `>foo` forces command-only, `@foo` forces history-only, `?foo` forces
-    /// AI natural-language → command. Otherwise the query inherits
-    /// `default_mode`.
+    /// AI natural-language → command, `:foo` forces workflows-only. Otherwise
+    /// the query inherits `default_mode`.
     pub fn parse(raw: &str, default_mode: PaletteMode) -> Self {
         let trimmed = raw.trim_start();
         if let Some(rest) = trimmed.strip_prefix('>') {
@@ -48,6 +51,9 @@ impl Query {
         }
         if let Some(rest) = trimmed.strip_prefix('?') {
             return Query { mode: PaletteMode::Ai, text: rest.trim_start().to_string() };
+        }
+        if let Some(rest) = trimmed.strip_prefix(':') {
+            return Query { mode: PaletteMode::Workflows, text: rest.trim_start().to_string() };
         }
         Query { mode: default_mode, text: trimmed.to_string() }
     }
@@ -65,6 +71,10 @@ pub(crate) enum Accept {
     /// fires the request, then types the returned command into the active
     /// pane (no autosubmit — same safety stance as TypeCommand).
     AskAi(String),
+    /// Run the workflow whose source path is given. Index into the workflow
+    /// list isn't used because the list can be reloaded between gather and
+    /// accept; the source path is stable enough to re-lookup.
+    RunWorkflow(std::path::PathBuf),
 }
 
 /// One row in the palette.
@@ -121,6 +131,7 @@ pub(crate) fn gather(
     query: &Query,
     kbmap: &KeybindingMap,
     history_path: Option<&Path>,
+    workflows: &[Workflow],
     limit: usize,
 ) -> Vec<Entry> {
     let matcher = SkimMatcherV2::default().smart_case();
@@ -136,6 +147,31 @@ pub(crate) fn gather(
                 sublabel: None,
                 right: if binding.is_empty() { None } else { Some(binding) },
                 accept: Accept::Action(action),
+            };
+            push_if_match(&matcher, &query.text, entry, &mut out);
+        }
+    }
+
+    if matches!(query.mode, PaletteMode::All | PaletteMode::Workflows) {
+        for wf in workflows {
+            let Some(path) = wf.source_path.clone() else { continue };
+            let right = if wf.tags.is_empty() {
+                Some(":".to_string())
+            } else {
+                Some(format!(":{}", wf.tags.join(",")))
+            };
+            let sublabel = if wf.description.is_empty() {
+                Some(wf.command.clone())
+            } else {
+                Some(wf.description.clone())
+            };
+            let entry = Entry {
+                tier: 1,
+                score: 0,
+                label: format!("⚙ {}", wf.name),
+                sublabel,
+                right,
+                accept: Accept::RunWorkflow(path),
             };
             push_if_match(&matcher, &query.text, entry, &mut out);
         }
@@ -182,7 +218,7 @@ pub(crate) fn gather(
             for (idx, item) in items.into_iter().enumerate() {
                 let recency = (len - idx) as i64; // 1..=len
                 let entry = Entry {
-                    tier: 1,
+                    tier: 2,
                     score: recency,
                     label: item.command.clone(),
                     sublabel: Some(history_sublabel(&item)),
@@ -267,9 +303,28 @@ mod tests {
             &Query { mode: PaletteMode::Commands, text: String::new() },
             &kbmap,
             None,
+            &[],
             100,
         );
         assert!(!entries.is_empty());
         assert!(entries.iter().all(|e| e.tier == 0));
+    }
+
+    #[test]
+    fn workflows_appear_under_colon_prefix() {
+        let kbmap = KeybindingMap::from_defaults();
+        let wf = Workflow {
+            name: "Git rebase".to_string(),
+            description: "rebase onto target".to_string(),
+            command: "git rebase {{t}}".to_string(),
+            tags: vec!["git".to_string()],
+            args: vec![],
+            source_path: Some(std::path::PathBuf::from("/tmp/wf.yaml")),
+        };
+        let q = Query::parse(":rebase", PaletteMode::All);
+        assert_eq!(q.mode, PaletteMode::Workflows);
+        let entries = gather(&q, &kbmap, None, std::slice::from_ref(&wf), 50);
+        assert_eq!(entries.len(), 1, "got {entries:?}");
+        assert!(matches!(entries[0].accept, Accept::RunWorkflow(_)));
     }
 }

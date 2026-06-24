@@ -17,6 +17,7 @@ use std::rc::Rc;
 use crate::config::{Config, Theme};
 use crate::keybindings::{Action, KeybindingMap};
 use crate::palette::{self, Accept, PaletteMode, Query};
+use crate::workflows::Workflow;
 use crate::{AppModel, AppMsg};
 
 /// Open the palette in command-only mode (kept for backwards-compat with the
@@ -24,19 +25,21 @@ use crate::{AppModel, AppMsg};
 pub(crate) fn toggle_command_palette(
     window: &adw::ApplicationWindow,
     kbmap: &Rc<RefCell<KeybindingMap>>,
+    workflows: &Rc<RefCell<Vec<Workflow>>>,
     dialog_ref: &Rc<RefCell<Option<adw::Dialog>>>,
     sender: &ComponentSender<AppModel>,
 ) {
-    toggle_palette(window, kbmap, None, dialog_ref, sender, PaletteMode::Commands);
+    toggle_palette(window, kbmap, None, workflows, dialog_ref, sender, PaletteMode::Commands);
 }
 
-/// Fuzzy palette over actions and shell history. `default_mode` decides what
-/// sources are initially included; the user can still narrow with a `>` or `@`
-/// prefix. A second invocation toggles it closed.
+/// Fuzzy palette over actions, shell history, and workflows. `default_mode`
+/// decides what sources are initially included; the user can still narrow
+/// with a `>`, `@`, `:`, or `?` prefix. A second invocation toggles it closed.
 pub(crate) fn toggle_palette(
     window: &adw::ApplicationWindow,
     kbmap: &Rc<RefCell<KeybindingMap>>,
     history_path: Option<&std::path::Path>,
+    workflows: &Rc<RefCell<Vec<Workflow>>>,
     dialog_ref: &Rc<RefCell<Option<adw::Dialog>>>,
     sender: &ComponentSender<AppModel>,
     default_mode: PaletteMode,
@@ -53,12 +56,14 @@ pub(crate) fn toggle_palette(
         PaletteMode::Commands => "Command Palette",
         PaletteMode::History => "History",
         PaletteMode::Ai => "Ask AI",
+        PaletteMode::Workflows => "Workflows",
     };
     let placeholder = match default_mode {
-        PaletteMode::All => "Search commands and history…  (try ? to ask AI)",
-        PaletteMode::Commands => "Search commands…  (try @ for history, ? for AI)",
-        PaletteMode::History => "Search history…  (try > for commands, ? for AI)",
+        PaletteMode::All => "Search everything…  (> commands, @ history, : workflows, ? AI)",
+        PaletteMode::Commands => "Search commands…  (@ history, : workflows, ? AI)",
+        PaletteMode::History => "Search history…  (> commands, : workflows, ? AI)",
         PaletteMode::Ai => "Describe what you want…",
+        PaletteMode::Workflows => "Search workflows…  (> commands, @ history)",
     };
 
     let dialog = adw::Dialog::builder()
@@ -107,9 +112,16 @@ pub(crate) fn toggle_palette(
         let history_path = history_path.clone();
         let list_box = list_box.clone();
         let accepts = accepts.clone();
+        let workflows = workflows.clone();
         Rc::new(move |needle: &str| {
             let query = Query::parse(needle, default_mode);
-            let entries = palette::gather(&query, &kbmap.borrow(), history_path.as_deref(), 200);
+            let entries = palette::gather(
+                &query,
+                &kbmap.borrow(),
+                history_path.as_deref(),
+                &workflows.borrow(),
+                200,
+            );
 
             // Clear existing rows.
             while let Some(row) = list_box.row_at_index(0) {
@@ -165,6 +177,7 @@ pub(crate) fn toggle_palette(
                 Accept::Action(a) => sender.input(AppMsg::Action(a)),
                 Accept::TypeCommand(cmd) => sender.input(AppMsg::PaletteTypeCommand(cmd)),
                 Accept::AskAi(query) => sender.input(AppMsg::PaletteAskAi(query)),
+                Accept::RunWorkflow(path) => sender.input(AppMsg::PaletteRunWorkflow(path)),
             }
         })
     };
@@ -240,6 +253,7 @@ pub(crate) fn toggle_history_popover(
     anchor: &gtk::Widget,
     kbmap: &Rc<RefCell<KeybindingMap>>,
     history_path: Option<&std::path::Path>,
+    workflows: &Rc<RefCell<Vec<Workflow>>>,
     popover_ref: &Rc<RefCell<Option<gtk::Popover>>>,
     sender: &ComponentSender<AppModel>,
 ) {
@@ -288,9 +302,16 @@ pub(crate) fn toggle_history_popover(
         let history_path = history_path.clone();
         let list_box = list_box.clone();
         let accepts = accepts.clone();
+        let workflows = workflows.clone();
         Rc::new(move |needle: &str| {
             let query = Query::parse(needle, PaletteMode::History);
-            let entries = palette::gather(&query, &kbmap.borrow(), history_path.as_deref(), 100);
+            let entries = palette::gather(
+                &query,
+                &kbmap.borrow(),
+                history_path.as_deref(),
+                &workflows.borrow(),
+                100,
+            );
             while let Some(row) = list_box.row_at_index(0) {
                 list_box.remove(&row);
             }
@@ -344,6 +365,7 @@ pub(crate) fn toggle_history_popover(
                 Accept::Action(a) => sender.input(AppMsg::Action(a)),
                 Accept::TypeCommand(cmd) => sender.input(AppMsg::PaletteTypeCommand(cmd)),
                 Accept::AskAi(query) => sender.input(AppMsg::PaletteAskAi(query)),
+                Accept::RunWorkflow(path) => sender.input(AppMsg::PaletteRunWorkflow(path)),
             }
         })
     };
@@ -414,6 +436,133 @@ fn glib_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Modal that prompts the user to fill in a workflow's args, then calls
+/// `on_ready(rendered_command)` with the substituted command. The callback
+/// is invoked synchronously inside the GTK signal handler on the main thread.
+/// If the user cancels (Escape or the Cancel button) the callback is not
+/// fired — the workflow is effectively dropped.
+pub(crate) fn show_workflow_param_dialog(
+    window: &adw::ApplicationWindow,
+    workflow: Workflow,
+    on_ready: impl Fn(String) + 'static,
+) {
+    let dialog = adw::Dialog::builder()
+        .title(&format!("Workflow: {}", workflow.name))
+        .content_width(520)
+        .content_height(0)
+        .build();
+    let header = adw::HeaderBar::new();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    if !workflow.description.is_empty() {
+        let desc = gtk::Label::new(Some(&workflow.description));
+        desc.set_halign(gtk::Align::Start);
+        desc.set_wrap(true);
+        desc.add_css_class("dim-label");
+        content.append(&desc);
+    }
+
+    // Preview the command template so users can see what the placeholders
+    // affect before filling them in.
+    let preview = gtk::Label::new(None);
+    preview.set_markup(&format!(
+        "<tt>{}</tt>",
+        glib_escape(&workflow.command)
+    ));
+    preview.set_halign(gtk::Align::Start);
+    preview.set_wrap(true);
+    preview.set_selectable(true);
+    content.append(&preview);
+
+    let entries: Rc<RefCell<Vec<(String, gtk::Entry)>>> = Rc::new(RefCell::new(Vec::new()));
+    if workflow.args.is_empty() {
+        // Edge case: someone hit the picker on an args-less workflow. The
+        // caller would normally short-circuit and render immediately, but
+        // handle it gracefully here too.
+        let lbl = gtk::Label::new(Some("This workflow has no parameters."));
+        lbl.set_halign(gtk::Align::Start);
+        lbl.add_css_class("dim-label");
+        content.append(&lbl);
+    } else {
+        for arg in &workflow.args {
+            let row = adw::ActionRow::builder()
+                .title(glib_escape(&arg.name))
+                .build();
+            if !arg.description.is_empty() {
+                row.set_subtitle(&glib_escape(&arg.description));
+            }
+            let entry = gtk::Entry::new();
+            entry.set_hexpand(true);
+            entry.set_valign(gtk::Align::Center);
+            if let Some(default) = &arg.default {
+                entry.set_text(default);
+            }
+            row.add_suffix(&entry);
+            row.set_activatable_widget(Some(&entry));
+            content.append(&row);
+            entries.borrow_mut().push((arg.name.clone(), entry));
+        }
+    }
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    buttons.set_halign(gtk::Align::End);
+    let cancel_btn = gtk::Button::with_label("Cancel");
+    let run_btn = gtk::Button::with_label("Insert command");
+    run_btn.add_css_class("suggested-action");
+    buttons.append(&cancel_btn);
+    buttons.append(&run_btn);
+    content.append(&buttons);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar));
+
+    let on_ready_rc: Rc<dyn Fn(String)> = Rc::new(on_ready);
+
+    {
+        let dialog = dialog.clone();
+        cancel_btn.connect_clicked(move |_| dialog.force_close());
+    }
+    {
+        let dialog = dialog.clone();
+        let workflow = workflow.clone();
+        let entries = entries.clone();
+        let on_ready = on_ready_rc.clone();
+        run_btn.connect_clicked(move |_| {
+            let mut values: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (name, entry) in entries.borrow().iter() {
+                values.insert(name.clone(), entry.text().to_string());
+            }
+            match crate::workflows::render(&workflow, &values) {
+                Ok(rendered) => {
+                    dialog.force_close();
+                    on_ready(rendered);
+                }
+                Err(e) => log::warn!("workflow render failed: {e}"),
+            }
+        });
+    }
+
+    // Enter in any of the param entries submits.
+    if let Some((_, first_entry)) = entries.borrow().first().cloned() {
+        for (_, entry) in entries.borrow().iter() {
+            let run_btn = run_btn.clone();
+            entry.connect_activate(move |_| run_btn.emit_clicked());
+        }
+        first_entry.grab_focus();
+    } else {
+        run_btn.grab_focus();
+    }
+
+    dialog.present(Some(window));
 }
 
 /// Searchable list of configured remote hosts. Activating a row opens a new tab
