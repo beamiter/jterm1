@@ -115,6 +115,24 @@ impl VtePty {
         };
         let OpenptyResult { master, slave } =
             openpty(Some(&initial_size), None).map_err(io::Error::other)?;
+        // Put the slave in raw mode. openpty(3) leaves it in the kernel default
+        // canonical/cooked discipline (ICANON + ECHO + ICRNL + OPOST). That
+        // discipline mangles the MITM splice in two ways: ICANON line-buffers
+        // VTE's keystrokes so the slave reader only sees a chunk after Enter,
+        // and ICRNL rewrites Enter's `\r` to `\n` — which rsh-style line
+        // editors treat as a literal newline, not the "execute command"
+        // signal. Net effect: typing `pwd` + Enter rendered into the active
+        // VTE but the shell never saw a CR, no command ever ran, and OSC 133;C
+        // / ;D never fired (so no finished block, ever). cfmakeraw turns off
+        // ICANON, ECHO, ICRNL, OPOST, etc., letting bytes splice through
+        // verbatim in both directions.
+        unsafe {
+            let mut tio: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(slave.as_raw_fd(), &mut tio) == 0 {
+                libc::cfmakeraw(&mut tio);
+                libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &tio);
+            }
+        }
         // vte4::Pty::foreign_sync takes io_lifetimes::OwnedFd, which is the
         // same underlying type as std's; round-trip via raw fd to bridge the
         // two crates without taking a hard dep on io-lifetimes here.

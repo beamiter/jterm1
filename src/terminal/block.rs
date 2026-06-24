@@ -3302,12 +3302,16 @@ fn reset_active(ctx: &Rc<Ctx>) {
     if ctx.tui_promoted.replace(false) {
         exit_fullscreen(ctx);
     }
-    // `reset()` acts on the emulator state immediately, but `feed()` bytes are
-    // parsed asynchronously: the just-finished command's output is still queued
-    // and would replay onto the cleared grid, leaving stale lines above the next
-    // prompt. Feed an in-stream clear (home + erase screen + erase scrollback) so
-    // it is ordered *after* that queued output and wipes it.
-    ctx.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
+    // `reset()` clears VTE's grid state immediately, but the just-finished
+    // command's tail bytes are still in the MITM PTY kernel queue (they were
+    // splice-written via `vte_pty.write_bytes` in earlier Bytes events) and
+    // will replay onto the freshly cleared grid, leaving stale rows above the
+    // next prompt. A direct `active_vte.feed(clear)` races with that drain
+    // because feed() injects into VTE's parser without going through the
+    // master fd. Route the clear through the MITM PTY instead so it is
+    // appended after the queued tail and ordered before the next prompt's
+    // bytes (which arrive via the same path).
+    ctx.vte_pty.write_bytes(b"\x1b[H\x1b[2J\x1b[3J");
     ctx.cmd_buf.borrow_mut().clear();
     ctx.typed_cmd.borrow_mut().clear();
     ctx.typed_unreliable.set(false);
