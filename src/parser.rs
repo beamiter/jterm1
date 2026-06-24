@@ -55,6 +55,10 @@ pub enum ParserEvent {
     CommandEnd(i32),
     /// OSC 7 — shell reported new CWD.
     CwdUpdate(String),
+    /// OSC 7770 — rsh-specific: the remote shell announces its session ID at
+    /// startup. jterm1 stores it on the tab's RemoteConn so subsequent
+    /// reconnects pass `--session <id>` and rsh restores cwd/env/aliases.
+    RemoteSessionId(String),
     /// CSI ? 1049 h — alt screen entered (vim, less, etc.)
     AltScreenEnter,
     /// CSI ? 1049 l — alt screen left.
@@ -552,6 +556,15 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
+    // OSC 7770 ; <session-id> — rsh-specific session announce (see rsh osc.rs:107).
+    if let Some(rest) = s.strip_prefix("7770;") {
+        let id = rest.trim();
+        if !id.is_empty() {
+            events.push(ParserEvent::RemoteSessionId(id.to_string()));
+        }
+        return;
+    }
+
     // OSC 7 ; file://host/path — CWD update (path is percent-encoded per RFC 3986).
     if let Some(rest) = s.strip_prefix("7;") {
         let raw = if let Some(uri) = rest.strip_prefix("file://") {
@@ -840,5 +853,27 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["A", "C", "D"]);
+    }
+
+    #[test]
+    fn osc_7770_emits_remote_session_id() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b]7770;home-main\x1b\\", &mut events);
+        let id = events.iter().find_map(|e| match e {
+            ParserEvent::RemoteSessionId(s) => Some(s.clone()),
+            _ => None,
+        });
+        assert_eq!(id.as_deref(), Some("home-main"));
+    }
+
+    #[test]
+    fn osc_7770_empty_payload_ignored() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b]7770;\x07", &mut events);
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, ParserEvent::RemoteSessionId(_))));
     }
 }

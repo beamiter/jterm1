@@ -48,6 +48,9 @@ enum AppMsg {
     ReloadConfig,
     PaneExited(u64, u64, i32),
     PaneCwdChanged(u64, u64, String),
+    /// Remote rsh announced its session id (OSC 7770). Stored on the tab's
+    /// RemoteConn so reconnects pass `--session <id>` and rsh restores state.
+    PaneRemoteSessionId(u64, String),
     /// Reconnect-countdown tick for a remote tab (id, seconds remaining).
     RemoteReconnectTick(u64, u64),
     /// Backoff elapsed: respawn the remote connection (id, attempt to seed).
@@ -248,6 +251,7 @@ fn create_pane(
         // (attention) style, success the lighter activity style.
         VteOutput::CommandFinished(true) => AppMsg::Activity(tab_id),
         VteOutput::CommandFinished(false) => AppMsg::Bell(tab_id),
+        VteOutput::RemoteSessionId(id) => AppMsg::PaneRemoteSessionId(tab_id, id),
     };
     let terminal = match mode {
         TerminalMode::Block => TermCtl::Block(
@@ -282,11 +286,17 @@ impl AppModel {
             .map(|p| &p.terminal)
     }
 
-    /// Working directory of the active pane, if it reports one.
+    /// Working directory of the active pane, if it reports one. Remote (ssh)
+    /// tabs return None: their cwd is a path on the remote filesystem and the
+    /// file tree must not follow it (even if a same-named dir exists locally,
+    /// it's a different machine).
     fn active_cwd(&self) -> Option<std::path::PathBuf> {
-        self.tabs
-            .get(self.active)
-            .and_then(|t| t.panes.get(t.active_pane))
+        let tab = self.tabs.get(self.active)?;
+        if tab.remote.is_some() {
+            return None;
+        }
+        tab.panes
+            .get(tab.active_pane)
             .and_then(|p| p.cwd.clone())
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_dir())
@@ -629,7 +639,10 @@ impl AppModel {
         ]
     }
 
-    /// Open a new tab that connects to a remote host via ssh (always bare VTE).
+    /// Open a new tab that connects to a remote host via ssh. Uses block mode
+    /// so OSC 133 / 7 / 7770 from the remote rsh drive the block UI; for a remote
+    /// shell without OSC 133, block.rs falls back to a streaming raw view, which
+    /// is no worse than the bare-VTE path this used to take.
     fn add_remote_tab(&mut self, host: &config::RemoteHost, sender: &ComponentSender<AppModel>) {
         let id = self.next_id;
         self.next_id += 1;
@@ -641,7 +654,7 @@ impl AppModel {
             &argv,
             id,
             pane_id,
-            TerminalMode::Vte,
+            TerminalMode::Block,
             None,
             None,
             sender,
@@ -762,13 +775,17 @@ impl AppModel {
         self.tabs[idx].holder.remove(&old_widget);
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
-        let argv = Rc::new(config::build_remote_argv(&conn.host));
+        // Pull the *current* host snapshot — `conn.host.session` may have been
+        // learned dynamically via OSC 7770 during the prior connection, so we
+        // can't reuse the cloned-at-spawn `conn`.
+        let host_now = self.tabs[idx].remote.as_ref().map(|c| c.host.clone()).unwrap_or(conn.host.clone());
+        let argv = Rc::new(config::build_remote_argv(&host_now));
         let pane = create_pane(
             &self.config,
             &argv,
             tab_id,
             pane_id,
-            TerminalMode::Vte,
+            TerminalMode::Block,
             None,
             None,
             sender,
@@ -776,7 +793,7 @@ impl AppModel {
         self.tabs[idx].holder.append(&pane.terminal.widget());
         self.tabs[idx].panes = vec![pane];
         self.tabs[idx].active_pane = 0;
-        self.tabs[idx].title = conn.host.name.clone();
+        self.tabs[idx].title = host_now.name.clone();
         if let Some(c) = self.tabs[idx].remote.as_mut() {
             c.status = ConnStatus::Connecting;
             c.attempt = attempt;
@@ -2415,6 +2432,16 @@ impl SimpleComponent for AppModel {
                         let number = ti as u32 + 1;
                         self.tabs[ti].title = default_tab_title(number, Some(&path));
                         self.rebuild_tab_strip(&sender);
+                    }
+                }
+            }
+            AppMsg::PaneRemoteSessionId(tab_id, id) => {
+                if let Some(idx) = self.index_of(tab_id) {
+                    if let Some(conn) = self.tabs[idx].remote.as_mut() {
+                        // Learn rsh's session id so a reconnect passes the same
+                        // `--session <id>` and rsh restores cwd/env/aliases.
+                        // Overrides any static value the TOML config set.
+                        conn.host.session = Some(id);
                     }
                 }
             }

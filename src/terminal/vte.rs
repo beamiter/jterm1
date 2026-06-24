@@ -354,6 +354,9 @@ pub enum VteOutput {
     /// scrolled away from the bottom). `true` = success, `false` = failure.
     /// Only emitted by BlockTerminal.
     CommandFinished(bool),
+    /// Remote shell announced its session id via OSC 7770. Carries the id so
+    /// the parent app can store it on the tab's RemoteConn for resume-on-reconnect.
+    RemoteSessionId(String),
 }
 
 pub struct VteTerminal {

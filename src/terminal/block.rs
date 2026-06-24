@@ -1865,6 +1865,9 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             update_active_prompt(ctx);
             let _ = sender.output(VteOutput::CwdChanged(path));
         }
+        ParserEvent::RemoteSessionId(id) => {
+            let _ = sender.output(VteOutput::RemoteSessionId(id));
+        }
         ParserEvent::AltScreenEnter => {
             if std::env::var_os("JTERM1_DBG").is_some() {
                 eprintln!(
