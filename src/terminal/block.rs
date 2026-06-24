@@ -1787,7 +1787,7 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
         ParserEvent::PromptStart => {
             // Finalize the previous command (deferred from its CommandEnd).
             if ctx.has_command.get() {
-                finalize_block(ctx);
+                finalize_block(ctx, Some(sender));
             }
             ctx.state.set(BlockState::CollectingPrompt);
         }
@@ -2794,7 +2794,7 @@ fn is_command_echo_line(line: &str, cmd: &str) -> bool {
 
 /// Snapshot the current command + output into a finished block, then reset the
 /// active card for the next command.
-fn finalize_block(ctx: &Rc<Ctx>) {
+fn finalize_block(ctx: &Rc<Ctx>, sender: Option<&ComponentSender<BlockTerminal>>) {
     // Prefer the keystroke-reconstructed command; fall back to scraping the last
     // line of the echoed output (e.g. for history recall / paste).
     let typed = ctx.typed_cmd.borrow().trim().to_string();
@@ -2886,7 +2886,47 @@ fn finalize_block(ctx: &Rc<Ctx>) {
     } else {
         append_minimap_tick(ctx);
     }
+
+    // Agent-mode hook: ship a bounded summary of the finished block so the
+    // parent app can match it against an in-flight agent observation. Kept
+    // ~8 KB to fit comfortably in a relm4 channel hop.
+    if let Some(sender) = sender {
+        let sample = sample_block_output_for_agent(&output, 8 * 1024);
+        let _ = sender.output(VteOutput::BlockFinished {
+            command: command.clone(),
+            exit_code,
+            output_sample: sample,
+        });
+    }
+
     reset_active(ctx);
+}
+
+/// Head+tail elision matching `ai::sample_output`'s shape — kept here so
+/// the agent hook doesn't have to depend on the ai module's internals.
+fn sample_block_output_for_agent(output: &str, max_bytes: usize) -> String {
+    if output.len() <= max_bytes {
+        return output.to_string();
+    }
+    let half = max_bytes / 2;
+    let mut head_end = half.min(output.len());
+    while head_end > 0 && !output.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = output.len().saturating_sub(half);
+    while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if tail_start <= head_end {
+        return output[..head_end].to_string();
+    }
+    let elided = output.len() - (head_end + (output.len() - tail_start));
+    format!(
+        "{}\n\n… [{} bytes elided] …\n\n{}",
+        &output[..head_end],
+        elided,
+        &output[tail_start..]
+    )
 }
 
 /// Drop `raw_output` from the oldest finished blocks until the total retained

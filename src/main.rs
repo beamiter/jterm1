@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod agent;
 mod ai;
 mod config;
 mod dialogs;
@@ -82,6 +83,29 @@ enum AppMsg {
     FileTreeActivateFile(String),
     /// File tree: open a `.jtnb.md` notebook viewer.
     OpenNotebook(std::path::PathBuf),
+    /// Open the multi-turn AI agent panel.
+    OpenAgent,
+    /// User typed a message in the agent panel input.
+    AgentSend(String),
+    /// User approved the proposed command at the given transcript index.
+    AgentApprove(usize),
+    /// User rejected the proposed command at the given transcript index.
+    AgentReject(usize),
+    /// User accepted an edited variant of the command at the given index.
+    AgentEditAndApprove(usize, String),
+    /// LLM reply arrived for the most recent turn.
+    AgentLlmReply(Result<String, String>),
+    /// A finished block arrived from one of the panes — feed it to the
+    /// active agent if there's a match.
+    AgentBlockFinished {
+        tab_id: u64,
+        pane_id: u64,
+        command: String,
+        exit_code: i32,
+        output_sample: String,
+    },
+    /// Agent dialog closed — drop the session.
+    AgentClose,
     /// File tree: reroot to the active tab's working directory.
     FileTreeGotoCwd,
     /// File tree: move the root up to its parent directory.
@@ -237,6 +261,9 @@ struct AppModel {
     /// is opened (cheap — handful of small YAML files) so users see edits
     /// without a restart.
     workflows: Rc<RefCell<Vec<workflows::Workflow>>>,
+    /// At most one agent session is active per app. Opening the panel
+    /// while another session is alive cancels the previous one.
+    active_agent: Rc<RefCell<Option<agent::AgentSession>>>,
 }
 
 /// Strip one layer of markdown code fence (```bash … ``` or ``` … ```) if it
@@ -287,6 +314,13 @@ fn create_pane(
         VteOutput::CommandFinished(true) => AppMsg::Activity(tab_id),
         VteOutput::CommandFinished(false) => AppMsg::Bell(tab_id),
         VteOutput::RemoteSessionId(id) => AppMsg::PaneRemoteSessionId(tab_id, id),
+        VteOutput::BlockFinished { command, exit_code, output_sample } => AppMsg::AgentBlockFinished {
+            tab_id,
+            pane_id,
+            command,
+            exit_code,
+            output_sample,
+        },
     };
     let terminal = match mode {
         TerminalMode::Block => TermCtl::Block(
@@ -409,6 +443,277 @@ impl AppModel {
             Err(e) => log::warn!("AI palette request failed: {e}"),
         });
         std::mem::forget(_h);
+    }
+
+    // ── Agent mode ───────────────────────────────────────────────────────
+
+    fn open_agent_panel(&self, sender: &ComponentSender<AppModel>) {
+        let cfg = self.config.borrow();
+        if !cfg.ai_enabled || !cfg.agent_enabled {
+            log::info!("agent: disabled (ai_enabled={}, agent_enabled={})", cfg.ai_enabled, cfg.agent_enabled);
+            return;
+        }
+        let max_turns = cfg.agent_max_turns;
+        drop(cfg);
+        let Some(client) = ai::AiClient::from_env() else {
+            log::warn!("agent: no AI provider configured");
+            return;
+        };
+
+        // Cancel any pre-existing session before replacing.
+        if let Some(prev) = self.active_agent.borrow_mut().take() {
+            prev.cancel();
+        }
+
+        let tab_id = self.tabs.get(self.active).map(|t| t.id).unwrap_or(0);
+        let pane_id = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.panes.get(t.active_pane))
+            .map(|p| p.id)
+            .unwrap_or(0);
+        *self.active_agent.borrow_mut() = Some(agent::AgentSession::new(tab_id, pane_id));
+
+        let provider_name = client.display_name();
+        agent::show_agent_panel(
+            &self.window,
+            &self.active_agent,
+            sender.clone(),
+            &provider_name,
+            max_turns,
+        );
+    }
+
+    /// Push a user turn and kick off the next LLM turn.
+    fn agent_send(&self, text: String, sender: &ComponentSender<AppModel>) {
+        if self.active_agent.borrow().is_none() {
+            return;
+        }
+        {
+            let mut guard = self.active_agent.borrow_mut();
+            let sess = guard.as_mut().unwrap();
+            if sess.sealed {
+                return;
+            }
+            sess.transcript.push(agent::Turn::User(text));
+        }
+        agent::rerender(&self.active_agent, sender.clone());
+        self.agent_kick_llm(sender);
+    }
+
+    fn agent_approve(
+        &self,
+        idx: usize,
+        edited: Option<String>,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let (cmd, tab_id, pane_id) = {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(sess) = guard.as_mut() else { return };
+            if sess.sealed {
+                return;
+            }
+            let final_cmd = match sess.transcript.get_mut(idx) {
+                Some(agent::Turn::AssistantProposed { cmd, approved }) => {
+                    if let Some(new_cmd) = edited {
+                        *cmd = new_cmd;
+                    }
+                    *approved = Some(true);
+                    cmd.clone()
+                }
+                _ => return,
+            };
+            sess.awaiting_command = Some(final_cmd.clone());
+            (final_cmd, sess.bound_tab, sess.bound_pane)
+        };
+        // Type the command into the bound pane, autosubmit with \r since
+        // the user has explicitly approved.
+        if let Some(term) = self.terminal_for(tab_id, pane_id) {
+            let mut bytes = cmd.into_bytes();
+            bytes.push(b'\r');
+            term.emit(VteInput::WriteInput(bytes));
+            term.emit(VteInput::GrabFocus);
+        }
+        agent::rerender(&self.active_agent, sender.clone());
+    }
+
+    fn agent_reject(&self, idx: usize, sender: &ComponentSender<AppModel>) {
+        {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(sess) = guard.as_mut() else { return };
+            if let Some(agent::Turn::AssistantProposed { approved, .. }) = sess.transcript.get_mut(idx) {
+                *approved = Some(false);
+            }
+        }
+        agent::rerender(&self.active_agent, sender.clone());
+        // Kick the LLM again so it can suggest something else.
+        self.agent_kick_llm(sender);
+    }
+
+    fn agent_handle_block_finished(
+        &self,
+        tab_id: u64,
+        pane_id: u64,
+        command: String,
+        exit_code: i32,
+        output_sample: String,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let should_feed = {
+            let guard = self.active_agent.borrow();
+            let Some(sess) = guard.as_ref() else { return };
+            if sess.bound_tab != tab_id || sess.bound_pane != pane_id {
+                return;
+            }
+            match sess.awaiting_command.as_ref() {
+                Some(expected) if expected.trim() == command.trim() => true,
+                // The user typed something themselves while the agent was
+                // waiting — drop this block and keep waiting.
+                _ => false,
+            }
+        };
+        if !should_feed {
+            return;
+        }
+        {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(sess) = guard.as_mut() else { return };
+            sess.awaiting_command = None;
+            sess.transcript.push(agent::Turn::Observation {
+                exit: exit_code,
+                output_sample: agent::sample_observation(&output_sample),
+            });
+        }
+        agent::rerender(&self.active_agent, sender.clone());
+        self.agent_kick_llm(sender);
+    }
+
+    fn agent_handle_reply(
+        &self,
+        reply: Result<String, String>,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(sess) = guard.as_mut() else { return };
+            if sess.is_cancelled() {
+                return;
+            }
+            if let Some(spinner) = sess.spinner.as_ref() {
+                spinner.set_visible(false);
+                spinner.stop();
+            }
+            sess.in_flight = None;
+            sess.turns_used = sess.turns_used.saturating_add(1);
+
+            match reply {
+                Err(e) => {
+                    sess.transcript.push(agent::Turn::AssistantSay(format!(
+                        "[error contacting model: {e}]"
+                    )));
+                }
+                Ok(raw) => {
+                    let parsed = agent::parse_action(&raw);
+                    match parsed {
+                        agent::ParsedAction::Run { thought, command } => {
+                            if let Some(t) = thought {
+                                sess.transcript.push(agent::Turn::AssistantThought(t));
+                            }
+                            sess.transcript.push(agent::Turn::AssistantProposed {
+                                cmd: command,
+                                approved: None,
+                            });
+                        }
+                        agent::ParsedAction::Say { thought, message } => {
+                            if let Some(t) = thought {
+                                sess.transcript.push(agent::Turn::AssistantThought(t));
+                            }
+                            sess.transcript.push(agent::Turn::AssistantSay(message));
+                        }
+                        agent::ParsedAction::Done { thought, message } => {
+                            if let Some(t) = thought {
+                                sess.transcript.push(agent::Turn::AssistantThought(t));
+                            }
+                            sess.transcript.push(agent::Turn::AssistantSay(message));
+                            sess.sealed = true;
+                        }
+                    }
+                }
+            }
+            // Turn-cap seal.
+            let cap = self.config.borrow().agent_max_turns;
+            if sess.turns_used >= cap {
+                sess.sealed = true;
+            }
+        }
+        agent::rerender(&self.active_agent, sender.clone());
+    }
+
+    fn agent_kick_llm(&self, sender: &ComponentSender<AppModel>) {
+        let Some(client) = ai::AiClient::from_env() else { return };
+        // Build the prompt outside the borrow.
+        let (system, user) = {
+            let guard = self.active_agent.borrow();
+            let Some(sess) = guard.as_ref() else { return };
+            if sess.sealed {
+                return;
+            }
+            // Don't double-fire while still waiting for a command's output.
+            if sess.awaiting_command.is_some() {
+                return;
+            }
+            let cwd = self
+                .active_cwd()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".to_string());
+            let shell = self
+                .shell_argv
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "/bin/sh".to_string());
+            let os = std::env::consts::OS.to_string();
+            (ai::build_agent_system_prompt(&cwd, &shell, &os), sess.build_user_prompt())
+        };
+
+        let sender_for_reply = sender.clone();
+        let cancelled = {
+            let guard = self.active_agent.borrow();
+            guard.as_ref().map(|s| s.cancelled.clone())
+        };
+        let handle = ai::ask(client, system, user, move |result| {
+            // Cancelled-check is already done by ask() against its own flag,
+            // but the agent session may have moved on between fire and
+            // delivery — re-check here.
+            if let Some(c) = &cancelled {
+                if c.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+            }
+            sender_for_reply.input(AppMsg::AgentLlmReply(result));
+        });
+        // Stash the handle on the session + show spinner.
+        let mut guard = self.active_agent.borrow_mut();
+        if let Some(sess) = guard.as_mut() {
+            if let Some(spinner) = sess.spinner.as_ref() {
+                spinner.set_visible(true);
+                spinner.start();
+            }
+            sess.in_flight = Some(handle);
+        }
+    }
+
+    fn agent_close(&self) {
+        if let Some(prev) = self.active_agent.borrow_mut().take() {
+            prev.cancel();
+        }
+    }
+
+    fn terminal_for(&self, tab_id: u64, pane_id: u64) -> Option<&TermCtl> {
+        self.tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.panes.iter().find(|p| p.id == pane_id))
+            .map(|p| &p.terminal)
     }
 
     /// Pop up the session-level AI panel. The panel has a freeform question
@@ -1856,6 +2161,9 @@ impl AppModel {
             Action::OpenAiPanel => {
                 self.show_ai_session_panel(sender);
             }
+            Action::OpenAgent => {
+                self.open_agent_panel(sender);
+            }
         }
     }
 
@@ -2613,6 +2921,7 @@ impl SimpleComponent for AppModel {
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
             history_popover: Rc::new(RefCell::new(None)),
             workflows: Rc::new(RefCell::new(Vec::new())),
+            active_agent: Rc::new(RefCell::new(None)),
         };
 
         let widgets = view_output!();
@@ -2905,6 +3214,24 @@ impl SimpleComponent for AppModel {
             AppMsg::OpenNotebook(path) => {
                 notebook::open_notebook_dialog(&self.window, &path);
             }
+            AppMsg::OpenAgent => self.open_agent_panel(&sender),
+            AppMsg::AgentSend(text) => self.agent_send(text, &sender),
+            AppMsg::AgentApprove(idx) => self.agent_approve(idx, None, &sender),
+            AppMsg::AgentEditAndApprove(idx, new_cmd) => {
+                self.agent_approve(idx, Some(new_cmd), &sender);
+            }
+            AppMsg::AgentReject(idx) => self.agent_reject(idx, &sender),
+            AppMsg::AgentLlmReply(reply) => self.agent_handle_reply(reply, &sender),
+            AppMsg::AgentBlockFinished {
+                tab_id,
+                pane_id,
+                command,
+                exit_code,
+                output_sample,
+            } => {
+                self.agent_handle_block_finished(tab_id, pane_id, command, exit_code, output_sample, &sender);
+            }
+            AppMsg::AgentClose => self.agent_close(),
             AppMsg::PaletteTypeCommand(cmd) => {
                 if let Some(term) = self.active_terminal() {
                     term.emit(VteInput::WriteInput(cmd.into_bytes()));

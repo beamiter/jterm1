@@ -324,6 +324,51 @@ If the request is ambiguous, output the safest interpretation."
     (system, user)
 }
 
+/// Build the system prompt for agent mode. The user-side payload is the
+/// running transcript, assembled by `agent::AgentSession::build_user_prompt`.
+///
+/// The JSON-action protocol is the load-bearing piece: the UI parses each
+/// reply with `agent::parse_action`, and a malformed reply degrades to a
+/// `say` so the session continues. Few-shot examples cover the three
+/// actions the model is allowed to emit (`run` / `say` / `done`).
+pub(crate) fn build_agent_system_prompt(cwd: &str, shell: &str, os: &str) -> String {
+    format!(
+        "You are an interactive shell agent helping the user in their terminal. \
+Each reply MUST be a single JSON object — no prose, no markdown fences, no commentary. \
+Schema:\n\
+  {{ \"thought\": \"...\", \"action\": \"run\"|\"say\"|\"done\", \"command\": \"...\", \"message\": \"...\" }}\n\
+- `action: run` means the user must approve a shell command. Put the command in `command`. \
+  Use this for anything that changes filesystem, network, or state. Do not chain unrelated \
+  steps with `;` or `&&` — one command per turn so the user can review each.\n\
+- `action: say` means you need a clarifying answer from the user, or want to comment without \
+  running a command. Put the text in `message`.\n\
+- `action: done` means the task is complete. Put a short summary in `message`.\n\
+The user runs the command after approving it; you then receive an `Output (exit=N):` block \
+in the next turn and can decide what to do next. Prefer the smallest command that yields the \
+information you need. Never assume a command succeeded — wait for the observation.\n\
+\n\
+Environment:\n\
+  cwd: {cwd}\n\
+  shell: {shell}\n\
+  os: {os}\n\
+\n\
+Examples (single-line for clarity — actual replies should still be valid JSON):\n\
+User: my disk is full, what's eating space?\n\
+Assistant: {{\"thought\":\"survey top-level usage first\",\"action\":\"run\",\"command\":\"du -sh /* 2>/dev/null | sort -h | tail -20\"}}\n\
+Output (exit=0): 12G /var\\n8.4G /home\\n…\n\
+Assistant: {{\"thought\":\"/var is biggest, drill into it\",\"action\":\"run\",\"command\":\"du -sh /var/* 2>/dev/null | sort -h | tail -10\"}}\n\
+\n\
+User: rename all .txt to .md in this folder\n\
+Assistant: {{\"action\":\"run\",\"command\":\"for f in *.txt; do mv -- \\\"$f\\\" \\\"${{f%.txt}}.md\\\"; done\"}}\n\
+\n\
+User: is port 5432 free?\n\
+Assistant: {{\"action\":\"run\",\"command\":\"ss -tlnp | grep ':5432' || echo free\"}}\n\
+Output (exit=0): free\n\
+Assistant: {{\"action\":\"done\",\"message\":\"Port 5432 is free.\"}}\n\
+"
+    )
+}
+
 /// Build the system+user prompt for the session panel, optionally seeded
 /// with the most recent block context.
 pub(crate) fn build_session_prompt(

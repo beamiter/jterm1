@@ -65,6 +65,8 @@ pub(crate) enum Action {
     /// Open the palette focused on parameterised command templates
     /// ("workflows", `:` prefix). Ctrl+Shift+Y by default.
     OpenWorkflows,
+    /// Open the multi-turn agent panel (Warp-style). Ctrl+Shift+G by default.
+    OpenAgent,
 }
 
 impl Action {
@@ -134,6 +136,7 @@ impl Action {
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::OpenAiPanel => "Open AI panel",
             Action::OpenWorkflows => "Open workflows",
+            Action::OpenAgent => "Open AI agent",
         }
     }
 
@@ -192,6 +195,7 @@ impl Action {
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
             Action::OpenAiPanel => Some("open_ai_panel"),
             Action::OpenWorkflows => Some("open_workflows"),
+            Action::OpenAgent => Some("open_agent"),
         }
     }
 
@@ -248,6 +252,7 @@ impl Action {
             Action::ToggleDebugDashboard,
             Action::OpenAiPanel,
             Action::OpenWorkflows,
+            Action::OpenAgent,
         ]
     }
 }
@@ -488,6 +493,7 @@ impl KeybindingMap {
         bind("Ctrl+Shift+Down", Action::FocusPaneDown);
         bind("Ctrl+Shift+A", Action::OpenAiPanel);
         bind("Ctrl+Shift+Y", Action::OpenWorkflows);
+        bind("Ctrl+Shift+G", Action::OpenAgent);
 
         KeybindingMap { bindings }
     }

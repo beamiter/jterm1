@@ -357,6 +357,17 @@ pub enum VteOutput {
     /// Remote shell announced its session id via OSC 7770. Carries the id so
     /// the parent app can store it on the tab's RemoteConn for resume-on-reconnect.
     RemoteSessionId(String),
+    /// A finished block, with the full reconstructed command + exit + a
+    /// captured-output sample. Drives agent-mode's run-observe loop. Emitted
+    /// by BlockTerminal only (the plain VTE wrapper has no block concept).
+    BlockFinished {
+        command: String,
+        exit_code: i32,
+        /// Bytes sampled head+tail by the caller to a small bound — the
+        /// agent already truncates to its own cap, but block.rs trims first
+        /// so we don't ship 256 KB across a relm4 channel.
+        output_sample: String,
+    },
 }
 
 pub struct VteTerminal {

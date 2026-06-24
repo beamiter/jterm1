@@ -193,6 +193,15 @@ pub struct Config {
     /// network call still only fires on an explicit user click — this just
     /// removes the entry points.
     pub(crate) ai_enabled: bool,
+    /// Show the agent-mode entry point (`Ctrl+Shift+G` / palette). Default
+    /// on, but suppressed when `ai_enabled` is false. Independent toggle so
+    /// users who like the per-block AI helpers but find agent mode too
+    /// risky can disable the multi-turn loop without losing the rest.
+    pub(crate) agent_enabled: bool,
+    /// Hard cap on assistant turns per agent session. Once reached the
+    /// session is sealed and the user must start a new one — this is a
+    /// runaway-loop safety net, not a usability lever.
+    pub(crate) agent_max_turns: u32,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
 }
@@ -395,6 +404,8 @@ struct FileConfig {
     editor_input: Option<bool>,
     allow_remote_clipboard_write: Option<bool>,
     ai_enabled: Option<bool>,
+    agent_enabled: Option<bool>,
+    agent_max_turns: Option<u32>,
     remote_hosts: Vec<RemoteHost>,
 }
 
@@ -442,6 +453,11 @@ fn load_file_config() -> FileConfig {
         editor_input: table.get("editor_input").and_then(|v| v.as_bool()),
         allow_remote_clipboard_write: table.get("allow_remote_clipboard_write").and_then(|v| v.as_bool()),
         ai_enabled: table.get("ai_enabled").and_then(|v| v.as_bool()),
+        agent_enabled: table.get("agent_enabled").and_then(|v| v.as_bool()),
+        agent_max_turns: table
+            .get("agent_max_turns")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u32),
         remote_hosts,
     }
 }
@@ -636,6 +652,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         editor_input: fc.editor_input.unwrap_or(true),
         allow_remote_clipboard_write: fc.allow_remote_clipboard_write.unwrap_or(false),
         ai_enabled: fc.ai_enabled.unwrap_or(true),
+        agent_enabled: fc.agent_enabled.unwrap_or(true),
+        agent_max_turns: fc.agent_max_turns.unwrap_or(20).max(1),
         remote_hosts: fc.remote_hosts,
     };
 
