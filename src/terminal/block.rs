@@ -314,6 +314,17 @@ struct Ctx {
     /// blocks. Once exceeded, the oldest non-pinned block's `raw_output` is
     /// dropped (theme re-parse for that block then falls back to plain text).
     raw_output_bytes: Cell<usize>,
+    /// Kitty graphics APC assembler — accumulates multi-chunk image uploads
+    /// from the current command. Reset between blocks so a partially-uploaded
+    /// image from a crashed shell doesn't leak into the next command.
+    kitty_assembler: RefCell<super::kitty_graphics::Assembler>,
+    /// Completed kitty-graphics textures attached to the active command,
+    /// rendered into the block widget at finalize_block. Bytes here are
+    /// loosely capped via `kitty_pending_bytes` to bound RSS.
+    pending_images: RefCell<Vec<gtk::gdk::Texture>>,
+    /// Approximate decoded-bytes total of `pending_images`; further images
+    /// are dropped once this exceeds `MAX_PENDING_BYTES_PER_BLOCK`.
+    kitty_pending_bytes: Cell<usize>,
 }
 
 /// Bounded head retained verbatim for a command's captured output.
@@ -585,6 +596,9 @@ impl Component for BlockTerminal {
             height_dirty: Cell::new(false),
             sync_output: Cell::new(false),
             raw_output_bytes: Cell::new(0),
+            kitty_assembler: RefCell::new(super::kitty_graphics::Assembler::new()),
+            pending_images: RefCell::new(Vec::new()),
+            kitty_pending_bytes: Cell::new(0),
         });
 
         // `changed` fires during the viewport's size-allocate, after layout, so
@@ -1934,16 +1948,32 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             }
         }
         ParserEvent::ApcSequence(payload) => {
-            // APC (`\e_ … \e\\`) is used by Kitty graphics and a few other
-            // protocols. VTE currently consumes APC silently in its string
-            // state machine — feeding it through is a no-op visually today,
-            // but stays correct if/when a future VTE adds APC handling, and
-            // avoids the byte-leak risk of dropping it on a parser change.
-            let mut wrapped = Vec::with_capacity(payload.len() + 4);
-            wrapped.extend_from_slice(b"\x1b_");
-            wrapped.extend_from_slice(&payload);
-            wrapped.extend_from_slice(b"\x1b\\");
-            ctx.active_vte.feed(&wrapped);
+            // APC G — kitty graphics. libvte does not implement this protocol,
+            // so we MUST strip these bytes here rather than forwarding: feeding
+            // them would either leave a stale APC pending in VTE's string state
+            // machine or, on a future VTE update, paint corrupted glyphs.
+            // Other APC payloads are still consumed silently (today's libvte
+            // behaviour) so any non-graphics use is a visual no-op.
+            if payload.first() == Some(&b'G') {
+                use super::kitty_graphics::{Outcome, MAX_PENDING_BYTES_PER_BLOCK};
+                let outcome = ctx.kitty_assembler.borrow_mut().feed(&payload);
+                if let Outcome::Complete(tex) = outcome {
+                    // Rough memory bound: width*height*4 (bytes per RGBA pixel).
+                    let approx = (tex.width() as usize)
+                        .saturating_mul(tex.height() as usize)
+                        .saturating_mul(4);
+                    let used = ctx.kitty_pending_bytes.get();
+                    if used + approx <= MAX_PENDING_BYTES_PER_BLOCK {
+                        ctx.kitty_pending_bytes.set(used + approx);
+                        ctx.pending_images.borrow_mut().push(tex);
+                    } else {
+                        log::warn!(
+                            "kitty graphics: per-block image budget exhausted ({} + {} > {}), dropping",
+                            used, approx, MAX_PENDING_BYTES_PER_BLOCK
+                        );
+                    }
+                }
+            }
         }
         // ── Request/response protocols ────────────────────────────────────────
         // The active VTE in block mode has no PTY to write a reply to, so any
@@ -2816,9 +2846,13 @@ fn finalize_block(ctx: &Rc<Ctx>) {
     let id = ctx.next_block_id.get();
     ctx.next_block_id.set(id + 1);
 
+    // Drain any kitty-graphics images that arrived during this command so the
+    // finished block widget can append them below its text output.
+    let images: Vec<gtk::gdk::Texture> = ctx.pending_images.borrow_mut().drain(..).collect();
+    ctx.kitty_pending_bytes.set(0);
     let meta = build_finished_block(
         ctx, id, &prompt, &command, &output, exit_code, &cwd, git_branch.as_deref(),
-        duration, end_time_ms, false,
+        duration, end_time_ms, false, &images,
     );
     let widget = meta.widget.clone();
     let duration_ms = meta.duration_ms;
@@ -3088,6 +3122,7 @@ fn load_block_history(ctx: &Rc<Ctx>) {
             duration,
             rec.end_time_ms,
             rec.pinned,
+            &[],
         );
         let widget = meta.widget.clone();
         ctx.block_list.append(&widget);
@@ -3326,6 +3361,12 @@ fn reset_active(ctx: &Rc<Ctx>) {
     ctx.duration.set(None);
     ctx.end_time_ms.set(None);
     ctx.start_time.set(None);
+    // Drop any half-uploaded kitty graphics that didn't reach a final chunk,
+    // and discard images that finalize_block left behind (defensive — it
+    // normally drains pending_images itself).
+    ctx.kitty_assembler.borrow_mut().reset();
+    ctx.pending_images.borrow_mut().clear();
+    ctx.kitty_pending_bytes.set(0);
 }
 
 // ─── Finished-block widget ──────────────────────────────────────────────────
@@ -3343,6 +3384,7 @@ fn build_finished_block(
     duration: Option<Duration>,
     end_time_ms: Option<u64>,
     pinned: bool,
+    images: &[gtk::gdk::Texture],
 ) -> FinishedBlock {
     let outer = gtk::Box::new(Orientation::Vertical, 0);
     outer.add_css_class("block-finished");
@@ -3652,11 +3694,36 @@ fn build_finished_block(
         output_view = Some(view);
     }
 
+    // Kitty graphics: append each captured texture as a Picture under the
+    // text output. Pictures preserve aspect ratio inside a max-height bound
+    // so a tall plot doesn't push the next block off-screen. Wrapped in one
+    // box so collapse hides them together with the text output.
+    let images_box: Option<gtk::Box> = if !images.is_empty() {
+        let ib = gtk::Box::new(Orientation::Vertical, 4);
+        ib.add_css_class("block-images");
+        ib.set_visible(!collapsed.get());
+        for tex in images {
+            let pic = gtk::Picture::for_paintable(tex);
+            pic.set_can_shrink(true);
+            pic.set_content_fit(gtk::ContentFit::Contain);
+            pic.set_halign(gtk::Align::Start);
+            // Cap displayed height so plots/screenshots stay within ~25 rows
+            // of block real estate; the user can scroll the block list normally.
+            pic.set_size_request(-1, (tex.height().min(600)).max(64));
+            ib.append(&pic);
+        }
+        outer.append(&ib);
+        Some(ib)
+    } else {
+        None
+    };
+
     // Wire the collapse chevron to toggle the output area. Blocks that start
     // collapsed (no output / lazy) render their content on first expand.
     {
         let output_view = output_view.clone();
         let show_more = show_more.clone();
+        let images_box = images_box.clone();
         let collapsed = collapsed.clone();
         let rendered = rendered.clone();
         let truncated = truncated.clone();
@@ -3686,6 +3753,9 @@ fn build_finished_block(
             }
             if let Some(b) = &show_more {
                 b.set_visible(!now_collapsed && do_truncate_c);
+            }
+            if let Some(ib) = &images_box {
+                ib.set_visible(!now_collapsed);
             }
             btn.set_label(if now_collapsed { "\u{f054}" } else { "\u{f078}" });
         });
