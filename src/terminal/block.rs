@@ -82,8 +82,14 @@ struct FinishedBlock {
     /// Truncated head, parallel to `full_runs`. Also swapped on theme change.
     head_runs: Rc<RefCell<Vec<AnsiTextRun>>>,
     /// Raw ANSI output (as fed to `ansi::ansi_text_runs`), kept so a theme
-    /// change can re-parse with the new palette.
-    raw_output: Rc<String>,
+    /// change can re-parse with the new palette. `None` for blocks whose raw
+    /// output has been evicted to honour `RAW_OUTPUT_TOTAL_CAP`; those blocks
+    /// just won't re-tint on the next theme swap (the rendered runs stay).
+    raw_output: Option<Rc<String>>,
+    /// Pre-built haystack for the cross-block search bar: `command + '\n' +
+    /// plain_output`. Built once at finalize so each keystroke in the search
+    /// entry doesn't allocate `format!` over every finished block.
+    search_corpus: String,
     /// Error-line highlight background, derived from the palette red. RefCell
     /// so it can be refreshed when the theme changes.
     err_bg: Rc<RefCell<String>>,
@@ -287,12 +293,41 @@ struct Ctx {
     /// count and misalign columns the program had already painted.
     captured_cols: Cell<i64>,
     captured_rows: Cell<i64>,
+    /// Resumable visual-row count of `out_buf`: `(rows, col, consumed)` valid
+    /// only when `out_row_cols` matches the active column count. `consumed` is
+    /// the byte prefix of `out_buf` already accounted for; the next tick re-
+    /// scans only `out_buf[consumed..]`. Reset on column change, command start,
+    /// or `out_buf` clear.
+    out_row_count: Cell<i64>,
+    out_row_col: Cell<i64>,
+    out_row_consumed: Cell<usize>,
+    out_row_cols: Cell<i64>,
+    /// True when an `update_active_height` is already scheduled on the GLib
+    /// frame clock. Burst chunks coalesce into one resize per frame.
+    height_dirty: Cell<bool>,
+    /// True while the application is inside a synchronized-output window
+    /// (`CSI ?2026h`). The PTY reader still feeds bytes to VTE, but the per-
+    /// chunk resize/autoscroll tick is suppressed so the user sees one painted
+    /// frame at `?2026l` instead of a half-drawn intermediate one.
+    sync_output: Cell<bool>,
+    /// Running cap for the sum of `raw_output` bytes retained across finished
+    /// blocks. Once exceeded, the oldest non-pinned block's `raw_output` is
+    /// dropped (theme re-parse for that block then falls back to plain text).
+    raw_output_bytes: Cell<usize>,
 }
 
 /// Bounded head retained verbatim for a command's captured output.
 const OUTPUT_HEAD_CAP: usize = 256 * 1024;
 /// Bounded rolling tail retained for a command's captured output.
 const OUTPUT_TAIL_CAP: usize = 256 * 1024;
+/// Sum of `raw_output` bytes kept across all finished blocks. Past this cap,
+/// the oldest blocks' `raw_output` is dropped (rendered runs stay; only the
+/// ability to re-tint that specific block on a theme change is lost). Sized so
+/// a 64-card history of capped outputs still fits.
+const RAW_OUTPUT_TOTAL_CAP: usize = 64 * 1024 * 1024;
+/// Soft ceiling for visual rows the active-card sizer will count to. Keeps
+/// `scan_wrapped_rows` from running away on pathological output.
+const HEIGHT_ROW_CAP: i64 = 10_000;
 // ─── Component ──────────────────────────────────────────────────────────────
 
 pub struct BlockTerminal {
@@ -543,6 +578,13 @@ impl Component for BlockTerminal {
             drag_cross_block: Cell::new(false),
             captured_cols: Cell::new(0),
             captured_rows: Cell::new(0),
+            out_row_count: Cell::new(0),
+            out_row_col: Cell::new(0),
+            out_row_consumed: Cell::new(0),
+            out_row_cols: Cell::new(0),
+            height_dirty: Cell::new(false),
+            sync_output: Cell::new(false),
+            raw_output_bytes: Cell::new(0),
         });
 
         // `changed` fires during the viewport's size-allocate, after layout, so
@@ -1187,7 +1229,13 @@ impl Component for BlockTerminal {
                 // swap the cached run vectors in place.
                 let new_err_bg = error_highlight_bg(&self.ctx);
                 for block in self.ctx.finished.borrow().iter() {
-                    let new_full = ansi::ansi_text_runs(&block.raw_output, &palette);
+                    let Some(raw) = block.raw_output.as_ref() else {
+                        // Raw output was evicted to honour the byte cap. Leave
+                        // the existing rendered runs alone; they were correct
+                        // for the prior palette and remain readable here.
+                        continue;
+                    };
+                    let new_full = ansi::ansi_text_runs(raw, &palette);
                     let total = ansi::count_lines(&new_full);
                     let do_trunc = truncate_lines > 0 && total > truncate_lines;
                     let new_head = if do_trunc {
@@ -1291,9 +1339,9 @@ fn search_set(ctx: &Rc<Ctx>, query: &str, use_regex: bool) {
     let needle = query.to_lowercase();
     let mut matches = Vec::new();
     for (idx, block) in ctx.finished.borrow().iter().enumerate() {
-        let hay = format!("{}\n{}", block.command, block.plain_output);
+        let hay = block.search_corpus.as_str();
         let hit = match &re {
-            Some(re) => re.is_match(&hay),
+            Some(re) => re.is_match(hay),
             None => hay.to_lowercase().contains(&needle),
         };
         if hit {
@@ -1621,8 +1669,31 @@ fn handle_data(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, data: &[u
     for ev in events {
         handle_event(ctx, sender, ev);
     }
-    update_active_height(ctx);
-    autoscroll(ctx);
+    // Per-chunk resize + autoscroll would re-scan up to OUTPUT_HEAD_CAP bytes
+    // and re-read CSS chrome from the style context on every PTY read, which
+    // dominates streaming-output cost. Coalesce into one tick per GLib frame.
+    // Synchronized-output windows (`CSI ?2026h`) additionally suppress the
+    // resize until `?2026l` so apps that batch frames don't get a half-painted
+    // intermediate.
+    schedule_height_update(ctx);
+}
+
+/// Mark the active card's height as stale and arm a single frame-clock tick to
+/// re-clamp it (plus the bottom-pin autoscroll). Re-entrant: subsequent calls
+/// in the same frame are no-ops until the tick fires.
+fn schedule_height_update(ctx: &Rc<Ctx>) {
+    if ctx.sync_output.get() {
+        return;
+    }
+    if ctx.height_dirty.replace(true) {
+        return;
+    }
+    let ctx2 = ctx.clone();
+    glib::idle_add_local_once(move || {
+        ctx2.height_dirty.set(false);
+        update_active_height(&ctx2);
+        autoscroll(&ctx2);
+    });
 }
 
 fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: ParserEvent) {
@@ -1660,6 +1731,23 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                     } else if ctx.tui_promoted.get() && contains_seq(&bytes, b"\x1b[?1l") {
                         ctx.tui_promoted.set(false);
                         exit_fullscreen(ctx);
+                    }
+                    // DEC mode 2026 — synchronized output. Apps wrap multi-CSI
+                    // redraws in `?2026h ... ?2026l` to ask the terminal to
+                    // hold off painting until the trailing `l`. We honour that
+                    // by gating the per-chunk resize/autoscroll tick (which
+                    // would otherwise re-clamp the active card mid-frame and
+                    // expose the half-drawn intermediate). VTE itself still
+                    // sees the bytes via the spliced master PTY.
+                    if contains_seq(&bytes, b"\x1b[?2026h") {
+                        ctx.sync_output.set(true);
+                    }
+                    let leaving_sync = contains_seq(&bytes, b"\x1b[?2026l");
+                    if leaving_sync && ctx.sync_output.replace(false) {
+                        // The window closed in this chunk — schedule the
+                        // deferred tick so the final frame's height + scroll
+                        // pin fire once.
+                        schedule_height_update(ctx);
                     }
                     let _ = sender.output(VteOutput::Activity);
                 }
@@ -1699,9 +1787,25 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                 .trim()
                 .to_string();
             *ctx.prompt.borrow_mut() = prompt_line;
-            ctx.prompt_buf.borrow_mut().clear();
-            ctx.cmd_buf.borrow_mut().clear();
-            ctx.typed_cmd.borrow_mut().clear();
+            // Reset *and* release the peak capacity for the per-command buffers:
+            // a long fish/zsh command line can grow `cmd_buf`/`typed_cmd` into
+            // tens of KB which `clear()` would retain. Allocating fresh per
+            // command is cheap and bounds steady-state RSS in a long session.
+            {
+                let mut pb = ctx.prompt_buf.borrow_mut();
+                pb.clear();
+                pb.shrink_to(4096);
+            }
+            {
+                let mut cb = ctx.cmd_buf.borrow_mut();
+                cb.clear();
+                cb.shrink_to(4096);
+            }
+            {
+                let mut tc = ctx.typed_cmd.borrow_mut();
+                tc.clear();
+                tc.shrink_to(4096);
+            }
             ctx.typed_unreliable.set(false);
             ctx.state.set(BlockState::AwaitingCommand);
         }
@@ -1709,6 +1813,7 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             ctx.out_buf.borrow_mut().clear();
             ctx.out_tail.borrow_mut().clear();
             ctx.out_total.set(0);
+            invalidate_out_row_cache(ctx);
             ctx.start_time.set(Some(Instant::now()));
             ctx.has_command.set(true);
             ctx.state.set(BlockState::CollectingOutput);
@@ -1915,8 +2020,12 @@ fn append_captured(ctx: &Rc<Ctx>, bytes: &[u8]) {
         tail.extend(bytes[bytes.len() - OUTPUT_TAIL_CAP..].iter().copied());
     } else {
         tail.extend(bytes.iter().copied());
-        while tail.len() > OUTPUT_TAIL_CAP {
-            tail.pop_front();
+        if tail.len() > OUTPUT_TAIL_CAP {
+            // VecDeque::drain is O(n) on the removed range, vs. pop_front in a
+            // tight loop which moves the head index byte-by-byte and inhibits
+            // the optimizer's batch path.
+            let excess = tail.len() - OUTPUT_TAIL_CAP;
+            tail.drain(..excess);
         }
     }
 }
@@ -1976,18 +2085,24 @@ fn captured_parts(ctx: &Rc<Ctx>) -> CapturedParts {
 /// case the raw stream is fine to display as-is).
 fn scrape_command_output(ctx: &Rc<Ctx>) -> Option<String> {
     use vte4::TerminalExt;
-    let parts = captured_parts(ctx);
-    let needs_grid = match &parts {
-        CapturedParts::Whole(b) => !b.is_empty() && super::grid::has_cursor_positioning(b),
-        CapturedParts::Split { head, tail, .. } => {
-            !(head.is_empty() && tail.is_empty())
-                && (super::grid::has_cursor_positioning(head)
-                    || super::grid::has_cursor_positioning(tail))
+    // Cheap predicate first: borrow head/tail and scan for cursor escapes
+    // without materializing the (up to 512 KB) `CapturedParts` clone unless
+    // the grid emulator actually needs to run.
+    {
+        let head = ctx.out_buf.borrow();
+        let tail = ctx.out_tail.borrow();
+        let head_has = !head.is_empty() && super::grid::has_cursor_positioning(&head);
+        // VecDeque slices are not necessarily contiguous; check both segments.
+        let tail_has = {
+            let (a, b) = tail.as_slices();
+            (!a.is_empty() && super::grid::has_cursor_positioning(a))
+                || (!b.is_empty() && super::grid::has_cursor_positioning(b))
+        };
+        if !head_has && !tail_has {
+            return None;
         }
-    };
-    if !needs_grid {
-        return None;
     }
+    let parts = captured_parts(ctx);
     // Use the geometry captured at CommandStart so absolute-addressing
     // sequences (`tput cup`) replay against the same column count the child
     // actually saw. Falls back to the live size if no command was active.
@@ -2072,72 +2187,111 @@ fn active_card_vchrome_px(holder: &gtk::Box) -> f64 {
 }
 
 /// Count the number of visual rows `bytes` occupy when rendered at `cols`
-/// columns, counting line wraps. ANSI escape sequences are skipped and
-/// UTF-8 codepoints are decoded so wide characters (CJK / emoji / fullwidth
-/// punctuation) advance by 2 columns. Scanning stops once `cap` rows are
-/// reached, bounding the cost for huge output.
+/// columns, counting line wraps. Convenience wrapper around the resumable
+/// `scan_wrapped_rows` for callers (typed_cmd) that always count from a clean
+/// state. ANSI escape sequences are skipped and UTF-8 codepoints decoded so
+/// wide characters advance by 2 columns. Bounded by `cap` rows.
 fn count_wrapped_rows(bytes: &[u8], cols: i64, cap: i64) -> i64 {
-    use unicode_width::UnicodeWidthChar;
+    let (rows, col, _) = scan_wrapped_rows(bytes, cols, 0, 0, cap);
+    rows + if col > 0 { 1 } else { 0 }
+}
+
+/// Resumable row scanner. Returns `(rows, col, consumed_bytes)` advancing from
+/// `(rows_in, col_in)`. `consumed_bytes` is the byte prefix of `bytes` whose
+/// scan completed cleanly — if the buffer ends mid-escape we report fewer than
+/// `bytes.len()` so the caller's next pass replays the unterminated escape
+/// against the (now-extended) buffer. Bounded by `cap` rows (returns early
+/// once exceeded; further appends should be considered unreliable).
+fn scan_wrapped_rows(
+    bytes: &[u8],
+    cols: i64,
+    rows_in: i64,
+    col_in: i64,
+    cap: i64,
+) -> (i64, i64, usize) {
     let cols = cols.max(1);
-    let mut rows: i64 = 0;
-    let mut col: i64 = 0;
-    let s = std::str::from_utf8(bytes)
-        .map(std::borrow::Cow::Borrowed)
-        .unwrap_or_else(|_| String::from_utf8_lossy(bytes));
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
+    let s = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        // Invalid UTF-8 → disable the resumption optimisation by reporting
+        // `consumed == bytes.len()` after a non-resumable scan against the
+        // lossy form. Output streams are UTF-8 in practice; this path is
+        // strictly a safety fallback.
+        Err(_) => {
+            let lossy = String::from_utf8_lossy(bytes);
+            let (r, c, _) = scan_wrapped_rows_inner(&lossy, cols, rows_in, col_in, cap);
+            return (r, c, bytes.len());
+        }
+    };
+    scan_wrapped_rows_inner(s, cols, rows_in, col_in, cap)
+}
+
+fn scan_wrapped_rows_inner(
+    s: &str,
+    cols: i64,
+    rows_in: i64,
+    col_in: i64,
+    cap: i64,
+) -> (i64, i64, usize) {
+    use unicode_width::UnicodeWidthChar;
+    let mut rows = rows_in;
+    let mut col = col_in;
+    let bytes_len = s.len();
+    let mut chars = s.char_indices();
+    while let Some((idx, c)) = chars.next() {
         if c == '\x1b' {
-            // Escape skip. The previous version used `is_ascii_alphabetic` as
-            // the CSI final-byte test, which misses the legal finals `@` `` ` ``
-            // `{|}~` and never recognized OSC at all — heavy escape output
-            // (vim/mc/htop) then mis-counted printable rows and the active
-            // card came out a row or two off.
-            match chars.next() {
-                Some('[') => {
-                    // CSI: final byte is in 0x40..=0x7e (`@A..Z[\]^_`a..z{|}~`).
-                    for nc in chars.by_ref() {
+            // Try to consume the entire escape sequence. If the buffer runs
+            // out before a terminator, the caller's next pass replays from the
+            // `\x1b` (consumed = idx).
+            let finished = match chars.next() {
+                Some((_, '[')) => {
+                    // CSI: final byte is in 0x40..=0x7e.
+                    let mut done = false;
+                    for (_, nc) in chars.by_ref() {
                         let n = nc as u32;
                         if (0x40..=0x7e).contains(&n) {
+                            done = true;
                             break;
                         }
                     }
+                    done
                 }
-                Some(']') => {
-                    // OSC: skip until BEL or ESC \.
-                    while let Some(nc) = chars.next() {
+                Some((_, ']')) => {
+                    // OSC: terminate on BEL or ST (ESC \).
+                    let mut done = false;
+                    while let Some((_, nc)) = chars.next() {
                         if nc == '\x07' {
+                            done = true;
                             break;
                         }
                         if nc == '\x1b' {
-                            // Eat the following `\` (ST) — if it's anything
-                            // else, treat it as the start of a new escape and
-                            // let the outer loop re-handle it on the next iter.
-                            if let Some(after) = chars.next() {
-                                if after != '\\' {
-                                    // Re-enter escape handling for this byte.
-                                    // Cheapest way: leave it consumed (worst
-                                    // case we mis-count a single row).
-                                }
+                            if chars.next().map(|(_, ch)| ch == '\\').unwrap_or(false) {
+                                done = true;
                             }
                             break;
                         }
                     }
+                    done
                 }
-                Some('_' | 'P' | '^') => {
-                    // APC / DCS / PM: consume until ST.
-                    while let Some(nc) = chars.next() {
+                Some((_, '_')) | Some((_, 'P')) | Some((_, '^')) => {
+                    let mut done = false;
+                    while let Some((_, nc)) = chars.next() {
                         if nc == '\x07' {
+                            done = true;
                             break;
                         }
                         if nc == '\x1b' {
                             let _ = chars.next();
+                            done = true;
                             break;
                         }
                     }
+                    done
                 }
-                // ESC followed by a single byte (charset selector etc.) — drop both.
-                Some(_) => {}
-                None => break,
+                Some(_) => true, // ESC + 1 byte (charset / single-shot)
+                None => false,
+            };
+            if !finished {
+                return (rows, col, idx);
             }
             continue;
         }
@@ -2147,8 +2301,8 @@ fn count_wrapped_rows(bytes: &[u8], cols: i64, cap: i64) -> i64 {
                 col = 0;
             }
             '\r' => col = 0,
-            c if (c as u32) >= 0x20 => {
-                let w = UnicodeWidthChar::width(c).unwrap_or(1) as i64;
+            ch if (ch as u32) >= 0x20 => {
+                let w = UnicodeWidthChar::width(ch).unwrap_or(1) as i64;
                 if w == 0 {
                     continue;
                 }
@@ -2165,10 +2319,62 @@ fn count_wrapped_rows(bytes: &[u8], cols: i64, cap: i64) -> i64 {
             _ => {}
         }
         if rows >= cap {
-            return cap;
+            // Return the byte position just past the current char.
+            let consumed = chars.clone().next().map(|(i, _)| i).unwrap_or(bytes_len);
+            return (cap, 0, consumed);
         }
     }
-    rows + if col > 0 { 1 } else { 0 }
+    (rows, col, bytes_len)
+}
+
+/// Visual-row count of `out_buf`, served from the resumable cache so a streaming
+/// command doesn't re-scan the entire (capped at OUTPUT_HEAD_CAP = 256 KB)
+/// buffer on every frame. The cache is invalidated on column change, command
+/// boundary, or `out_buf` clear.
+fn out_buf_visual_rows(ctx: &Rc<Ctx>, cols: i64, cap: i64) -> i64 {
+    let buf = ctx.out_buf.borrow();
+    // Column change → cache invalid; recount fully against the new width.
+    if ctx.out_row_cols.get() != cols {
+        let (rows, col, consumed) = scan_wrapped_rows(&buf, cols, 0, 0, cap);
+        ctx.out_row_cols.set(cols);
+        ctx.out_row_count.set(rows);
+        ctx.out_row_col.set(col);
+        ctx.out_row_consumed.set(consumed);
+        return rows + if col > 0 { 1 } else { 0 };
+    }
+    let consumed = ctx.out_row_consumed.get();
+    // Buffer was reset (clear / new command) under us — refresh from scratch.
+    if consumed > buf.len() {
+        let (rows, col, consumed) = scan_wrapped_rows(&buf, cols, 0, 0, cap);
+        ctx.out_row_count.set(rows);
+        ctx.out_row_col.set(col);
+        ctx.out_row_consumed.set(consumed);
+        return rows + if col > 0 { 1 } else { 0 };
+    }
+    if consumed < buf.len() {
+        let (rows, col, new_consumed) = scan_wrapped_rows(
+            &buf[consumed..],
+            cols,
+            ctx.out_row_count.get(),
+            ctx.out_row_col.get(),
+            cap,
+        );
+        ctx.out_row_count.set(rows);
+        ctx.out_row_col.set(col);
+        ctx.out_row_consumed.set(consumed + new_consumed);
+    }
+    ctx.out_row_count.get() + if ctx.out_row_col.get() > 0 { 1 } else { 0 }
+}
+
+/// Reset the cached row count — called on command start (out_buf cleared) and
+/// alt-screen exit (out_buf rewritten with a final-frame snapshot).
+fn invalidate_out_row_cache(ctx: &Rc<Ctx>) {
+    ctx.out_row_count.set(0);
+    ctx.out_row_col.set(0);
+    ctx.out_row_consumed.set(0);
+    // Force a cols-mismatch on the next read so a single shared invalidation
+    // path also re-checks the column count.
+    ctx.out_row_cols.set(0);
 }
 
 /// Resize the active card to fit its current content, clamped between a compact
@@ -2208,7 +2414,7 @@ fn update_active_height(ctx: &Rc<Ctx>) {
         let cmd_rows = count_wrapped_rows(ctx.typed_cmd.borrow().as_bytes(), cols, max_rows);
         let content = match ctx.state.get() {
             BlockState::CollectingOutput | BlockState::PostCommand => {
-                1 + cmd_rows + count_wrapped_rows(&ctx.out_buf.borrow(), cols, max_rows)
+                1 + cmd_rows + out_buf_visual_rows(ctx, cols, max_rows)
             }
             _ => 1 + cmd_rows,
         };
@@ -2633,9 +2839,44 @@ fn finalize_block(ctx: &Rc<Ctx>) {
         show_toast(ctx, new_idx, &command, duration, exit_code == 0);
     }
 
-    enforce_max_blocks(ctx);
-    rebuild_minimap(ctx);
+    let evicted = enforce_max_blocks(ctx);
+    enforce_raw_output_cap(ctx);
+    // After eviction the displayed index range shifted, so click closures
+    // captured by tick widgets are stale → full rebuild. Steady-state (no
+    // eviction) is a single-tick append.
+    if evicted {
+        rebuild_minimap(ctx);
+    } else {
+        append_minimap_tick(ctx);
+    }
     reset_active(ctx);
+}
+
+/// Drop `raw_output` from the oldest finished blocks until the total retained
+/// bytes fits `RAW_OUTPUT_TOTAL_CAP`. Eviction is "drop the raw bytes only",
+/// not "remove the block" — the rendered runs already shown to the user stay
+/// intact; only a future palette swap can no longer re-render that block.
+fn enforce_raw_output_cap(ctx: &Rc<Ctx>) {
+    let total: usize = ctx
+        .finished
+        .borrow()
+        .iter()
+        .filter_map(|b| b.raw_output.as_ref().map(|r| r.len()))
+        .sum();
+    ctx.raw_output_bytes.set(total);
+    if total <= RAW_OUTPUT_TOTAL_CAP {
+        return;
+    }
+    let mut remaining = total;
+    for block in ctx.finished.borrow_mut().iter_mut() {
+        if remaining <= RAW_OUTPUT_TOTAL_CAP {
+            break;
+        }
+        if let Some(raw) = block.raw_output.take() {
+            remaining = remaining.saturating_sub(raw.len());
+        }
+    }
+    ctx.raw_output_bytes.set(remaining);
 }
 
 /// One persisted finished block. Stores raw (ANSI-bearing) output so a reloaded
@@ -2890,10 +3131,10 @@ fn apply_visibility(ctx: &Rc<Ctx>) {
 
 /// Enforce `max_visible_blocks`: evict the oldest non-pinned finished blocks once
 /// the live count exceeds the cap (0 = unlimited). History on disk is unaffected.
-fn enforce_max_blocks(ctx: &Rc<Ctx>) {
+fn enforce_max_blocks(ctx: &Rc<Ctx>) -> bool {
     let max = ctx.config.borrow().max_visible_blocks as usize;
     if max == 0 {
-        return;
+        return false;
     }
     let mut evicted = false;
     loop {
@@ -2912,6 +3153,7 @@ fn enforce_max_blocks(ctx: &Rc<Ctx>) {
         ctx.search_matches.borrow_mut().clear();
         ctx.search_idx.set(0);
     }
+    evicted
 }
 
 /// Set the active filter and toggle each finished block's visibility.
@@ -3115,6 +3357,12 @@ fn build_finished_block(
     let runs_vec = ansi::ansi_text_runs(output, &palette);
     let plain_output: String = runs_vec.iter().map(|r| r.text.as_str()).collect();
     let runs: Rc<RefCell<Vec<AnsiTextRun>>> = Rc::new(RefCell::new(runs_vec));
+    // Pre-build the search haystack so every keystroke in the search entry
+    // doesn't re-format `cmd \n plain_output` across all blocks.
+    let mut search_corpus = String::with_capacity(command.len() + plain_output.len() + 1);
+    search_corpus.push_str(command);
+    search_corpus.push('\n');
+    search_corpus.push_str(&plain_output);
 
     // Detect error-line offsets (only meaningful for failed commands).
     let error_offsets = if exit_code != 0 {
@@ -3461,7 +3709,8 @@ fn build_finished_block(
         show_more,
         full_runs: runs,
         head_runs,
-        raw_output,
+        raw_output: Some(raw_output),
+        search_corpus,
         err_bg,
         collapsed,
         truncated,
@@ -4183,6 +4432,11 @@ fn refresh_index_badges(ctx: &Rc<Ctx>) {
 
 /// Rebuild the right-edge minimap: one colored tick per visible block, clickable
 /// to jump. Hidden in fullscreen or when fewer than two blocks are visible.
+///
+/// This is the full-rebuild path used for filter / pin / delete / visibility
+/// changes. For the common case of "a new block just finished", prefer
+/// `append_minimap_tick` so we only spawn one extra GTK widget instead of
+/// recreating the whole strip.
 fn rebuild_minimap(ctx: &Rc<Ctx>) {
     while let Some(child) = ctx.minimap.first_child() {
         ctx.minimap.remove(&child);
@@ -4195,23 +4449,54 @@ fn rebuild_minimap(ctx: &Rc<Ctx>) {
     let finished = ctx.finished.borrow();
     for &idx in &visible {
         let Some(block) = finished.get(idx) else { continue };
-        let tick = gtk::Button::new();
-        tick.add_css_class("block-minimap-tick");
-        tick.add_css_class("flat");
-        if block.pinned {
-            tick.add_css_class("tick-pinned");
-        } else if block.exit_code == 0 {
-            tick.add_css_class("tick-ok");
-        } else {
-            tick.add_css_class("tick-bad");
-        }
-        let short: String = block.command.chars().take(60).collect();
-        tick.set_tooltip_text(Some(&short));
-        let ctx2 = ctx.clone();
-        tick.connect_clicked(move |_| scroll_to_block(&ctx2, idx));
+        let tick = build_minimap_tick(ctx, idx, block);
         ctx.minimap.append(&tick);
     }
     ctx.minimap.set_visible(true);
+}
+
+/// Append a single tick for `idx` — fast path for the post-finalize case. If
+/// the minimap would now flip from hidden→visible (we just crossed 2 blocks),
+/// fall back to the full rebuild so all ticks are created with consistent
+/// click closures.
+fn append_minimap_tick(ctx: &Rc<Ctx>) {
+    if ctx.fullscreen.get() {
+        return;
+    }
+    let visible = visible_indices(ctx);
+    if visible.len() < 2 {
+        ctx.minimap.set_visible(false);
+        return;
+    }
+    // Crossing the visibility threshold (was hidden, now should be shown) —
+    // full rebuild so we render *all* ticks, not just the newest.
+    if !ctx.minimap.is_visible() {
+        rebuild_minimap(ctx);
+        return;
+    }
+    let Some(&idx) = visible.last() else { return };
+    let finished = ctx.finished.borrow();
+    let Some(block) = finished.get(idx) else { return };
+    let tick = build_minimap_tick(ctx, idx, block);
+    ctx.minimap.append(&tick);
+}
+
+fn build_minimap_tick(ctx: &Rc<Ctx>, idx: usize, block: &FinishedBlock) -> gtk::Button {
+    let tick = gtk::Button::new();
+    tick.add_css_class("block-minimap-tick");
+    tick.add_css_class("flat");
+    if block.pinned {
+        tick.add_css_class("tick-pinned");
+    } else if block.exit_code == 0 {
+        tick.add_css_class("tick-ok");
+    } else {
+        tick.add_css_class("tick-bad");
+    }
+    let short: String = block.command.chars().take(60).collect();
+    tick.set_tooltip_text(Some(&short));
+    let ctx2 = ctx.clone();
+    tick.connect_clicked(move |_| scroll_to_block(&ctx2, idx));
+    tick
 }
 
 /// Briefly flash a just-finished block (green on success, red on failure) for

@@ -74,18 +74,77 @@ fn rgb(r: u8, g: u8, b: u8) -> RGBA {
     RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
 }
 
-fn parse_colon_color(sub_parts: &[&str], palette: &[RGBA; 16]) -> Option<RGBA> {
-    let mode = sub_parts.get(1).and_then(|s| s.parse::<u32>().ok())?;
+/// Iterator over `;`-separated SGR parameter chunks, with a leading private
+/// marker (`?`, `>`, `=`) stripped. Borrows from the input bytes so callers
+/// don't pay an allocation per CSI.
+pub(crate) struct SgrChunks<'a> {
+    rest: &'a [u8],
+    done: bool,
+}
+
+impl<'a> SgrChunks<'a> {
+    pub(crate) fn new(mut params: &'a [u8]) -> Self {
+        if matches!(params.first(), Some(&b'?') | Some(&b'>') | Some(&b'=')) {
+            params = &params[1..];
+        }
+        SgrChunks { rest: params, done: false }
+    }
+}
+
+impl<'a> Iterator for SgrChunks<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.done {
+            return None;
+        }
+        match memchr::memchr(b';', self.rest) {
+            Some(i) => {
+                let (head, tail) = self.rest.split_at(i);
+                self.rest = &tail[1..];
+                Some(head)
+            }
+            None => {
+                self.done = true;
+                Some(self.rest)
+            }
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn bytes_to_u32(bytes: &[u8]) -> u32 {
+    let mut acc: u32 = 0;
+    for &b in bytes {
+        if b.is_ascii_digit() {
+            acc = acc.saturating_mul(10).saturating_add((b - b'0') as u32);
+        } else {
+            return acc;
+        }
+    }
+    acc
+}
+
+#[inline]
+fn bytes_to_u8(bytes: &[u8]) -> Option<u8> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let v = bytes_to_u32(bytes);
+    if v <= 255 { Some(v as u8) } else { None }
+}
+
+fn parse_colon_color_bytes(sub_parts: &[&[u8]], palette: &[RGBA; 16]) -> Option<RGBA> {
+    let mode = bytes_to_u32(sub_parts.get(1)?);
     match mode {
         5 => {
-            let idx = sub_parts.get(2).and_then(|s| s.parse::<u8>().ok())?;
+            let idx = bytes_to_u8(sub_parts.get(2)?)?;
             let (r, g, b) = ansi256_to_rgb(idx, palette);
             Some(rgb(r, g, b))
         }
         2 => {
             let nums: Vec<u8> = sub_parts[2..]
                 .iter()
-                .filter_map(|s| s.parse::<u8>().ok())
+                .filter_map(|s| bytes_to_u8(s))
                 .collect();
             if nums.len() >= 3 {
                 Some(rgb(
@@ -101,15 +160,25 @@ fn parse_colon_color(sub_parts: &[&str], palette: &[RGBA; 16]) -> Option<RGBA> {
     }
 }
 
-pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: &[RGBA; 16]) {
+/// Parse SGR params from raw param bytes (semicolon-separated, with optional
+/// colon-delimited sub-parameters). Avoids the per-CSI `Vec<String>` and
+/// `String::parse::<u32>` round-trip the old `&[String]` signature forced.
+pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[u8], palette: &[RGBA; 16]) {
+    // Empty params == bare `\e[m` == reset.
+    let chunks: SgrChunks = SgrChunks::new(params);
+    let parts: Vec<&[u8]> = chunks.collect();
     let mut index = 0;
-    while index < params.len() {
-        if params[index].contains(':') {
-            let sub_parts: Vec<&str> = params[index].split(':').collect();
-            let base = sub_parts[0].parse::<u32>().unwrap_or(0);
+    while index < parts.len() {
+        let part = parts[index];
+        if part.contains(&b':') {
+            let sub_parts: Vec<&[u8]> = part.split(|&b| b == b':').collect();
+            let base = bytes_to_u32(sub_parts[0]);
             match base {
                 4 => {
-                    let sub = sub_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+                    let sub = sub_parts
+                        .get(1)
+                        .map(|s| bytes_to_u32(s))
+                        .unwrap_or(1);
                     style.underline_style = match sub {
                         0 => UnderlineStyle::None,
                         1 => UnderlineStyle::Single,
@@ -121,7 +190,7 @@ pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: 
                     };
                 }
                 38 | 48 | 58 => {
-                    if let Some(color) = parse_colon_color(&sub_parts, palette) {
+                    if let Some(color) = parse_colon_color_bytes(&sub_parts, palette) {
                         match base {
                             38 => style.foreground = Some(color),
                             48 => style.background = Some(color),
@@ -135,11 +204,7 @@ pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: 
             continue;
         }
 
-        let param = if params[index].is_empty() {
-            0
-        } else {
-            params[index].parse::<u32>().unwrap_or(0)
-        };
+        let param = if part.is_empty() { 0 } else { bytes_to_u32(part) };
 
         match param {
             0 => {
@@ -188,17 +253,17 @@ pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: 
                 } else {
                     &mut style.background
                 };
-                if index + 2 < params.len() && params[index + 1] == "5" {
-                    if let Ok(ci) = params[index + 2].parse::<u8>() {
+                if index + 2 < parts.len() && parts[index + 1] == b"5" {
+                    if let Some(ci) = bytes_to_u8(parts[index + 2]) {
                         let (r, g, b) = ansi256_to_rgb(ci, palette);
                         *target = Some(rgb(r, g, b));
                     }
                     index += 2;
-                } else if index + 4 < params.len() && params[index + 1] == "2" {
-                    if let (Ok(r), Ok(g), Ok(b)) = (
-                        params[index + 2].parse::<u8>(),
-                        params[index + 3].parse::<u8>(),
-                        params[index + 4].parse::<u8>(),
+                } else if index + 4 < parts.len() && parts[index + 1] == b"2" {
+                    if let (Some(r), Some(g), Some(b)) = (
+                        bytes_to_u8(parts[index + 2]),
+                        bytes_to_u8(parts[index + 3]),
+                        bytes_to_u8(parts[index + 4]),
                     ) {
                         *target = Some(rgb(r, g, b));
                     }
@@ -206,17 +271,17 @@ pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: 
                 }
             }
             58 => {
-                if index + 2 < params.len() && params[index + 1] == "5" {
-                    if let Ok(ci) = params[index + 2].parse::<u8>() {
+                if index + 2 < parts.len() && parts[index + 1] == b"5" {
+                    if let Some(ci) = bytes_to_u8(parts[index + 2]) {
                         let (r, g, b) = ansi256_to_rgb(ci, palette);
                         style.underline_color = Some(rgb(r, g, b));
                     }
                     index += 2;
-                } else if index + 4 < params.len() && params[index + 1] == "2" {
-                    if let (Ok(r), Ok(g), Ok(b)) = (
-                        params[index + 2].parse::<u8>(),
-                        params[index + 3].parse::<u8>(),
-                        params[index + 4].parse::<u8>(),
+                } else if index + 4 < parts.len() && parts[index + 1] == b"2" {
+                    if let (Some(r), Some(g), Some(b)) = (
+                        bytes_to_u8(parts[index + 2]),
+                        bytes_to_u8(parts[index + 3]),
+                        bytes_to_u8(parts[index + 4]),
                     ) {
                         style.underline_color = Some(rgb(r, g, b));
                     }
@@ -428,12 +493,12 @@ pub fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
                             i += 1;
                             match final_c {
                                 'm' => {
-                                    let parts: Vec<String> = if params.is_empty() {
-                                        vec!["0".to_string()]
+                                    let bytes = params.as_bytes();
+                                    if bytes.is_empty() {
+                                        parse_sgr_params(&mut style, b"0", palette);
                                     } else {
-                                        params.split(';').map(|s| s.to_string()).collect()
-                                    };
-                                    parse_sgr_params(&mut style, &parts, palette);
+                                        parse_sgr_params(&mut style, bytes, palette);
+                                    }
                                 }
                                 'K' => {
                                     let n = params.parse::<u32>().unwrap_or(0);
@@ -554,58 +619,62 @@ pub fn apply_ansi_runs_to_buffer(buffer: &TextBuffer, start_offset: usize, runs:
 /// `LESS=R`, `git log --color`, `top`) loses all its color when the recorded
 /// block is rendered. Always begins with `0` (reset) so it's standalone.
 pub fn encode_sgr(style: &AnsiStyleState) -> String {
-    let mut parts: Vec<String> = vec!["0".into()];
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(32);
+    s.push_str("\x1b[0");
     if style.bold {
-        parts.push("1".into());
+        s.push_str(";1");
     }
     if style.dim {
-        parts.push("2".into());
+        s.push_str(";2");
     }
     if style.italic {
-        parts.push("3".into());
+        s.push_str(";3");
     }
     match style.underline_style {
         UnderlineStyle::None => {}
-        UnderlineStyle::Single => parts.push("4".into()),
-        UnderlineStyle::Double => parts.push("21".into()),
-        UnderlineStyle::Curly => parts.push("4:3".into()),
-        UnderlineStyle::Dotted => parts.push("4:4".into()),
-        UnderlineStyle::Dashed => parts.push("4:5".into()),
+        UnderlineStyle::Single => s.push_str(";4"),
+        UnderlineStyle::Double => s.push_str(";21"),
+        UnderlineStyle::Curly => s.push_str(";4:3"),
+        UnderlineStyle::Dotted => s.push_str(";4:4"),
+        UnderlineStyle::Dashed => s.push_str(";4:5"),
     }
     if style.blink {
-        parts.push("5".into());
+        s.push_str(";5");
     }
     if style.reverse {
-        parts.push("7".into());
+        s.push_str(";7");
     }
     if style.hidden {
-        parts.push("8".into());
+        s.push_str(";8");
     }
     if style.strikethrough {
-        parts.push("9".into());
+        s.push_str(";9");
     }
     if style.overline {
-        parts.push("53".into());
+        s.push_str(";53");
     }
-    let push_rgb = |parts: &mut Vec<String>, lead: &str, c: &RGBA| {
-        parts.push(format!(
-            "{lead};2;{};{};{}",
+    let push_rgb = |s: &mut String, lead: &str, c: &RGBA| {
+        let _ = write!(
+            s,
+            ";{lead};2;{};{};{}",
             (c.red() * 255.0) as u8,
             (c.green() * 255.0) as u8,
-            (c.blue() * 255.0) as u8
-        ));
+            (c.blue() * 255.0) as u8,
+        );
     };
     if let Some(c) = style.foreground.as_ref() {
-        push_rgb(&mut parts, "38", c);
+        push_rgb(&mut s, "38", c);
     }
     if let Some(c) = style.background.as_ref() {
-        push_rgb(&mut parts, "48", c);
+        push_rgb(&mut s, "48", c);
     }
     if let Some(c) = style.underline_color.as_ref() {
-        push_rgb(&mut parts, "58", c);
+        push_rgb(&mut s, "58", c);
     }
     // hyperlink is OSC 8, not SGR; encoded separately if needed.
-    format!("\x1b[{}m", parts.join(";"))
+    s.push('m');
+    s
 }
 
 /// Truncate a run list to at most `max_chars` characters.

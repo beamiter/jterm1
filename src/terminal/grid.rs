@@ -15,6 +15,8 @@
 //! Scope: enough to handle pagers and dashboards. Color/SGR is dropped (we
 //! only return text). Unsupported sequences are skipped without aborting.
 
+use std::collections::HashMap;
+
 const MIN_COLS: usize = 1;
 const MIN_ROWS: usize = 1;
 
@@ -191,6 +193,16 @@ pub fn render_to_ansi(
                         grid.col = 0;
                         i += 2;
                     }
+                    b'7' => {
+                        // DECSC — save cursor + SGR + charset + scroll region.
+                        grid.save_cursor();
+                        i += 2;
+                    }
+                    b'8' => {
+                        // DECRC — restore the snapshot from the last DECSC.
+                        grid.restore_cursor();
+                        i += 2;
+                    }
                     b'P' | b'_' | b'^' | b'X' => {
                         // DCS (\eP), APC (\e_), PM (\e^), SOS (\eX) — string
                         // sequences terminated by ST (\e\) or BEL. The most
@@ -348,13 +360,11 @@ fn apply_csi(grid: &mut Grid, params: &[u8], final_b: u8) {
     // SGR (m) updates the current cell style. Routed here before parsing as
     // u32 so colon-delimited sub-parameters survive into `parse_sgr_params`.
     if final_b == b'm' {
-        let s = std::str::from_utf8(params).unwrap_or("");
-        let parts: Vec<String> = if s.is_empty() {
-            vec!["0".into()]
+        if params.is_empty() {
+            super::ansi::parse_sgr_params(&mut grid.cur_state, b"0", &grid.palette);
         } else {
-            s.split(';').map(String::from).collect()
-        };
-        super::ansi::parse_sgr_params(&mut grid.cur_state, &parts, &grid.palette);
+            super::ansi::parse_sgr_params(&mut grid.cur_state, params, &grid.palette);
+        }
         grid.cur_style = grid.intern_style();
         return;
     }
@@ -454,13 +464,73 @@ fn blank_cell() -> Cell {
     (' ', DEFAULT_STYLE)
 }
 
+/// Hashable digest of `AnsiStyleState`. `RGBA` holds f32 fields and isn't
+/// `Hash`/`Eq`, so we project colors down to packed `u32`s (R<<24|G<<16|B<<8|A
+/// each rounded from the 0..1 float) and pack the booleans + underline style
+/// into a single `u16` flag word. Two styles compare equal under this key iff
+/// they would produce the same SGR sequence, which is the equivalence we want
+/// for interning.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct StyleKey {
+    fg: Option<u32>,
+    bg: Option<u32>,
+    uc: Option<u32>,
+    flags: u16,
+    link: Option<String>,
+}
+
+#[inline]
+fn pack_rgba(c: &gtk4::gdk::RGBA) -> u32 {
+    ((c.red() * 255.0).round() as u32) << 24
+        | ((c.green() * 255.0).round() as u32) << 16
+        | ((c.blue() * 255.0).round() as u32) << 8
+        | ((c.alpha() * 255.0).round() as u32)
+}
+
+fn style_key(s: &super::ansi::AnsiStyleState) -> StyleKey {
+    let mut flags: u16 = 0;
+    if s.bold { flags |= 1 << 0; }
+    if s.italic { flags |= 1 << 1; }
+    if s.strikethrough { flags |= 1 << 2; }
+    if s.dim { flags |= 1 << 3; }
+    if s.reverse { flags |= 1 << 4; }
+    if s.hidden { flags |= 1 << 5; }
+    if s.overline { flags |= 1 << 6; }
+    if s.blink { flags |= 1 << 7; }
+    flags |= (s.underline_style as u16) << 8;
+    StyleKey {
+        fg: s.foreground.as_ref().map(pack_rgba),
+        bg: s.background.as_ref().map(pack_rgba),
+        uc: s.underline_color.as_ref().map(pack_rgba),
+        flags,
+        link: s.hyperlink.clone(),
+    }
+}
+
+/// Cursor + style + scroll-region snapshot taken by DECSC (ESC 7) / CSI s
+/// and restored by DECRC (ESC 8) / CSI u. xterm/VTE save SGR and charset
+/// state alongside the cursor; jterm1 matches that so e.g. `dialog` and
+/// `fzf` restore their colors correctly after popping back from a submenu.
+#[derive(Clone)]
+struct SavedState {
+    row: usize,
+    col: usize,
+    scroll_top: usize,
+    scroll_bot: usize,
+    cur_style: u16,
+    cur_state: super::ansi::AnsiStyleState,
+    g0_line_drawing: bool,
+    g1_line_drawing: bool,
+    gl_is_g1: bool,
+}
+
 struct Grid {
     cells: Vec<Vec<Cell>>,
     cols: usize,
     rows: usize,
     row: usize,
     col: usize,
-    saved: Option<(usize, usize)>,
+    saved: Option<SavedState>,
     scroll_top: usize,
     scroll_bot: usize,
     /// Highest row index that has ever held non-blank content. The output
@@ -470,6 +540,10 @@ struct Grid {
     /// Interned styles — cells store a u16 index, the table holds unique states.
     /// Index 0 is the default (no SGR), so plain output skips the table entirely.
     style_table: Vec<super::ansi::AnsiStyleState>,
+    /// O(1) reverse lookup so `intern_style` doesn't linearly scan
+    /// `style_table` per SGR — colored output (top, htop, fzf preview) can
+    /// blow the table up to thousands of entries.
+    style_index: HashMap<StyleKey, u16>,
     /// Currently-active SGR state (mutated by `m`-final CSI sequences).
     cur_state: super::ansi::AnsiStyleState,
     /// Interned index of `cur_state` — what new cells are written with.
@@ -501,6 +575,7 @@ impl Grid {
             scroll_bot: rows - 1,
             high_water: 0,
             style_table: vec![super::ansi::AnsiStyleState::default()],
+            style_index: HashMap::new(),
             cur_state: super::ansi::AnsiStyleState::default(),
             cur_style: DEFAULT_STYLE,
             palette,
@@ -564,18 +639,17 @@ impl Grid {
         if self.cur_state == self.style_table[DEFAULT_STYLE as usize] {
             return DEFAULT_STYLE;
         }
-        for (i, existing) in self.style_table.iter().enumerate() {
-            if existing == &self.cur_state {
-                return i as u16;
-            }
+        let key = style_key(&self.cur_state);
+        if let Some(&i) = self.style_index.get(&key) {
+            return i;
         }
-        // Cap to u16 to keep the table cheap; further unique styles all fold
-        // onto the last slot (worst case is colored-output style mashing).
         if self.style_table.len() >= u16::MAX as usize {
             return (self.style_table.len() - 1) as u16;
         }
+        let i = self.style_table.len() as u16;
         self.style_table.push(self.cur_state.clone());
-        (self.style_table.len() - 1) as u16
+        self.style_index.insert(key, i);
+        i
     }
 
     fn put_char(&mut self, c: char) {
@@ -830,13 +904,30 @@ impl Grid {
     }
 
     fn save_cursor(&mut self) {
-        self.saved = Some((self.row, self.col));
+        self.saved = Some(SavedState {
+            row: self.row,
+            col: self.col,
+            scroll_top: self.scroll_top,
+            scroll_bot: self.scroll_bot,
+            cur_style: self.cur_style,
+            cur_state: self.cur_state.clone(),
+            g0_line_drawing: self.g0_line_drawing,
+            g1_line_drawing: self.g1_line_drawing,
+            gl_is_g1: self.gl_is_g1,
+        });
     }
 
     fn restore_cursor(&mut self) {
-        if let Some((r, c)) = self.saved {
-            self.row = r.min(self.rows - 1);
-            self.col = c.min(self.cols - 1);
+        if let Some(s) = self.saved.clone() {
+            self.row = s.row.min(self.rows - 1);
+            self.col = s.col.min(self.cols - 1);
+            self.scroll_top = s.scroll_top.min(self.rows - 1);
+            self.scroll_bot = s.scroll_bot.min(self.rows - 1).max(self.scroll_top);
+            self.cur_state = s.cur_state;
+            self.cur_style = s.cur_style;
+            self.g0_line_drawing = s.g0_line_drawing;
+            self.g1_line_drawing = s.g1_line_drawing;
+            self.gl_is_g1 = s.gl_is_g1;
         }
     }
 

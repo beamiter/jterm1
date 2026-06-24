@@ -201,7 +201,8 @@ impl VtePty {
                     libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                 };
                 if n > 0 {
-                    callback(buf[..n as usize].to_vec());
+                    let n = n as usize;
+                    callback(buf[..n].to_vec());
                 }
                 glib::ControlFlow::Continue
             });
