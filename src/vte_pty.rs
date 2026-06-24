@@ -8,8 +8,12 @@
 //! be updated every time xterm or the application protocol grows a new escape.
 //!
 //! With a real PTY here, libvte answers everything natively. We open a fresh
-//! PTY pair, hand the slave end to VTE via [`vte4::Pty::foreign_sync`], and
-//! splice the master end onto the shell's real PTY:
+//! PTY pair, hand the *master* end to VTE via [`vte4::Pty::foreign_sync`]
+//! (libvte's foreign_sync requires a master fd — grantpt/unlockpt/ioctl
+//! probes return EINVAL on a slave), and keep the slave end on the jterm1
+//! side. Bytes still flow symmetrically across the pair: writes to the slave
+//! arrive at the master (VTE renders them) and writes by VTE on the master
+//! arrive at the slave (jterm1 splices them onto the shell PTY).
 //!
 //! ```text
 //!   shell-PTY  <──┐                          ┌──> active VTE
@@ -19,8 +23,8 @@
 //!                 └──> finished blocks       └──> VtePty (this module)
 //! ```
 //!
-//! The reader thread on the VTE master delivers VTE's writes back to jterm1,
-//! which forwards them straight to the shell PTY. The flow is symmetric:
+//! The reader thread on the jterm1-owned (slave) fd delivers VTE's writes
+//! back to jterm1, which forwards them straight to the shell PTY:
 //!
 //!   shell → parser → vte_pty.write_bytes()       (jterm1 → VTE)
 //!   vte_pty reader → shell_pty.write_bytes()     (VTE → shell)
@@ -84,20 +88,24 @@ fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
     }
 }
 
-/// A PTY pair owned by jterm1 whose slave is wrapped in a `vte4::Pty` and
-/// attached to the active VTE. Read the module docs for the data flow.
+/// A PTY pair owned by jterm1 whose *master* end is wrapped in a `vte4::Pty`
+/// and attached to the active VTE. Read the module docs for the data flow.
 pub struct VtePty {
-    /// Master end. Wrapped in Mutex so close/drop and writes serialise.
-    master: Arc<Mutex<Option<OwnedFd>>>,
-    /// The `vte4::Pty` holding the slave end. The caller passes this to
+    /// jterm1's local end of the pair — the slave fd. Wrapped in Mutex so
+    /// close/drop and writes serialise. Named "local" to avoid confusion: the
+    /// master is owned by libvte (and closed when `vte_pty` drops).
+    local: Arc<Mutex<Option<OwnedFd>>>,
+    /// The `vte4::Pty` holding the master end. The caller passes this to
     /// `Terminal::set_pty`. Stored so it lives as long as VtePty does.
     vte_pty: vte4::Pty,
 }
 
 impl VtePty {
-    /// Allocate a fresh PTY pair. The slave fd is moved into a
-    /// `vte4::Pty::foreign_sync` so libvte owns it. Initial winsize is set to
-    /// 80×24; callers should resize after the GTK widget is realised.
+    /// Allocate a fresh PTY pair. The master fd is moved into a
+    /// `vte4::Pty::foreign_sync` so libvte owns it (libvte's foreign_sync
+    /// requires a master — passing a slave fails with EINVAL on the
+    /// grantpt/unlockpt path). Initial winsize is set to 80×24; callers
+    /// should resize after the GTK widget is realised.
     pub fn new() -> io::Result<Self> {
         let initial_size = nix::pty::Winsize {
             ws_row: 24,
@@ -110,12 +118,12 @@ impl VtePty {
         // vte4::Pty::foreign_sync takes io_lifetimes::OwnedFd, which is the
         // same underlying type as std's; round-trip via raw fd to bridge the
         // two crates without taking a hard dep on io-lifetimes here.
-        let slave_raw = slave.into_raw_fd();
-        let slave_fd = unsafe { io_lifetimes::OwnedFd::from_raw_fd(slave_raw) };
-        let vte_pty = vte4::Pty::foreign_sync(slave_fd, None::<&gtk4::gio::Cancellable>)
+        let master_raw = master.into_raw_fd();
+        let master_fd = unsafe { io_lifetimes::OwnedFd::from_raw_fd(master_raw) };
+        let vte_pty = vte4::Pty::foreign_sync(master_fd, None::<&gtk4::gio::Cancellable>)
             .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(VtePty {
-            master: Arc::new(Mutex::new(Some(master))),
+            local: Arc::new(Mutex::new(Some(slave))),
             vte_pty,
         })
     }
@@ -129,7 +137,7 @@ impl VtePty {
     /// enough for normal terminal traffic and a few-byte loss after disconnect
     /// is preferable to blocking the UI thread).
     pub fn write_bytes(&self, data: &[u8]) {
-        if let Ok(guard) = self.master.lock() {
+        if let Ok(guard) = self.local.lock() {
             if let Some(fd) = guard.as_ref() {
                 let raw = fd.as_raw_fd();
                 unsafe {
@@ -143,7 +151,7 @@ impl VtePty {
     /// the slave's reported window size matches what VTE believes. Called
     /// from block.rs alongside the shell-PTY resize so both sides stay in sync.
     pub fn resize(&self, cols: u16, rows: u16) {
-        if let Ok(guard) = self.master.lock() {
+        if let Ok(guard) = self.local.lock() {
             if let Some(fd) = guard.as_ref() {
                 let ws = libc::winsize {
                     ws_row: rows,
@@ -168,7 +176,7 @@ impl VtePty {
         F: FnMut(Vec<u8>) + 'static,
     {
         let fd = match self
-            .master
+            .local
             .lock()
             .ok()
             .and_then(|g| g.as_ref().map(|f| f.as_raw_fd()))
@@ -182,9 +190,9 @@ impl VtePty {
             // No eventfd → fall back to a glib idle poll. VTE's outgoing
             // traffic is light (only response data + commits), so a 10ms tick
             // is acceptable here.
-            let master = self.master.clone();
+            let local = self.local.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
-                let raw = match master.lock().ok().and_then(|g| g.as_ref().map(|f| f.as_raw_fd())) {
+                let raw = match local.lock().ok().and_then(|g| g.as_ref().map(|f| f.as_raw_fd())) {
                     Some(fd) => fd,
                     None => return glib::ControlFlow::Break,
                 };
@@ -249,7 +257,7 @@ impl VtePty {
 
 impl Drop for VtePty {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.master.lock() {
+        if let Ok(mut guard) = self.local.lock() {
             guard.take();
         }
     }
