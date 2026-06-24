@@ -2,17 +2,29 @@
 
 Source the file matching your shell from its rc file:
 
-| Shell | File | Source from |
-|-------|------|-------------|
-| bash  | `jterm1.bash` | `~/.bashrc` |
-| zsh   | `jterm1.zsh`  | `~/.zshrc`  |
-| fish  | `jterm1.fish` | `~/.config/fish/config.fish` |
+| Shell      | File           | Source from |
+|------------|----------------|-------------|
+| bash       | `jterm1.bash`  | `~/.bashrc` |
+| zsh        | `jterm1.zsh`   | `~/.zshrc`  |
+| fish       | `jterm1.fish`  | `~/.config/fish/config.fish` |
+| PowerShell | `jterm1.ps1`   | `$PROFILE`  |
 
 Example (bash):
 
 ```bash
 [[ $TERM_PROGRAM == jterm1 ]] && source /path/to/jterm1.bash
 ```
+
+Example (PowerShell):
+
+```powershell
+if ($env:TERM_PROGRAM -eq 'jterm1') { . /path/to/jterm1.ps1 }
+```
+
+The PowerShell script requires PSReadLine (bundled with pwsh 7+; preinstalled
+on Windows PowerShell 5+). Without it OSC 133 ;C is not emitted on Enter — the
+prompt-side markers still fire, so blocks are still demarcated but exit codes
+attach only at the *next* prompt.
 
 ## What it provides
 
