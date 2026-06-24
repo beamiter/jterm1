@@ -52,11 +52,13 @@ pub(crate) fn toggle_palette(
         PaletteMode::All => "Palette",
         PaletteMode::Commands => "Command Palette",
         PaletteMode::History => "History",
+        PaletteMode::Ai => "Ask AI",
     };
     let placeholder = match default_mode {
-        PaletteMode::All => "Search commands and history…",
-        PaletteMode::Commands => "Search commands…  (try @ for history)",
-        PaletteMode::History => "Search history…  (try > for commands)",
+        PaletteMode::All => "Search commands and history…  (try ? to ask AI)",
+        PaletteMode::Commands => "Search commands…  (try @ for history, ? for AI)",
+        PaletteMode::History => "Search history…  (try > for commands, ? for AI)",
+        PaletteMode::Ai => "Describe what you want…",
     };
 
     let dialog = adw::Dialog::builder()
@@ -162,6 +164,7 @@ pub(crate) fn toggle_palette(
             match accept {
                 Accept::Action(a) => sender.input(AppMsg::Action(a)),
                 Accept::TypeCommand(cmd) => sender.input(AppMsg::PaletteTypeCommand(cmd)),
+                Accept::AskAi(query) => sender.input(AppMsg::PaletteAskAi(query)),
             }
         })
     };
@@ -340,6 +343,7 @@ pub(crate) fn toggle_history_popover(
             match accept {
                 Accept::Action(a) => sender.input(AppMsg::Action(a)),
                 Accept::TypeCommand(cmd) => sender.input(AppMsg::PaletteTypeCommand(cmd)),
+                Accept::AskAi(query) => sender.input(AppMsg::PaletteAskAi(query)),
             }
         })
     };

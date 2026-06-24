@@ -21,6 +21,9 @@ pub(crate) enum PaletteMode {
     Commands,
     /// Only shell history.
     History,
+    /// `?` prefix: AI natural-language → shell command. The remaining text
+    /// becomes the user prompt; gather returns a single "Ask AI" entry.
+    Ai,
 }
 
 /// Parsed query: a mode (possibly tightened by a prefix) and the remaining
@@ -32,8 +35,9 @@ pub(crate) struct Query {
 }
 
 impl Query {
-    /// `>foo` forces command-only, `@foo` forces history-only. Otherwise the
-    /// query inherits `default_mode`.
+    /// `>foo` forces command-only, `@foo` forces history-only, `?foo` forces
+    /// AI natural-language → command. Otherwise the query inherits
+    /// `default_mode`.
     pub fn parse(raw: &str, default_mode: PaletteMode) -> Self {
         let trimmed = raw.trim_start();
         if let Some(rest) = trimmed.strip_prefix('>') {
@@ -41,6 +45,9 @@ impl Query {
         }
         if let Some(rest) = trimmed.strip_prefix('@') {
             return Query { mode: PaletteMode::History, text: rest.trim_start().to_string() };
+        }
+        if let Some(rest) = trimmed.strip_prefix('?') {
+            return Query { mode: PaletteMode::Ai, text: rest.trim_start().to_string() };
         }
         Query { mode: default_mode, text: trimmed.to_string() }
     }
@@ -54,6 +61,10 @@ pub(crate) enum Accept {
     /// Type the command into the active pane without submitting (user can edit
     /// then press Enter). Safest default for history.
     TypeCommand(String),
+    /// Forward the natural-language query to the AI bridge. The main loop
+    /// fires the request, then types the returned command into the active
+    /// pane (no autosubmit — same safety stance as TypeCommand).
+    AskAi(String),
 }
 
 /// One row in the palette.
@@ -128,6 +139,36 @@ pub(crate) fn gather(
             };
             push_if_match(&matcher, &query.text, entry, &mut out);
         }
+    }
+
+    if matches!(query.mode, PaletteMode::Ai) {
+        // Single synthetic entry: activating it kicks off the AI request.
+        // We surface the raw user text in the label so they can see exactly
+        // what's being sent. Empty query → harmless no-op entry that just
+        // explains the prefix.
+        let (label, sublabel, accept) = if query.text.trim().is_empty() {
+            (
+                "Type a natural-language request after ?".to_string(),
+                Some("e.g. ? find files modified today".to_string()),
+                Accept::TypeCommand(String::new()),
+            )
+        } else {
+            (
+                format!("Ask AI: {}", query.text),
+                Some("Generates a shell command (review before running)".to_string()),
+                Accept::AskAi(query.text.clone()),
+            )
+        };
+        out.push(Entry {
+            tier: 0,
+            score: i64::MAX,
+            label,
+            sublabel,
+            right: Some("?".to_string()),
+            accept,
+        });
+        out.truncate(limit);
+        return out;
     }
 
     if matches!(query.mode, PaletteMode::All | PaletteMode::History) {

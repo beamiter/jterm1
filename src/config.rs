@@ -187,6 +187,12 @@ pub struct Config {
     /// remote process can otherwise silently replace the user's clipboard
     /// (OWASP-style concern). Most users enable this only on trusted hosts.
     pub(crate) allow_remote_clipboard_write: bool,
+    /// Show jterm1-side AI surfaces (per-block error explain button, the
+    /// session AI panel, and the `?` palette prefix). Default on; flip to
+    /// `false` to hide all AI UI even when API keys are present. The actual
+    /// network call still only fires on an explicit user click — this just
+    /// removes the entry points.
+    pub(crate) ai_enabled: bool,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
 }
@@ -388,6 +394,7 @@ struct FileConfig {
     block_compact: Option<bool>,
     editor_input: Option<bool>,
     allow_remote_clipboard_write: Option<bool>,
+    ai_enabled: Option<bool>,
     remote_hosts: Vec<RemoteHost>,
 }
 
@@ -434,6 +441,7 @@ fn load_file_config() -> FileConfig {
         block_compact: table.get("block_compact").and_then(|v| v.as_bool()),
         editor_input: table.get("editor_input").and_then(|v| v.as_bool()),
         allow_remote_clipboard_write: table.get("allow_remote_clipboard_write").and_then(|v| v.as_bool()),
+        ai_enabled: table.get("ai_enabled").and_then(|v| v.as_bool()),
         remote_hosts,
     }
 }
@@ -627,6 +635,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         block_compact,
         editor_input: fc.editor_input.unwrap_or(true),
         allow_remote_clipboard_write: fc.allow_remote_clipboard_write.unwrap_or(false),
+        ai_enabled: fc.ai_enabled.unwrap_or(true),
         remote_hosts: fc.remote_hosts,
     };
 

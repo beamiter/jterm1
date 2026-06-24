@@ -3545,6 +3545,23 @@ fn build_finished_block(
     }
     action_box.append(&rerun);
 
+    // Explain (AI) — only meaningful on failed blocks. Hidden behind the
+    // `ai_enabled` config gate so opt-out users see no AI surfaces. Network
+    // call only fires when the button is clicked.
+    if exit_code != 0 && ctx.config.borrow().ai_enabled {
+        let explain = gtk::Button::with_label("\u{f0eb}"); // lightbulb
+        explain.add_css_class("block-action-btn");
+        explain.add_css_class("flat");
+        explain.set_tooltip_text(Some("Explain this error (AI)"));
+        {
+            let ctx = ctx.clone();
+            explain.connect_clicked(move |btn| {
+                show_explain_dialog(&ctx, id, btn);
+            });
+        }
+        action_box.append(&explain);
+    }
+
     // Overflow (⋯): the full context menu (recall, granular copy, error report,
     // export, delete). Nerd Font ellipsis ().
     let overflow = gtk::Button::with_label("\u{f142}");
@@ -3869,6 +3886,143 @@ fn detect_error_offsets(plain: &str) -> Vec<i32> {
         char_off += line.chars().count() as i32;
     }
     offsets
+}
+
+/// Spawn the "explain this error" dialog and fire one AI request against
+/// the captured block. The dialog shows a spinner until the response (or
+/// error) arrives; the user can dismiss at any point — the in-flight HTTP
+/// is cancelled so a late reply doesn't try to populate a closed window.
+fn show_explain_dialog(ctx: &Rc<Ctx>, id: u64, anchor: &gtk::Button) {
+    use relm4::adw;
+    use adw::prelude::*;
+
+    // Snapshot the block so the dialog (which outlives the click) doesn't
+    // need to keep borrowing `ctx.finished`.
+    let (command, plain_output, exit_code, cwd) = match ctx
+        .finished
+        .borrow()
+        .iter()
+        .find(|b| b.id == id)
+    {
+        Some(b) => (
+            b.command.clone(),
+            b.plain_output.clone(),
+            b.exit_code,
+            b.cwd.clone(),
+        ),
+        None => return,
+    };
+
+    // Locate the parent window so adw::Dialog has a presentation target.
+    let parent_window: Option<gtk::Window> = anchor
+        .root()
+        .and_then(|r| r.downcast::<gtk::Window>().ok());
+
+    let dialog = adw::Dialog::builder()
+        .title("Explain error")
+        .content_width(640)
+        .content_height(480)
+        .build();
+
+    let header = adw::HeaderBar::new();
+    let content_box = gtk::Box::new(Orientation::Vertical, 8);
+    content_box.set_margin_top(12);
+    content_box.set_margin_bottom(12);
+    content_box.set_margin_start(12);
+    content_box.set_margin_end(12);
+
+    let status = gtk::Label::new(Some(""));
+    status.add_css_class("dim-label");
+    status.set_halign(gtk::Align::Start);
+    content_box.append(&status);
+
+    let spinner = gtk::Spinner::new();
+    spinner.set_halign(gtk::Align::Start);
+    content_box.append(&spinner);
+
+    let body = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .build();
+    body.add_css_class("ai-explain-body");
+    let body_scroll = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .child(&body)
+        .build();
+    content_box.append(&body_scroll);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&content_box));
+    dialog.set_child(Some(&toolbar));
+
+    // Try to pick a provider. If none is reachable, show a one-line hint
+    // and skip the network call entirely.
+    let client = match crate::ai::AiClient::from_env() {
+        Some(c) => c,
+        None => {
+            spinner.set_visible(false);
+            status.set_text(
+                "No AI provider configured. Set ANTHROPIC_API_KEY / OPENAI_API_KEY, \
+                 or run `ollama serve` locally.",
+            );
+            if let Some(win) = parent_window.as_ref() {
+                dialog.present(Some(win));
+            } else {
+                dialog.present(gtk::Widget::NONE);
+            }
+            return;
+        }
+    };
+    status.set_text(&format!("Asking {} …", client.display_name()));
+    spinner.start();
+
+    let (system, user) = crate::ai::build_explain_prompt(&command, &plain_output, exit_code, &cwd);
+
+    // Hold the handle in an Rc<RefCell> so dialog close can cancel the
+    // pending callback without dropping a freshly-built handle by accident.
+    let handle: Rc<RefCell<Option<crate::ai::AiHandle>>> = Rc::new(RefCell::new(None));
+    let dialog_for_cb = dialog.clone();
+    let status_for_cb = status.clone();
+    let spinner_for_cb = spinner.clone();
+    let body_for_cb = body.clone();
+    let h = crate::ai::ask(client, system, user, move |result| {
+        // The dialog may have been closed in the meantime; guard by checking
+        // mapped state so we don't try to touch destroyed widgets.
+        if !dialog_for_cb.is_mapped() && dialog_for_cb.parent().is_none() {
+            return;
+        }
+        spinner_for_cb.stop();
+        spinner_for_cb.set_visible(false);
+        match result {
+            Ok(text) => {
+                status_for_cb.set_text("");
+                body_for_cb.buffer().set_text(text.trim());
+            }
+            Err(msg) => {
+                status_for_cb.set_text(&format!("AI error: {msg}"));
+            }
+        }
+    });
+    *handle.borrow_mut() = Some(h);
+
+    // Cancel the in-flight request when the dialog closes.
+    {
+        let handle = handle.clone();
+        dialog.connect_closed(move |_| {
+            if let Some(h) = handle.borrow().as_ref() {
+                h.cancel();
+            }
+        });
+    }
+
+    if let Some(win) = parent_window.as_ref() {
+        dialog.present(Some(win));
+    } else {
+        dialog.present(gtk::Widget::NONE);
+    }
 }
 
 /// Build and pop up the per-block right-click context menu. Uses a plain

@@ -59,6 +59,9 @@ pub(crate) enum Action {
     JumpToPrevPinned,
     JumpToNextPinned,
     ToggleDebugDashboard,
+    /// Open the session-level AI panel for free-form questions about the
+    /// current shell context (Ctrl+Shift+A by default).
+    OpenAiPanel,
 }
 
 impl Action {
@@ -126,6 +129,7 @@ impl Action {
             Action::JumpToNextPinned => "Jump to next pinned block",
             Action::ClearBlockFilter => "Clear block filter",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
+            Action::OpenAiPanel => "Open AI panel",
         }
     }
 
@@ -182,6 +186,7 @@ impl Action {
             Action::JumpToNextPinned => Some("jump_to_next_pinned"),
             Action::ClearBlockFilter => Some("clear_block_filter"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
+            Action::OpenAiPanel => Some("open_ai_panel"),
         }
     }
 
@@ -236,6 +241,7 @@ impl Action {
             Action::JumpToNextPinned,
             Action::ClearBlockFilter,
             Action::ToggleDebugDashboard,
+            Action::OpenAiPanel,
         ]
     }
 }
@@ -474,6 +480,7 @@ impl KeybindingMap {
         bind("Ctrl+Shift+Right", Action::FocusPaneRight);
         bind("Ctrl+Shift+Up", Action::FocusPaneUp);
         bind("Ctrl+Shift+Down", Action::FocusPaneDown);
+        bind("Ctrl+Shift+A", Action::OpenAiPanel);
 
         KeybindingMap { bindings }
     }

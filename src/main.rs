@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod ai;
 mod config;
 mod dialogs;
 mod file_tree;
@@ -86,6 +87,12 @@ enum AppMsg {
     /// Palette accepted a command — type it into the active pane (no newline)
     /// so the user can edit before submitting.
     PaletteTypeCommand(String),
+    /// Palette `?` prefix: send the natural-language query to the AI bridge.
+    /// On success the returned command is typed into the active pane (still
+    /// no autosubmit — matches PaletteTypeCommand's safety stance).
+    PaletteAskAi(String),
+    /// Open the session AI panel (Ctrl+Shift+A by default).
+    OpenAiPanel,
     Ignore,
 }
 
@@ -218,6 +225,20 @@ struct AppModel {
     history_popover: Rc<RefCell<Option<gtk::Popover>>>,
 }
 
+/// Strip one layer of markdown code fence (```bash … ``` or ``` … ```) if it
+/// wraps the entire response. LLMs often format single-command outputs that
+/// way even when asked for raw text.
+fn strip_code_fences(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("```") {
+        let after_lang = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
+        if let Some(inner) = after_lang.trim_end().strip_suffix("```") {
+            return inner.trim();
+        }
+    }
+    s
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_pane(
     config: &Rc<RefCell<Config>>,
@@ -300,6 +321,231 @@ impl AppModel {
             .and_then(|p| p.cwd.clone())
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_dir())
+    }
+
+    /// `?` palette accept handler: run the natural-language query through the
+    /// configured AI provider and, on success, type the returned command into
+    /// the active pane (no autosubmit). Errors raise a transient toast/log
+    /// only — the user can always retry.
+    fn handle_palette_ask_ai(&self, query: String, sender: &ComponentSender<AppModel>) {
+        if !self.config.borrow().ai_enabled {
+            return;
+        }
+        let Some(client) = ai::AiClient::from_env() else {
+            log::warn!("AI palette: no provider configured");
+            return;
+        };
+        let cwd = self
+            .active_cwd()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let (system, user) = ai::build_nl_to_cmd_prompt(&query, &cwd);
+        let sender_clone = sender.clone();
+        // Fire and forget — keeping the handle would just let us cancel, but
+        // the palette has already closed by the time we get here, so there's
+        // nothing user-visible to cancel against.
+        let _h = ai::ask(client, system, user, move |result| match result {
+            Ok(cmd) => {
+                let cleaned = strip_code_fences(cmd.trim()).to_string();
+                if !cleaned.is_empty() {
+                    sender_clone.input(AppMsg::PaletteTypeCommand(cleaned));
+                }
+            }
+            Err(e) => log::warn!("AI palette request failed: {e}"),
+        });
+        std::mem::forget(_h);
+    }
+
+    /// Pop up the session-level AI panel. The panel has a freeform question
+    /// field plus an optional "attach recent shell context" toggle that
+    /// includes the last few finished blocks' command + exit + first line of
+    /// output (no raw stdout dumps — keeps the prompt small + the privacy
+    /// boundary obvious to the user).
+    fn show_ai_session_panel(&self, _sender: &ComponentSender<AppModel>) {
+        use adw::prelude::*;
+        if !self.config.borrow().ai_enabled {
+            return;
+        }
+
+        let dialog = adw::Dialog::builder()
+            .title("Ask AI")
+            .content_width(640)
+            .content_height(520)
+            .build();
+        let header = adw::HeaderBar::new();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+
+        let prompt_label = gtk::Label::new(Some("Your question:"));
+        prompt_label.set_halign(gtk::Align::Start);
+        prompt_label.add_css_class("dim-label");
+        content.append(&prompt_label);
+
+        let entry = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .height_request(80)
+            .build();
+        entry.add_css_class("ai-panel-entry");
+        let entry_scroll = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .child(&entry)
+            .build();
+        entry_scroll.set_min_content_height(80);
+        content.append(&entry_scroll);
+
+        let attach_check = gtk::CheckButton::with_label("Include recent shell context");
+        attach_check.set_active(true);
+        content.append(&attach_check);
+
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.set_halign(gtk::Align::End);
+        let send_btn = gtk::Button::with_label("Ask");
+        send_btn.add_css_class("suggested-action");
+        let status = gtk::Label::new(Some(""));
+        status.add_css_class("dim-label");
+        status.set_halign(gtk::Align::Start);
+        status.set_hexpand(true);
+        buttons.append(&status);
+        buttons.append(&send_btn);
+        content.append(&buttons);
+
+        let spinner = gtk::Spinner::new();
+        spinner.set_visible(false);
+        content.append(&spinner);
+
+        let answer = gtk::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .build();
+        answer.add_css_class("ai-explain-body");
+        let answer_scroll = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .child(&answer)
+            .build();
+        content.append(&answer_scroll);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+
+        // Collect a small context snapshot: history-file tail (latest 5
+        // commands). Falls back to empty if history is unconfigured.
+        let history_path = self.config.borrow().block_history_path.clone();
+        let context_factory: Rc<dyn Fn() -> Option<String>> = {
+            let history_path = history_path.clone();
+            Rc::new(move || {
+                let path = history_path.as_ref()?;
+                let p = std::path::Path::new(path);
+                let items = palette::read_history(p, 5);
+                if items.is_empty() {
+                    return None;
+                }
+                let mut s = String::new();
+                for it in items.iter().rev() {
+                    let exit = it.exit_code;
+                    s.push_str(&format!("$ {} (exit {exit})\n", it.command));
+                }
+                Some(s)
+            })
+        };
+
+        let in_flight: Rc<RefCell<Option<ai::AiHandle>>> = Rc::new(RefCell::new(None));
+        let dialog_for_close = dialog.clone();
+        let in_flight_for_close = in_flight.clone();
+        dialog.connect_closed(move |_| {
+            if let Some(h) = in_flight_for_close.borrow().as_ref() {
+                h.cancel();
+            }
+        });
+        let _ = dialog_for_close;
+
+        // Hooked here so capturing isn't needlessly duplicated below.
+        let send_handler = {
+            let entry = entry.clone();
+            let answer = answer.clone();
+            let spinner = spinner.clone();
+            let status = status.clone();
+            let send_btn = send_btn.clone();
+            let attach_check = attach_check.clone();
+            let in_flight = in_flight.clone();
+            let context_factory = context_factory.clone();
+            move || {
+                let buffer = entry.buffer();
+                let (start, end) = buffer.bounds();
+                let question = buffer.text(&start, &end, true).to_string();
+                let trimmed = question.trim();
+                if trimmed.is_empty() {
+                    status.set_text("(question is empty)");
+                    return;
+                }
+                let Some(client) = ai::AiClient::from_env() else {
+                    status.set_text(
+                        "No AI provider configured. Set ANTHROPIC_API_KEY / OPENAI_API_KEY, \
+                         or run `ollama serve`.",
+                    );
+                    return;
+                };
+                let context = if attach_check.is_active() {
+                    context_factory()
+                } else {
+                    None
+                };
+                let (system, user) = ai::build_session_prompt(trimmed, context.as_deref());
+                answer.buffer().set_text("");
+                status.set_text(&format!("Asking {} …", client.display_name()));
+                spinner.set_visible(true);
+                spinner.start();
+                send_btn.set_sensitive(false);
+
+                let answer_cb = answer.clone();
+                let spinner_cb = spinner.clone();
+                let status_cb = status.clone();
+                let send_btn_cb = send_btn.clone();
+                let h = ai::ask(client, system, user, move |result| {
+                    spinner_cb.stop();
+                    spinner_cb.set_visible(false);
+                    send_btn_cb.set_sensitive(true);
+                    match result {
+                        Ok(text) => {
+                            status_cb.set_text("");
+                            answer_cb.buffer().set_text(text.trim());
+                        }
+                        Err(msg) => status_cb.set_text(&format!("AI error: {msg}")),
+                    }
+                });
+                *in_flight.borrow_mut() = Some(h);
+            }
+        };
+        {
+            let send_handler = send_handler.clone();
+            send_btn.connect_clicked(move |_| send_handler());
+        }
+
+        // Ctrl+Enter inside the question entry triggers send.
+        let key = gtk::EventControllerKey::new();
+        key.connect_key_pressed({
+            let send_handler = send_handler.clone();
+            move |_, keyval, _, state| {
+                use gtk::gdk::Key;
+                if matches!(keyval, Key::Return | Key::KP_Enter)
+                    && state.contains(ModifierType::CONTROL_MASK)
+                {
+                    send_handler();
+                    return gtk::glib::Propagation::Stop;
+                }
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        entry.add_controller(key);
+
+        dialog.present(Some(&self.window));
+        entry.grab_focus();
     }
 
     /// Rebuild the file tree with `root` at the top.
@@ -1533,6 +1779,9 @@ impl AppModel {
                     self.add_remote_tab(&host, sender);
                 }
             }
+            Action::OpenAiPanel => {
+                self.show_ai_session_panel(sender);
+            }
         }
     }
 
@@ -2579,6 +2828,12 @@ impl SimpleComponent for AppModel {
                     term.emit(VteInput::WriteInput(cmd.into_bytes()));
                     term.emit(VteInput::GrabFocus);
                 }
+            }
+            AppMsg::PaletteAskAi(query) => {
+                self.handle_palette_ask_ai(query, &sender);
+            }
+            AppMsg::OpenAiPanel => {
+                self.show_ai_session_panel(&sender);
             }
             AppMsg::FileTreeGotoCwd => self.file_tree_goto_current_cwd(),
             AppMsg::FileTreeGoUp => self.file_tree_go_up(),
