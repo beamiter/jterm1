@@ -44,18 +44,33 @@ impl Query {
     pub fn parse(raw: &str, default_mode: PaletteMode) -> Self {
         let trimmed = raw.trim_start();
         if let Some(rest) = trimmed.strip_prefix('>') {
-            return Query { mode: PaletteMode::Commands, text: rest.trim_start().to_string() };
+            return Query {
+                mode: PaletteMode::Commands,
+                text: rest.trim_start().to_string(),
+            };
         }
         if let Some(rest) = trimmed.strip_prefix('@') {
-            return Query { mode: PaletteMode::History, text: rest.trim_start().to_string() };
+            return Query {
+                mode: PaletteMode::History,
+                text: rest.trim_start().to_string(),
+            };
         }
         if let Some(rest) = trimmed.strip_prefix('?') {
-            return Query { mode: PaletteMode::Ai, text: rest.trim_start().to_string() };
+            return Query {
+                mode: PaletteMode::Ai,
+                text: rest.trim_start().to_string(),
+            };
         }
         if let Some(rest) = trimmed.strip_prefix(':') {
-            return Query { mode: PaletteMode::Workflows, text: rest.trim_start().to_string() };
+            return Query {
+                mode: PaletteMode::Workflows,
+                text: rest.trim_start().to_string(),
+            };
         }
-        Query { mode: default_mode, text: trimmed.to_string() }
+        Query {
+            mode: default_mode,
+            text: trimmed.to_string(),
+        }
     }
 }
 
@@ -97,7 +112,9 @@ pub(crate) struct Entry {
 /// Read up to the last `max` records from a jsonl history file (newest last).
 /// Records are pulled most-recent-first then reversed for display order.
 pub(crate) fn read_history(path: &Path, max: usize) -> Vec<HistoryItem> {
-    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
     let mut out: Vec<HistoryItem> = text
         .lines()
         .rev()
@@ -145,7 +162,11 @@ pub(crate) fn gather(
                 score: 0,
                 label,
                 sublabel: None,
-                right: if binding.is_empty() { None } else { Some(binding) },
+                right: if binding.is_empty() {
+                    None
+                } else {
+                    Some(binding)
+                },
                 accept: Accept::Action(action),
             };
             push_if_match(&matcher, &query.text, entry, &mut out);
@@ -154,7 +175,9 @@ pub(crate) fn gather(
 
     if matches!(query.mode, PaletteMode::All | PaletteMode::Workflows) {
         for wf in workflows {
-            let Some(path) = wf.source_path.clone() else { continue };
+            let Some(path) = wf.source_path.clone() else {
+                continue;
+            };
             let right = if wf.tags.is_empty() {
                 Some(":".to_string())
             } else {
@@ -243,7 +266,10 @@ fn push_if_match(matcher: &SkimMatcherV2, needle: &str, mut e: Entry, out: &mut 
     // Match against label first; fall back to sublabel for history entries
     // whose command is short but whose cwd narrows intent ("ls" in ~/proj/foo).
     let primary = matcher.fuzzy_match(&e.label, needle);
-    let secondary = e.sublabel.as_deref().and_then(|s| matcher.fuzzy_match(s, needle));
+    let secondary = e
+        .sublabel
+        .as_deref()
+        .and_then(|s| matcher.fuzzy_match(s, needle));
     let score = match (primary, secondary) {
         (Some(p), Some(s)) => Some(p.max(s / 2)),
         (Some(p), None) => Some(p),
@@ -268,7 +294,9 @@ fn history_sublabel(item: &HistoryItem) -> String {
 }
 
 fn shorten_path(p: &str) -> String {
-    if p.is_empty() { return String::new(); }
+    if p.is_empty() {
+        return String::new();
+    }
     if let Ok(home) = std::env::var("HOME") {
         if let Some(rest) = p.strip_prefix(&home) {
             return format!("~{rest}");
@@ -300,7 +328,10 @@ mod tests {
     fn empty_query_keeps_all_entries() {
         let kbmap = KeybindingMap::from_defaults();
         let entries = gather(
-            &Query { mode: PaletteMode::Commands, text: String::new() },
+            &Query {
+                mode: PaletteMode::Commands,
+                text: String::new(),
+            },
             &kbmap,
             None,
             &[],

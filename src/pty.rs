@@ -117,8 +117,7 @@ impl OwnedPty {
                 }
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
 
-                let c_argv: Vec<CString> =
-                    argv.iter().map(|a| CString::new(*a).unwrap()).collect();
+                let c_argv: Vec<CString> = argv.iter().map(|a| CString::new(*a).unwrap()).collect();
                 let _ = unistd::execvp(&c_argv[0], &c_argv);
                 std::process::exit(127);
             }
@@ -368,12 +367,7 @@ fn reap_child(child_pid: Pid, tx: &mpsc::Sender<PtyMsg>) {
 /// firehose can't starve the main thread; the 1ms poll timeout is a tiny
 /// fraction of a 60Hz frame budget but enough to merge clear+repaint pairs
 /// that one program emitted in a single render.
-fn coalesce_pending(
-    fd: RawFd,
-    file: &mut std::fs::File,
-    buf: &mut [u8],
-    combined: &mut Vec<u8>,
-) {
+fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combined: &mut Vec<u8>) {
     const MAX_BYTES: usize = 256 * 1024;
     const MAX_FOLLOWUP_READS: u32 = 8;
     let mut follow_ups = 0u32;

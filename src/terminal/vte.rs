@@ -4,6 +4,7 @@
 //! is spawned on init. VTE signals (cwd/exit/bell/title/activity) are forwarded
 //! as component Output messages instead of jterm4's callback-Vec observer model.
 
+use gtk::prelude::*;
 use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
 use gtk4::gdk::ModifierType;
 use gtk4::gdk::RGBA;
@@ -11,11 +12,10 @@ use gtk4::gio::{self, Cancellable};
 use gtk4::glib::translate::IntoGlib;
 use gtk4::glib::SpawnFlags;
 use gtk4::pango::FontDescription;
-use gtk4::Orientation;
 use gtk4::GestureClick;
+use gtk4::Orientation;
 use relm4::gtk;
 use relm4::prelude::*;
-use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
@@ -51,7 +51,11 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
     terminal.set_delete_binding(vte4::EraseBinding::DeleteSequence);
 
     let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
-    terminal.set_colors(Some(&config.foreground), Some(&config.background), &palette_refs);
+    terminal.set_colors(
+        Some(&config.foreground),
+        Some(&config.background),
+        &palette_refs,
+    );
     terminal.set_color_bold(None);
     terminal.set_color_cursor(Some(&config.cursor));
     terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
@@ -489,10 +493,7 @@ impl Component for VteTerminal {
             terminal,
             config: init.config,
         };
-        ComponentParts {
-            model,
-            widgets: (),
-        }
+        ComponentParts { model, widgets: () }
     }
 
     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>, _root: &Self::Root) {
@@ -520,7 +521,8 @@ impl Component for VteTerminal {
                 if let Some(adj) = self.terminal.vadjustment() {
                     let delta = adj.step_increment() * lines as f64;
                     let max_val = adj.upper() - adj.page_size();
-                    let new_val = (adj.value() + delta).clamp(adj.lower(), max_val.max(adj.lower()));
+                    let new_val =
+                        (adj.value() + delta).clamp(adj.lower(), max_val.max(adj.lower()));
                     adj.set_value(new_val);
                 }
             }

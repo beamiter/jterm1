@@ -16,13 +16,13 @@ mod terminal;
 mod vte_pty;
 mod workflows;
 
-use relm4::prelude::*;
-use relm4::adw;
-use relm4::gtk;
 use adw::prelude::*;
 use gtk::gdk::ModifierType;
 use gtk::gio::{self, Cancellable};
 use gtk::glib;
+use relm4::adw;
+use relm4::gtk;
+use relm4::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -314,7 +314,11 @@ fn create_pane(
         VteOutput::CommandFinished(true) => AppMsg::Activity(tab_id),
         VteOutput::CommandFinished(false) => AppMsg::Bell(tab_id),
         VteOutput::RemoteSessionId(id) => AppMsg::PaneRemoteSessionId(tab_id, id),
-        VteOutput::BlockFinished { command, exit_code, output_sample } => AppMsg::AgentBlockFinished {
+        VteOutput::BlockFinished {
+            command,
+            exit_code,
+            output_sample,
+        } => AppMsg::AgentBlockFinished {
             tab_id,
             pane_id,
             command,
@@ -384,11 +388,7 @@ impl AppModel {
     /// an index, because the workflow list can be rebuilt between
     /// gather() and accept). If the workflow has no args, render and type
     /// immediately; otherwise open the param-fill dialog.
-    fn run_workflow_from_path(
-        &self,
-        path: std::path::PathBuf,
-        sender: &ComponentSender<AppModel>,
-    ) {
+    fn run_workflow_from_path(&self, path: std::path::PathBuf, sender: &ComponentSender<AppModel>) {
         let workflow = self
             .workflows
             .borrow()
@@ -450,7 +450,11 @@ impl AppModel {
     fn open_agent_panel(&self, sender: &ComponentSender<AppModel>) {
         let cfg = self.config.borrow();
         if !cfg.ai_enabled || !cfg.agent_enabled {
-            log::info!("agent: disabled (ai_enabled={}, agent_enabled={})", cfg.ai_enabled, cfg.agent_enabled);
+            log::info!(
+                "agent: disabled (ai_enabled={}, agent_enabled={})",
+                cfg.ai_enabled,
+                cfg.agent_enabled
+            );
             return;
         }
         let max_turns = cfg.agent_max_turns;
@@ -541,7 +545,9 @@ impl AppModel {
         {
             let mut guard = self.active_agent.borrow_mut();
             let Some(sess) = guard.as_mut() else { return };
-            if let Some(agent::Turn::AssistantProposed { approved, .. }) = sess.transcript.get_mut(idx) {
+            if let Some(agent::Turn::AssistantProposed { approved, .. }) =
+                sess.transcript.get_mut(idx)
+            {
                 *approved = Some(false);
             }
         }
@@ -650,7 +656,9 @@ impl AppModel {
     }
 
     fn agent_kick_llm(&self, sender: &ComponentSender<AppModel>) {
-        let Some(client) = ai::AiClient::from_env() else { return };
+        let Some(client) = ai::AiClient::from_env() else {
+            return;
+        };
         // Build the prompt outside the borrow.
         let (system, user) = {
             let guard = self.active_agent.borrow();
@@ -672,7 +680,10 @@ impl AppModel {
                 .cloned()
                 .unwrap_or_else(|| "/bin/sh".to_string());
             let os = std::env::consts::OS.to_string();
-            (ai::build_agent_system_prompt(&cwd, &shell, &os), sess.build_user_prompt())
+            (
+                ai::build_agent_system_prompt(&cwd, &shell, &os),
+                sess.build_user_prompt(),
+            )
         };
 
         let sender_for_reply = sender.clone();
@@ -912,7 +923,8 @@ impl AppModel {
     #[allow(deprecated)]
     fn set_file_tree_root(&self, root: std::path::PathBuf) {
         self.file_tree_store.clear();
-        self.file_tree_root_label.set_text(&file_tree::display_path(&root));
+        self.file_tree_root_label
+            .set_text(&file_tree::display_path(&root));
         self.file_tree_root_label
             .set_tooltip_text(Some(&root.to_string_lossy()));
         file_tree::populate_dir(&self.file_tree_store, None, &root);
@@ -1210,10 +1222,7 @@ impl AppModel {
             ("Theme".to_string(), cfg.theme_name.clone()),
             ("Font".to_string(), cfg.font_desc.clone()),
             ("Font scale".to_string(), format!("{:.3}", self.font_scale)),
-            (
-                "Opacity".to_string(),
-                format!("{:.2}", self.window_opacity),
-            ),
+            ("Opacity".to_string(), format!("{:.2}", self.window_opacity)),
             (
                 "Terminal mode".to_string(),
                 match cfg.terminal_mode {
@@ -1232,7 +1241,10 @@ impl AppModel {
                 "Keybindings".to_string(),
                 self.kbmap.borrow().bindings.len().to_string(),
             ),
-            ("Remote hosts".to_string(), cfg.remote_hosts.len().to_string()),
+            (
+                "Remote hosts".to_string(),
+                cfg.remote_hosts.len().to_string(),
+            ),
             (
                 "Startup commands".to_string(),
                 cfg.startup_commands.clone().unwrap_or_default(),
@@ -1314,11 +1326,15 @@ impl AppModel {
         sender: &ComponentSender<AppModel>,
     ) -> bool {
         const MAX_ATTEMPT: u32 = 6;
-        let Some(idx) = self.index_of(tab_id) else { return false };
+        let Some(idx) = self.index_of(tab_id) else {
+            return false;
+        };
         if self.tabs[idx].panes.len() != 1 {
             return false;
         }
-        let Some(conn) = self.tabs[idx].remote.clone() else { return false };
+        let Some(conn) = self.tabs[idx].remote.clone() else {
+            return false;
+        };
         if code == 0 {
             // User logged out cleanly — drop the connection record, close normally.
             self.tabs[idx].remote = None;
@@ -1331,7 +1347,8 @@ impl AppModel {
         if next_attempt > MAX_ATTEMPT {
             log::warn!(
                 "[remote] giving up reconnect for '{}' after {} attempts",
-                conn.host.name, conn.attempt
+                conn.host.name,
+                conn.attempt
             );
             if let Some(c) = self.tabs[idx].remote.as_mut() {
                 c.status = ConnStatus::Disconnected;
@@ -1373,9 +1390,18 @@ impl AppModel {
     }
 
     /// Respawn a dead remote tab's connection in place (same tab id / position).
-    fn do_remote_reconnect(&mut self, tab_id: u64, attempt: u32, sender: &ComponentSender<AppModel>) {
-        let Some(idx) = self.index_of(tab_id) else { return };
-        let Some(conn) = self.tabs[idx].remote.clone() else { return };
+    fn do_remote_reconnect(
+        &mut self,
+        tab_id: u64,
+        attempt: u32,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let Some(idx) = self.index_of(tab_id) else {
+            return;
+        };
+        let Some(conn) = self.tabs[idx].remote.clone() else {
+            return;
+        };
         // Swap the dead pane widget for a fresh remote pane.
         let old_widget = self.tabs[idx].panes[0].terminal.widget();
         self.tabs[idx].holder.remove(&old_widget);
@@ -1384,7 +1410,11 @@ impl AppModel {
         // Pull the *current* host snapshot — `conn.host.session` may have been
         // learned dynamically via OSC 7770 during the prior connection, so we
         // can't reuse the cloned-at-spawn `conn`.
-        let host_now = self.tabs[idx].remote.as_ref().map(|c| c.host.clone()).unwrap_or(conn.host.clone());
+        let host_now = self.tabs[idx]
+            .remote
+            .as_ref()
+            .map(|c| c.host.clone())
+            .unwrap_or(conn.host.clone());
         let argv = Rc::new(config::build_remote_argv(&host_now));
         let pane = create_pane(
             &self.config,
@@ -1450,7 +1480,11 @@ impl AppModel {
             relm4::main_application().quit();
             return;
         }
-        let new_idx = if idx >= self.tabs.len() { self.tabs.len() - 1 } else { idx };
+        let new_idx = if idx >= self.tabs.len() {
+            self.tabs.len() - 1
+        } else {
+            idx
+        };
         let new_id = self.tabs[new_idx].id;
         self.select_tab(new_id, sender);
     }
@@ -1488,7 +1522,9 @@ impl AppModel {
 
     /// Move the tab with `src_id` to `to_idx`, preserving which tab is active.
     fn reorder_tab(&mut self, src_id: u64, to_idx: usize, sender: &ComponentSender<AppModel>) {
-        let Some(from) = self.index_of(src_id) else { return };
+        let Some(from) = self.index_of(src_id) else {
+            return;
+        };
         let to = to_idx.min(self.tabs.len().saturating_sub(1));
         if from == to {
             return;
@@ -1529,11 +1565,10 @@ impl AppModel {
 
     /// Open a new tab inheriting the active tab's mode, cwd and (custom) title.
     fn duplicate_active_tab(&mut self, sender: &ComponentSender<AppModel>) {
-        let Some(src) = self.tabs.get(self.active) else { return };
-        let cwd = src
-            .panes
-            .get(src.active_pane)
-            .and_then(|p| p.cwd.clone());
+        let Some(src) = self.tabs.get(self.active) else {
+            return;
+        };
+        let cwd = src.panes.get(src.active_pane).and_then(|p| p.cwd.clone());
         let title = src.title.clone();
         let custom_title = src.custom_title;
 
@@ -1599,7 +1634,9 @@ impl AppModel {
 
     /// Split the active pane, placing a fresh bare-VTE pane beside it.
     fn split_active(&mut self, orientation: gtk::Orientation, sender: &ComponentSender<AppModel>) {
-        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
         if tab.zoom.is_some() {
             return;
         }
@@ -1654,13 +1691,17 @@ impl AppModel {
         let tab = &mut self.tabs[ti];
         tab.panes.push(new_pane);
         tab.active_pane = tab.panes.len() - 1;
-        tab.panes[tab.active_pane].terminal.emit(VteInput::GrabFocus);
+        tab.panes[tab.active_pane]
+            .terminal
+            .emit(VteInput::GrabFocus);
     }
 
     /// Remove a pane from its tab, collapsing the Paned tree and promoting the
     /// sibling. Closes the whole tab if it was the last pane.
     fn close_pane(&mut self, pane_id: u64, sender: &ComponentSender<AppModel>) {
-        let Some((ti, pi)) = self.find_pane(pane_id) else { return };
+        let Some((ti, pi)) = self.find_pane(pane_id) else {
+            return;
+        };
         if self.tabs[ti].zoom.is_some() {
             self.toggle_pane_zoom_for(ti);
         }
@@ -1674,7 +1715,11 @@ impl AppModel {
             if let Ok(paned) = parent.downcast::<gtk::Paned>() {
                 let start = paned.start_child();
                 let end = paned.end_child();
-                let sibling = if start.as_ref() == Some(&eff) { end } else { start };
+                let sibling = if start.as_ref() == Some(&eff) {
+                    end
+                } else {
+                    start
+                };
                 paned.set_start_child(None::<&gtk::Widget>);
                 paned.set_end_child(None::<&gtk::Widget>);
                 if let Some(sibling) = sibling {
@@ -1707,7 +1752,9 @@ impl AppModel {
     }
 
     fn cycle_pane_focus(&mut self, delta: i32) {
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         let n = tab.panes.len() as i32;
         if n <= 1 {
             return;
@@ -1715,18 +1762,24 @@ impl AppModel {
         let cur = tab.active_pane as i32;
         let next = ((cur + delta) % n + n) % n;
         tab.active_pane = next as usize;
-        tab.panes[tab.active_pane].terminal.emit(VteInput::GrabFocus);
+        tab.panes[tab.active_pane]
+            .terminal
+            .emit(VteInput::GrabFocus);
     }
 
     fn focus_pane_directional(&mut self, direction: Direction) {
-        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
         if tab.panes.len() <= 1 {
             return;
         }
         let holder: gtk::Widget = tab.holder.clone().upcast();
         let api = tab.active_pane;
         let focused_widget = tab.panes[api].terminal.widget();
-        let Some(fb) = focused_widget.compute_bounds(&holder) else { return };
+        let Some(fb) = focused_widget.compute_bounds(&holder) else {
+            return;
+        };
         let fcx = fb.x() + fb.width() / 2.0;
         let fcy = fb.y() + fb.height() / 2.0;
 
@@ -1736,7 +1789,9 @@ impl AppModel {
                 continue;
             }
             let w = pane.terminal.widget();
-            let Some(b) = w.compute_bounds(&holder) else { continue };
+            let Some(b) = w.compute_bounds(&holder) else {
+                continue;
+            };
             let cx = b.x() + b.width() / 2.0;
             let cy = b.y() + b.height() / 2.0;
             let dx = cx - fcx;
@@ -1767,7 +1822,9 @@ impl AppModel {
     }
 
     fn resize_pane(&mut self, target: gtk::Orientation, delta: i32) {
-        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
         let api = tab.active_pane;
         let mut widget = tab.panes[api].terminal.widget().parent();
         while let Some(cur) = widget {
@@ -1787,7 +1844,9 @@ impl AppModel {
     }
 
     fn toggle_pane_zoom_for(&mut self, ti: usize) {
-        let Some(tab) = self.tabs.get_mut(ti) else { return };
+        let Some(tab) = self.tabs.get_mut(ti) else {
+            return;
+        };
         if let Some(z) = tab.zoom.take() {
             tab.holder.remove(&z.pane_widget);
             if z.was_start {
@@ -1804,10 +1863,16 @@ impl AppModel {
             }
             let api = tab.active_pane;
             let pane_widget = tab.panes[api].terminal.widget();
-            let Some(parent) = pane_widget.parent() else { return };
-            let Ok(parent_paned) = parent.downcast::<gtk::Paned>() else { return };
+            let Some(parent) = pane_widget.parent() else {
+                return;
+            };
+            let Ok(parent_paned) = parent.downcast::<gtk::Paned>() else {
+                return;
+            };
             let was_start = parent_paned.start_child().as_ref() == Some(&pane_widget);
-            let Some(tree_root) = tab.holder.first_child() else { return };
+            let Some(tree_root) = tab.holder.first_child() else {
+                return;
+            };
             if was_start {
                 parent_paned.set_start_child(None::<&gtk::Widget>);
             } else {
@@ -1827,7 +1892,9 @@ impl AppModel {
 
     /// Detach the active pane from a split tab and host it in a brand-new tab.
     fn move_pane_to_new_tab(&mut self, sender: &ComponentSender<AppModel>) {
-        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
         if tab.panes.len() <= 1 || tab.zoom.is_some() {
             return;
         }
@@ -1840,7 +1907,11 @@ impl AppModel {
             if let Ok(paned) = parent.downcast::<gtk::Paned>() {
                 let start = paned.start_child();
                 let end = paned.end_child();
-                let sibling = if start.as_ref() == Some(&eff) { end } else { start };
+                let sibling = if start.as_ref() == Some(&eff) {
+                    end
+                } else {
+                    start
+                };
                 paned.set_start_child(None::<&gtk::Widget>);
                 paned.set_end_child(None::<&gtk::Widget>);
                 if let Some(sibling) = sibling {
@@ -2146,11 +2217,7 @@ impl AppModel {
             }
             Action::ToggleDebugDashboard => {
                 let info = self.debug_info_snapshot();
-                dialogs::toggle_debug_dashboard(
-                    &self.window,
-                    info,
-                    &self.debug_dashboard_dialog,
-                );
+                dialogs::toggle_debug_dashboard(&self.window, info, &self.debug_dashboard_dialog);
             }
             Action::ConnectRemote(n) => {
                 let host = self.config.borrow().remote_hosts.get(n as usize).cloned();
@@ -2198,7 +2265,8 @@ impl AppModel {
         self.font_scale = new_config.default_font_scale;
         for tab in &self.tabs {
             for pane in &tab.panes {
-                pane.terminal.emit(VteInput::SetFontScale(new_config.default_font_scale));
+                pane.terminal
+                    .emit(VteInput::SetFontScale(new_config.default_font_scale));
                 pane.terminal.emit(VteInput::SetFont(font_desc.clone()));
                 pane.terminal.emit(VteInput::SetScrollback(scrollback));
                 pane.terminal.emit(VteInput::ApplyTheme);
@@ -2296,7 +2364,8 @@ impl AppModel {
         }
         // set_active does not refire `clicked`, so this won't recurse.
         self.sidebar_tabs_btn.set_active(view == SidebarView::Tabs);
-        self.sidebar_files_btn.set_active(view == SidebarView::Files);
+        self.sidebar_files_btn
+            .set_active(view == SidebarView::Files);
 
         if persist {
             self.sidebar_view.set(view);
@@ -2707,9 +2776,7 @@ impl SimpleComponent for AppModel {
         let search_entry = gtk::SearchEntry::new();
         search_entry.set_placeholder_text(Some("Find… (/regex/ for regex)"));
         search_entry.set_hexpand(true);
-        let search_bar = gtk::SearchBar::builder()
-            .search_mode_enabled(false)
-            .build();
+        let search_bar = gtk::SearchBar::builder().search_mode_enabled(false).build();
         search_bar.set_child(Some(&search_entry));
         search_bar.connect_entry(&search_entry);
         {
@@ -2937,7 +3004,9 @@ impl SimpleComponent for AppModel {
             let ksender = sender.clone();
             key_controller.connect_key_pressed(move |_c, keyval, _kc, state| {
                 let mods = state
-                    & (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK | ModifierType::ALT_MASK);
+                    & (ModifierType::CONTROL_MASK
+                        | ModifierType::SHIFT_MASK
+                        | ModifierType::ALT_MASK);
                 let combo = KeyCombo {
                     modifiers: mods,
                     key: normalize_key(keyval),
@@ -2985,10 +3054,13 @@ impl SimpleComponent for AppModel {
                     reload_pending.set(true);
                     let rsender = rsender.clone();
                     let pending = reload_pending.clone();
-                    glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
-                        pending.set(false);
-                        rsender.input(AppMsg::ReloadConfig);
-                    });
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(200),
+                        move || {
+                            pending.set(false);
+                            rsender.input(AppMsg::ReloadConfig);
+                        },
+                    );
                 }
             });
             unsafe { root.set_data("config-monitor", monitor) };
@@ -3060,7 +3132,9 @@ impl SimpleComponent for AppModel {
                     }
                 }
             }
-            AppMsg::RemoteReconnectNow(id, attempt) => self.do_remote_reconnect(id, attempt, &sender),
+            AppMsg::RemoteReconnectNow(id, attempt) => {
+                self.do_remote_reconnect(id, attempt, &sender)
+            }
             AppMsg::PaneCwdChanged(_, pane_id, path) => {
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
                     self.tabs[ti].panes[pi].cwd = Some(path.clone());
@@ -3229,7 +3303,14 @@ impl SimpleComponent for AppModel {
                 exit_code,
                 output_sample,
             } => {
-                self.agent_handle_block_finished(tab_id, pane_id, command, exit_code, output_sample, &sender);
+                self.agent_handle_block_finished(
+                    tab_id,
+                    pane_id,
+                    command,
+                    exit_code,
+                    output_sample,
+                    &sender,
+                );
             }
             AppMsg::AgentClose => self.agent_close(),
             AppMsg::PaletteTypeCommand(cmd) => {

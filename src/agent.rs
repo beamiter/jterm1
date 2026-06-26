@@ -31,10 +31,10 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use adw::prelude::*;
 use relm4::adw;
 use relm4::gtk;
 use relm4::ComponentSender;
-use adw::prelude::*;
 
 /// Hard cap on transcript bytes sent to the LLM. Past this, the middle is
 /// elided. Chosen well below typical 100k context windows so the system
@@ -61,16 +61,10 @@ pub(crate) enum Turn {
     /// The model proposed a command. `approved` tracks user verdict:
     /// `None` = pending, `Some(true)` = ran (Observation follows),
     /// `Some(false)` = rejected.
-    AssistantProposed {
-        cmd: String,
-        approved: Option<bool>,
-    },
+    AssistantProposed { cmd: String, approved: Option<bool> },
     /// The captured outcome of an approved command. `output_sample` is
     /// already truncated to `MAX_OBS_BYTES`.
-    Observation {
-        exit: i32,
-        output_sample: String,
-    },
+    Observation { exit: i32, output_sample: String },
 }
 
 impl Turn {
@@ -103,7 +97,10 @@ impl Turn {
                     Some(false) => format!("Assistant: {payload}\n[user rejected]"),
                 }
             }
-            Turn::Observation { exit, output_sample } => {
+            Turn::Observation {
+                exit,
+                output_sample,
+            } => {
                 format!("Output (exit={exit}):\n{output_sample}")
             }
         }
@@ -114,9 +111,18 @@ impl Turn {
 /// the JSON is malformed so the session stays usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParsedAction {
-    Run { thought: Option<String>, command: String },
-    Say { thought: Option<String>, message: String },
-    Done { thought: Option<String>, message: String },
+    Run {
+        thought: Option<String>,
+        command: String,
+    },
+    Say {
+        thought: Option<String>,
+        message: String,
+    },
+    Done {
+        thought: Option<String>,
+        message: String,
+    },
 }
 
 /// Best-effort JSON parser. Strips a markdown fence if the model wrapped
@@ -154,7 +160,10 @@ pub(crate) fn parse_action(raw: &str) -> ParsedAction {
                     message: raw.trim().to_string(),
                 }
             } else {
-                ParsedAction::Run { thought, command: cmd }
+                ParsedAction::Run {
+                    thought,
+                    command: cmd,
+                }
             }
         }
         "done" => ParsedAction::Done {
@@ -210,7 +219,10 @@ pub(crate) fn is_dangerous(cmd: &str) -> Option<&'static str> {
         return Some("rm -rf against a top-level path");
     }
     // mkfs.* — formats a filesystem.
-    if lower.split_whitespace().any(|t| t.starts_with("mkfs.") || t == "mkfs") {
+    if lower
+        .split_whitespace()
+        .any(|t| t.starts_with("mkfs.") || t == "mkfs")
+    {
         return Some("mkfs formats a filesystem");
     }
     // dd if=… of=/dev/sdX  — disk overwrite.
@@ -219,7 +231,10 @@ pub(crate) fn is_dangerous(cmd: &str) -> Option<&'static str> {
     }
     // Pipe to shell from network — typical curl|sh / wget|sh footgun.
     if (lower.contains("curl ") || lower.contains("wget "))
-        && (lower.contains("| sh") || lower.contains("|sh") || lower.contains("| bash") || lower.contains("|bash"))
+        && (lower.contains("| sh")
+            || lower.contains("|sh")
+            || lower.contains("| bash")
+            || lower.contains("|bash"))
     {
         return Some("piping network content directly to a shell");
     }
@@ -227,12 +242,19 @@ pub(crate) fn is_dangerous(cmd: &str) -> Option<&'static str> {
     if let Some(idx) = lower.find("> /dev/sd") {
         let after = &lower[idx + 2..];
         // "> /dev/sda", "> /dev/sdb1", …
-        if after.split_whitespace().next().is_some_and(|t| t.starts_with("/dev/sd")) {
+        if after
+            .split_whitespace()
+            .next()
+            .is_some_and(|t| t.starts_with("/dev/sd"))
+        {
             return Some("redirecting to a raw block device");
         }
     }
     // chmod 777 -R … on a top-level dir.
-    if lower.contains("chmod") && lower.contains("777") && (lower.contains(" /") || lower.contains(" ~")) {
+    if lower.contains("chmod")
+        && lower.contains("777")
+        && (lower.contains(" /") || lower.contains(" ~"))
+    {
         return Some("recursive chmod 777 on a top-level path");
     }
     None
@@ -243,7 +265,9 @@ fn has_rm_rf_dangerous_target(lower: &str) -> bool {
     // the remaining arguments for a dangerous target. We split on whitespace
     // and tolerate flag clustering like `-rf`, `-fR`, etc.
     let toks: Vec<&str> = lower.split_whitespace().collect();
-    let Some(rm_idx) = toks.iter().position(|t| *t == "rm") else { return false };
+    let Some(rm_idx) = toks.iter().position(|t| *t == "rm") else {
+        return false;
+    };
     let rest = &toks[rm_idx + 1..];
     let mut has_r = false;
     let mut has_f = false;
@@ -284,8 +308,21 @@ fn has_rm_rf_dangerous_target(lower: &str) -> bool {
         // Top-level system dirs.
         if matches!(
             t,
-            "/bin" | "/boot" | "/etc" | "/home" | "/lib" | "/lib64" | "/opt" | "/root" | "/sbin"
-              | "/srv" | "/sys" | "/usr" | "/var" | "/proc" | "/dev"
+            "/bin"
+                | "/boot"
+                | "/etc"
+                | "/home"
+                | "/lib"
+                | "/lib64"
+                | "/opt"
+                | "/root"
+                | "/sbin"
+                | "/srv"
+                | "/sys"
+                | "/usr"
+                | "/var"
+                | "/proc"
+                | "/dev"
         ) {
             return true;
         }
@@ -510,8 +547,12 @@ pub(crate) fn rerender(
     sender: ComponentSender<crate::AppModel>,
 ) {
     let sess_borrow = session.borrow();
-    let Some(sess) = sess_borrow.as_ref() else { return };
-    let Some(tb) = sess.transcript_box.as_ref() else { return };
+    let Some(sess) = sess_borrow.as_ref() else {
+        return;
+    };
+    let Some(tb) = sess.transcript_box.as_ref() else {
+        return;
+    };
 
     // Clear existing children.
     while let Some(child) = tb.first_child() {
@@ -524,9 +565,18 @@ pub(crate) fn rerender(
             Turn::AssistantThought(msg) => tb.append(&render_thought(msg)),
             Turn::AssistantSay(msg) => tb.append(&render_say(msg)),
             Turn::AssistantProposed { cmd, approved } => {
-                tb.append(&render_proposed(idx, cmd, *approved, sender.clone(), sess.sealed));
+                tb.append(&render_proposed(
+                    idx,
+                    cmd,
+                    *approved,
+                    sender.clone(),
+                    sess.sealed,
+                ));
             }
-            Turn::Observation { exit, output_sample } => {
+            Turn::Observation {
+                exit,
+                output_sample,
+            } => {
                 tb.append(&render_observation(*exit, output_sample));
             }
         }
@@ -534,7 +584,11 @@ pub(crate) fn rerender(
 
     if let Some(status) = sess.status_label.as_ref() {
         let txt = if sess.sealed {
-            format!("Session sealed — open a new agent for more turns.  ({}/{})", sess.turns_used, sess.turns_used.max(1))
+            format!(
+                "Session sealed — open a new agent for more turns.  ({}/{})",
+                sess.turns_used,
+                sess.turns_used.max(1)
+            )
         } else if sess.awaiting_command.is_some() {
             "Waiting for command output…".to_string()
         } else {
@@ -802,9 +856,7 @@ mod tests {
 
     #[test]
     fn parse_action_run_with_thought() {
-        let r = parse_action(
-            r#"{"thought":"need to inspect","action":"run","command":"du -sh"}"#,
-        );
+        let r = parse_action(r#"{"thought":"need to inspect","action":"run","command":"du -sh"}"#);
         match r {
             ParsedAction::Run { thought, command } => {
                 assert_eq!(thought.as_deref(), Some("need to inspect"));

@@ -211,8 +211,20 @@ impl Parser {
             };
             match n {
                 2004 => self.bracketed_paste = enable,
-                9 => self.mouse_mode = if enable { MouseMode::X10 } else { MouseMode::None },
-                1000 => self.mouse_mode = if enable { MouseMode::Normal } else { MouseMode::None },
+                9 => {
+                    self.mouse_mode = if enable {
+                        MouseMode::X10
+                    } else {
+                        MouseMode::None
+                    }
+                }
+                1000 => {
+                    self.mouse_mode = if enable {
+                        MouseMode::Normal
+                    } else {
+                        MouseMode::None
+                    }
+                }
                 1002 => {
                     self.mouse_mode = if enable {
                         MouseMode::ButtonEvent
@@ -773,7 +785,10 @@ mod tests {
     fn osc_color_queries_emit_events() {
         let mut p = Parser::new();
         let mut events = Vec::new();
-        p.feed(b"\x1b]11;?\x07\x1b]10;?\x07\x1b]12;?\x1b\\\x1b]4;5;?\x07", &mut events);
+        p.feed(
+            b"\x1b]11;?\x07\x1b]10;?\x07\x1b]12;?\x1b\\\x1b]4;5;?\x07",
+            &mut events,
+        );
         let kinds: Vec<_> = events
             .iter()
             .filter_map(|e| match e {

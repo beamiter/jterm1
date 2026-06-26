@@ -5,10 +5,10 @@
 //! key=value, quoted string, … — so one double-click grabs the whole unit.
 //! Ported from jterm4's `block_view/select.rs`.
 
+use gtk::prelude::*;
 use gtk4::TextBuffer;
 use regex::Regex;
 use relm4::gtk;
-use gtk::prelude::*;
 use std::sync::LazyLock;
 
 struct Pat {
@@ -28,7 +28,10 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
         p(r#"((?:https?|ftp|file)://[^\s<>"'`)\]}]+)"#, 1),
         p(r#"([\w.+-]+@[\w-]+(?:\.[\w-]+)+)"#, 1),
         p(r#"((?:[~.]?[\w./+-]*\w):\d+(?::\d+)?)"#, 1),
-        p(r#"((?:~|\.{1,2})?(?:/[\w.+@~-]+)+/?|(?:[\w.+-]+/)+[\w.+-]*)"#, 1),
+        p(
+            r#"((?:~|\.{1,2})?(?:/[\w.+@~-]+)+/?|(?:[\w.+-]+/)+[\w.+-]*)"#,
+            1,
+        ),
         p(r#"(\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?)"#, 1),
         p(r#"([\w.-]+=[^\s'"]+)"#, 1),
         p(r#"(\b[0-9a-f]{7,40}\b)"#, 1),

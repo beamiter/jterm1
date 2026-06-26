@@ -10,13 +10,13 @@
 //! Mirrors `VteTerminal`'s Component surface — same `VteInit`/`VteInput`/
 //! `VteOutput` types — so `main.rs` can route to either backend by config.
 
+use gtk::glib;
+use gtk::prelude::*;
 use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
 use gtk4::Orientation;
 use relm4::gtk;
 use relm4::prelude::*;
-use gtk::glib;
-use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -370,7 +370,11 @@ impl Component for BlockTerminal {
 
         // Scroll → viewport → block_list (vertical stack of blocks). Compact density
         // tightens the inter-block gap to match Warp's compact spacing.
-        let block_gap = if init.config.borrow().block_compact { 2 } else { 6 };
+        let block_gap = if init.config.borrow().block_compact {
+            2
+        } else {
+            6
+        };
         let block_list = gtk::Box::new(Orientation::Vertical, block_gap);
         block_list.add_css_class("block-list");
         block_list.set_hexpand(true);
@@ -526,8 +530,8 @@ impl Component for BlockTerminal {
         let argv: Vec<&str> = init.shell_argv.iter().map(|s| s.as_str()).collect();
         let home = std::env::var("HOME").ok();
         let cwd = init.working_directory.clone().or(home);
-        let pty = OwnedPty::spawn(&argv, cwd.as_deref(), &[])
-            .expect("failed to spawn block-view PTY");
+        let pty =
+            OwnedPty::spawn(&argv, cwd.as_deref(), &[]).expect("failed to spawn block-view PTY");
         let pty = Rc::new(pty);
         init.probe.shell_pid.set(pty.pid_i32());
         init.probe.pty_fd.set(pty.master_fd_raw());
@@ -690,10 +694,16 @@ impl Component for BlockTerminal {
             {
                 let ctx = ctx.clone();
                 drag.connect_drag_update(move |g, off_x, off_y| {
-                    let Some(anchor) = ctx.drag_anchor.get() else { return };
-                    let Some((sx, sy)) = g.start_point() else { return };
+                    let Some(anchor) = ctx.drag_anchor.get() else {
+                        return;
+                    };
+                    let Some((sx, sy)) = g.start_point() else {
+                        return;
+                    };
                     let (x, y) = (sx + off_x, sy + off_y);
-                    let Some(cur) = hit_test_block(&ctx, x, y) else { return };
+                    let Some(cur) = hit_test_block(&ctx, x, y) else {
+                        return;
+                    };
                     // Determine which finished block the anchor is currently in.
                     let finished = ctx.finished.borrow();
                     let Some(anchor_idx) = finished.iter().position(|b| b.id == anchor.block_id)
@@ -1125,11 +1135,7 @@ impl Component for BlockTerminal {
                 // input line (clear the shell line with Ctrl+U, then type it).
                 if matches!(keyval, Key::Return | Key::KP_Enter) {
                     if let Some(idx) = ctx.selected_block.get() {
-                        let cmd = ctx
-                            .finished
-                            .borrow()
-                            .get(idx)
-                            .map(|b| b.command.clone());
+                        let cmd = ctx.finished.borrow().get(idx).map(|b| b.command.clone());
                         if let Some(cmd) = cmd {
                             ctx.pty.write_bytes(b"\x15");
                             ctx.pty.write_bytes(cmd.as_bytes());
@@ -1215,7 +1221,11 @@ impl Component for BlockTerminal {
                 // (which is geared to whole-page navigation).
                 let adj = self.ctx.scroll.vadjustment();
                 let cell_h = self.ctx.active_vte.char_height() as f64;
-                let step = if cell_h > 0.0 { cell_h } else { adj.step_increment() };
+                let step = if cell_h > 0.0 {
+                    cell_h
+                } else {
+                    adj.step_increment()
+                };
                 let delta = step * lines as f64;
                 let max_val = adj.upper() - adj.page_size();
                 let new_val = (adj.value() + delta).clamp(adj.lower(), max_val.max(adj.lower()));
@@ -1441,7 +1451,10 @@ fn highlight_matches_in_view(
     }
     let table = buffer.tag_table();
     let tag = table.lookup("jterm-search").unwrap_or_else(|| {
-        let t = gtk::TextTag::builder().name("jterm-search").background(bg).build();
+        let t = gtk::TextTag::builder()
+            .name("jterm-search")
+            .background(bg)
+            .build();
         table.add(&t);
         t
     });
@@ -1551,12 +1564,24 @@ fn jump_to_pinned(ctx: &Rc<Ctx>, dir: i32) {
     if pinned.is_empty() {
         return;
     }
-    let cursor = ctx.selected_block.get().unwrap_or_else(|| ctx.sticky_idx.get().unwrap_or(0));
+    let cursor = ctx
+        .selected_block
+        .get()
+        .unwrap_or_else(|| ctx.sticky_idx.get().unwrap_or(0));
     // Find the next/prev pinned index strictly past `cursor`; fall back to wrap.
     let target = if dir > 0 {
-        pinned.iter().copied().find(|&i| i > cursor).unwrap_or(pinned[0])
+        pinned
+            .iter()
+            .copied()
+            .find(|&i| i > cursor)
+            .unwrap_or(pinned[0])
     } else {
-        pinned.iter().copied().rev().find(|&i| i < cursor).unwrap_or(*pinned.last().unwrap())
+        pinned
+            .iter()
+            .copied()
+            .rev()
+            .find(|&i| i < cursor)
+            .unwrap_or(*pinned.last().unwrap())
     };
     drop(finished);
     scroll_to_block(ctx, target);
@@ -1565,7 +1590,9 @@ fn jump_to_pinned(ctx: &Rc<Ctx>, dir: i32) {
 
 fn scroll_to_block(ctx: &Rc<Ctx>, idx: usize) {
     let finished = ctx.finished.borrow();
-    let Some(block) = finished.get(idx) else { return };
+    let Some(block) = finished.get(idx) else {
+        return;
+    };
     if let Some(p) = block
         .widget
         .compute_point(&ctx.block_list, &gtk::graphene::Point::new(0.0, 0.0))
@@ -1612,7 +1639,9 @@ fn animate_scroll_to(ctx: &Rc<Ctx>, target: f64) {
 /// currently hidden or truncated, so its content is fully visible. No-op when the
 /// block has no output view or is already fully shown.
 fn expand_block_fully(ctx: &Rc<Ctx>, block: &FinishedBlock) {
-    let Some(view) = &block.output_view else { return };
+    let Some(view) = &block.output_view else {
+        return;
+    };
     if !(block.truncated.get() || block.collapsed.get()) {
         return;
     }
@@ -1633,9 +1662,13 @@ fn expand_block_fully(ctx: &Rc<Ctx>, block: &FinishedBlock) {
 /// expanding its output first, and scroll that line into view. No-op when no
 /// block is selected or the selected block has no detected errors.
 fn jump_to_error(ctx: &Rc<Ctx>, delta: i32) {
-    let Some(sel) = ctx.selected_block.get() else { return };
+    let Some(sel) = ctx.selected_block.get() else {
+        return;
+    };
     let finished = ctx.finished.borrow();
-    let Some(block) = finished.get(sel) else { return };
+    let Some(block) = finished.get(sel) else {
+        return;
+    };
     if block.error_offsets.is_empty() {
         return;
     }
@@ -1652,11 +1685,14 @@ fn jump_to_error(ctx: &Rc<Ctx>, delta: i32) {
 /// Scroll the outer list so the given char offset inside a block's output view is
 /// near the top of the viewport.
 fn scroll_to_offset(ctx: &Rc<Ctx>, block: &FinishedBlock, offset: i32) {
-    let Some(view) = &block.output_view else { return };
+    let Some(view) = &block.output_view else {
+        return;
+    };
     let iter = view.buffer().iter_at_offset(offset);
     let loc = view.iter_location(&iter);
     let (_wx, wy) = view.buffer_to_window_coords(gtk::TextWindowType::Widget, loc.x(), loc.y());
-    if let Some(p) = view.compute_point(&ctx.block_list, &gtk::graphene::Point::new(0.0, wy as f32)) {
+    if let Some(p) = view.compute_point(&ctx.block_list, &gtk::graphene::Point::new(0.0, wy as f32))
+    {
         let adj = ctx.scroll.vadjustment();
         let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
         let target = (p.y() as f64 - 8.0).clamp(adj.lower(), max_val);
@@ -1916,9 +1952,9 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             // the normal buffer — that is the screen the user saw last and the
             // only content we record for the finished block. Skip it if the alt
             // app left nothing distinct from the pre-alt baseline.
-            let final_frame = super::alt::normalize_pager_snapshot(
-                &super::alt::visible_vte_text(&ctx.active_vte),
-            );
+            let final_frame = super::alt::normalize_pager_snapshot(&super::alt::visible_vte_text(
+                &ctx.active_vte,
+            ));
             ctx.active_vte.feed(b"\x1b[?1049l");
             let baseline = ctx.pager_preclear.replace(String::new());
             if !final_frame.is_empty() && final_frame != baseline {
@@ -2033,7 +2069,6 @@ fn build_color_query_reply(ctx: &Rc<Ctx>, kind: ColorKind) -> String {
     }
 }
 
-
 /// Append streamed command output under a memory bound: the first
 /// `OUTPUT_HEAD_CAP` bytes are kept verbatim in `out_buf`, and the last
 /// `OUTPUT_TAIL_CAP` bytes roll through `out_tail`. `out_total` records the true
@@ -2069,7 +2104,11 @@ fn append_captured(ctx: &Rc<Ctx>, bytes: &[u8]) {
 fn captured_output(ctx: &Rc<Ctx>) -> Vec<u8> {
     match captured_parts(ctx) {
         CapturedParts::Whole(bytes) => bytes,
-        CapturedParts::Split { head, tail, omitted } => {
+        CapturedParts::Split {
+            head,
+            tail,
+            omitted,
+        } => {
             let mut out = head;
             out.extend_from_slice(format!("\n…({omitted} bytes omitted)…\n").as_bytes());
             out.extend_from_slice(&tail);
@@ -2083,7 +2122,11 @@ fn captured_output(ctx: &Rc<Ctx>) -> Vec<u8> {
 /// independently so the omission marker doesn't corrupt SGR / cursor state.
 enum CapturedParts {
     Whole(Vec<u8>),
-    Split { head: Vec<u8>, tail: Vec<u8>, omitted: usize },
+    Split {
+        head: Vec<u8>,
+        tail: Vec<u8>,
+        omitted: usize,
+    },
 }
 
 fn captured_parts(ctx: &Rc<Ctx>) -> CapturedParts {
@@ -2169,7 +2212,11 @@ fn scrape_command_output(ctx: &Rc<Ctx>) -> Option<String> {
     };
     Some(match parts {
         CapturedParts::Whole(bytes) => render(&bytes),
-        CapturedParts::Split { head, tail, omitted } => {
+        CapturedParts::Split {
+            head,
+            tail,
+            omitted,
+        } => {
             // Replay head and tail through independent grid emulators, then
             // join with the omission marker as text. Feeding the marker
             // through the grid would let stray SGR state from the head leak
@@ -2473,7 +2520,9 @@ fn update_active_height(ctx: &Rc<Ctx>) {
         if std::env::var_os("JTERM1_DBG").is_some() {
             eprintln!(
                 "[DBG] resize grid {} -> {} rows (fs={})",
-                ctx.active_vte.row_count(), target_rows, ctx.fullscreen.get(),
+                ctx.active_vte.row_count(),
+                target_rows,
+                ctx.fullscreen.get(),
             );
         }
         ctx.active_vte.set_size(cols, target_rows);
@@ -2496,8 +2545,7 @@ fn resize_active_to_fullscreen(ctx: &Rc<Ctx>) {
     }
     let cols = ctx.active_vte.column_count().max(1);
     let chrome = active_card_vchrome_px(&ctx.active_holder);
-    let max_rows = (((page_px - chrome).max(ch as f64)) as i64 / ch)
-        .max(MIN_ACTIVE_ROWS);
+    let max_rows = (((page_px - chrome).max(ch as f64)) as i64 / ch).max(MIN_ACTIVE_ROWS);
     if std::env::var_os("JTERM1_DBG").is_some() {
         eprintln!(
             "[DBG] tui pre-promote -> {}x{} (sync PTY resize)",
@@ -2564,7 +2612,10 @@ fn first_program_word(cmd: &str) -> Option<String> {
             rest = rest[first.len()..].trim_start();
             continue;
         }
-        if matches!(first, "sudo" | "doas" | "command" | "env" | "nice" | "ionice") {
+        if matches!(
+            first,
+            "sudo" | "doas" | "command" | "env" | "nice" | "ionice"
+        ) {
             rest = rest[first.len()..].trim_start();
             continue;
         }
@@ -2581,18 +2632,50 @@ fn first_program_word(cmd: &str) -> Option<String> {
 /// `/proc`-based fallback probe (matching against the kernel's `comm` field).
 const TUI_BASENAMES: &[&str] = &[
     // process / system viewers
-    "top", "htop", "btop", "btm", "atop", "iotop", "nethogs", "nload",
-    "powertop", "iftop", "bmon",
+    "top",
+    "htop",
+    "btop",
+    "btm",
+    "atop",
+    "iotop",
+    "nethogs",
+    "nload",
+    "powertop",
+    "iftop",
+    "bmon",
     // editors
-    "vim", "vi", "nvim", "neovim", "nano", "pico", "emacs",
+    "vim",
+    "vi",
+    "nvim",
+    "neovim",
+    "nano",
+    "pico",
+    "emacs",
     // pagers
-    "less", "more", "most", "pager",
+    "less",
+    "more",
+    "most",
+    "pager",
     // file managers / explorers
-    "ranger", "nnn", "mc", "lf", "vifm",
+    "ranger",
+    "nnn",
+    "mc",
+    "lf",
+    "vifm",
     // disk / inspection tools
-    "ncdu", "dust", "tig", "lazygit", "lazydocker", "k9s",
+    "ncdu",
+    "dust",
+    "tig",
+    "lazygit",
+    "lazydocker",
+    "k9s",
     // misc
-    "watch", "man", "fzf", "tldr", "alsamixer", "ttyper",
+    "watch",
+    "man",
+    "fzf",
+    "tldr",
+    "alsamixer",
+    "ttyper",
 ];
 
 fn is_tui_basename(name: &str) -> bool {
@@ -2659,7 +2742,9 @@ fn tui_probe_tick(ctx: &Rc<Ctx>) {
         return;
     }
     // Some other process group is foreground. Check whether it looks like a TUI.
-    let Some(comm) = read_proc_comm(fg_pgid) else { return };
+    let Some(comm) = read_proc_comm(fg_pgid) else {
+        return;
+    };
     if is_tui_basename(&comm) {
         if !ctx.tui_promoted.get() && !ctx.fullscreen.get() {
             ctx.tui_promoted.set(true);
@@ -2851,8 +2936,18 @@ fn finalize_block(ctx: &Rc<Ctx>, sender: Option<&ComponentSender<BlockTerminal>>
     let images: Vec<gtk::gdk::Texture> = ctx.pending_images.borrow_mut().drain(..).collect();
     ctx.kitty_pending_bytes.set(0);
     let meta = build_finished_block(
-        ctx, id, &prompt, &command, &output, exit_code, &cwd, git_branch.as_deref(),
-        duration, end_time_ms, false, &images,
+        ctx,
+        id,
+        &prompt,
+        &command,
+        &output,
+        exit_code,
+        &cwd,
+        git_branch.as_deref(),
+        duration,
+        end_time_ms,
+        false,
+        &images,
     );
     let widget = meta.widget.clone();
     let duration_ms = meta.duration_ms;
@@ -2863,7 +2958,18 @@ fn finalize_block(ctx: &Rc<Ctx>, sender: Option<&ComponentSender<BlockTerminal>>
     widget.set_visible(block_visible(ctx, &meta));
     ctx.finished.borrow_mut().push(meta);
 
-    append_block_history(ctx, &prompt, &command, &output, exit_code, &cwd, duration_ms, end_time_ms, false, git_branch.as_deref());
+    append_block_history(
+        ctx,
+        &prompt,
+        &command,
+        &output,
+        exit_code,
+        &cwd,
+        duration_ms,
+        end_time_ms,
+        false,
+        git_branch.as_deref(),
+    );
 
     let new_idx = ctx.finished.borrow().len() - 1;
     pulse_block(ctx, new_idx, exit_code == 0);
@@ -2994,7 +3100,11 @@ struct BlockExport {
 
 impl BlockExport {
     fn from_block(b: &FinishedBlock) -> Self {
-        let duration_ms = if b.duration_ms > 0 { Some(b.duration_ms) } else { None };
+        let duration_ms = if b.duration_ms > 0 {
+            Some(b.duration_ms)
+        } else {
+            None
+        };
         let start_time_ms = match (b.end_time_ms, duration_ms) {
             (Some(end), Some(dur)) => Some(end.saturating_sub(dur)),
             _ => None,
@@ -3010,7 +3120,11 @@ impl BlockExport {
             start_time_ms,
             end_time_ms: b.end_time_ms,
             duration_ms,
-            cwd: if b.cwd.is_empty() { None } else { Some(b.cwd.clone()) },
+            cwd: if b.cwd.is_empty() {
+                None
+            } else {
+                Some(b.cwd.clone())
+            },
         }
     }
 
@@ -3280,7 +3394,11 @@ fn visible_indices(ctx: &Rc<Ctx>) -> Vec<usize> {
 /// Select the first (or last) currently-visible block.
 fn jump_block_edge(ctx: &Rc<Ctx>, first: bool) {
     let visible = visible_indices(ctx);
-    let target = if first { visible.first() } else { visible.last() };
+    let target = if first {
+        visible.first()
+    } else {
+        visible.last()
+    };
     if let Some(&idx) = target {
         select_block(ctx, Some(idx));
     }
@@ -3472,7 +3590,11 @@ fn build_finished_block(
     let index_badge_ret = index_badge.clone();
 
     // Status icon: Nerd Font check () on success, times () on failure.
-    let status = gtk::Label::new(Some(if exit_code == 0 { "\u{f00c}" } else { "\u{f00d}" }));
+    let status = gtk::Label::new(Some(if exit_code == 0 {
+        "\u{f00c}"
+    } else {
+        "\u{f00d}"
+    }));
     status.add_css_class(if exit_code == 0 {
         "block-status-ok"
     } else {
@@ -3814,7 +3936,11 @@ fn build_finished_block(
             if let Some(ib) = &images_box {
                 ib.set_visible(!now_collapsed);
             }
-            btn.set_label(if now_collapsed { "\u{f054}" } else { "\u{f078}" });
+            btn.set_label(if now_collapsed {
+                "\u{f054}"
+            } else {
+                "\u{f078}"
+            });
         });
     }
     if collapsed.get() {
@@ -3890,7 +4016,10 @@ fn apply_line_highlight(view: &gtk::TextView, offsets: &[i32], tag_name: &str, b
     let buffer = view.buffer();
     let table = buffer.tag_table();
     let tag = table.lookup(tag_name).unwrap_or_else(|| {
-        let t = gtk::TextTag::builder().name(tag_name).background(bg).build();
+        let t = gtk::TextTag::builder()
+            .name(tag_name)
+            .background(bg)
+            .build();
         table.add(&t);
         t
     });
@@ -3933,30 +4062,25 @@ fn detect_error_offsets(plain: &str) -> Vec<i32> {
 /// error) arrives; the user can dismiss at any point — the in-flight HTTP
 /// is cancelled so a late reply doesn't try to populate a closed window.
 fn show_explain_dialog(ctx: &Rc<Ctx>, id: u64, anchor: &gtk::Button) {
-    use relm4::adw;
     use adw::prelude::*;
+    use relm4::adw;
 
     // Snapshot the block so the dialog (which outlives the click) doesn't
     // need to keep borrowing `ctx.finished`.
-    let (command, plain_output, exit_code, cwd) = match ctx
-        .finished
-        .borrow()
-        .iter()
-        .find(|b| b.id == id)
-    {
-        Some(b) => (
-            b.command.clone(),
-            b.plain_output.clone(),
-            b.exit_code,
-            b.cwd.clone(),
-        ),
-        None => return,
-    };
+    let (command, plain_output, exit_code, cwd) =
+        match ctx.finished.borrow().iter().find(|b| b.id == id) {
+            Some(b) => (
+                b.command.clone(),
+                b.plain_output.clone(),
+                b.exit_code,
+                b.cwd.clone(),
+            ),
+            None => return,
+        };
 
     // Locate the parent window so adw::Dialog has a presentation target.
-    let parent_window: Option<gtk::Window> = anchor
-        .root()
-        .and_then(|r| r.downcast::<gtk::Window>().ok());
+    let parent_window: Option<gtk::Window> =
+        anchor.root().and_then(|r| r.downcast::<gtk::Window>().ok());
 
     let dialog = adw::Dialog::builder()
         .title("Explain error")
@@ -4095,7 +4219,11 @@ fn show_block_menu(ctx: &Rc<Ctx>, id: u64, anchor: &gtk::Box, x: f64, y: f64) {
         .find(|b| b.id == id)
         .map(|b| (b.pinned, b.exit_code != 0))
         .unwrap_or((false, false));
-    let pin_label = if is_pinned { "Unpin Block" } else { "Pin Block" };
+    let pin_label = if is_pinned {
+        "Unpin Block"
+    } else {
+        "Pin Block"
+    };
     let mut items: Vec<(&str, fn(&Rc<Ctx>, u64))> = vec![
         ("Recall Command", recall_block_by_id),
         ("Rerun Command", rerun_block_by_id),
@@ -4381,18 +4509,11 @@ fn hit_test_block(ctx: &Rc<Ctx>, list_x: f64, list_y: f64) -> Option<(usize, Vie
                 continue;
             };
             let (lx, ly) = (local.x() as f64, local.y() as f64);
-            if lx < 0.0
-                || ly < 0.0
-                || lx > view.width() as f64
-                || ly > view.height() as f64
-            {
+            if lx < 0.0 || ly < 0.0 || lx > view.width() as f64 || ly > view.height() as f64 {
                 continue;
             }
-            let (bx, by) = view.window_to_buffer_coords(
-                gtk::TextWindowType::Widget,
-                lx as i32,
-                ly as i32,
-            );
+            let (bx, by) =
+                view.window_to_buffer_coords(gtk::TextWindowType::Widget, lx as i32, ly as i32);
             let iter = view.iter_at_location(bx, by).unwrap_or_else(|| {
                 // Past end of text: clamp to end of buffer.
                 view.buffer().end_iter()
@@ -4479,10 +4600,7 @@ fn strip_ansi(input: &[u8]) -> String {
                                 i += 1;
                                 break;
                             }
-                            if input[i] == 0x1b
-                                && i + 1 < input.len()
-                                && input[i + 1] == b'\\'
-                            {
+                            if input[i] == 0x1b && i + 1 < input.len() && input[i + 1] == b'\\' {
                                 i += 2;
                                 break;
                             }
@@ -4538,7 +4656,12 @@ fn chrono_local_offset_secs() -> i64 {
 fn format_clock(end_time_ms: u64) -> String {
     let secs = end_time_ms / 1000;
     let local = (secs as i64 + chrono_local_offset_secs()).rem_euclid(86400) as u64;
-    format!("{:02}:{:02}:{:02}", local / 3600, (local % 3600) / 60, local % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        local / 3600,
+        (local % 3600) / 60,
+        local % 60
+    )
 }
 
 fn format_duration(d: Duration) -> String {
@@ -4616,8 +4739,11 @@ fn update_active_prompt(ctx: &Rc<Ctx>) {
         ctx.active_prompt.set_visible(false);
         return;
     }
-    ctx.active_prompt
-        .append(&make_chip(&shorten_path(&cwd), Some("\u{f07c}"), "block-chip-cwd"));
+    ctx.active_prompt.append(&make_chip(
+        &shorten_path(&cwd),
+        Some("\u{f07c}"),
+        "block-chip-cwd",
+    ));
     if let Some(branch) = git_branch(&cwd) {
         ctx.active_prompt
             .append(&make_chip(&branch, Some("\u{e0a0}"), "block-chip-git"));
@@ -4719,7 +4845,9 @@ fn rebuild_minimap(ctx: &Rc<Ctx>) {
     }
     let finished = ctx.finished.borrow();
     for &idx in &visible {
-        let Some(block) = finished.get(idx) else { continue };
+        let Some(block) = finished.get(idx) else {
+            continue;
+        };
         let tick = build_minimap_tick(ctx, idx, block);
         ctx.minimap.append(&tick);
     }
@@ -4747,7 +4875,9 @@ fn append_minimap_tick(ctx: &Rc<Ctx>) {
     }
     let Some(&idx) = visible.last() else { return };
     let finished = ctx.finished.borrow();
-    let Some(block) = finished.get(idx) else { return };
+    let Some(block) = finished.get(idx) else {
+        return;
+    };
     let tick = build_minimap_tick(ctx, idx, block);
     ctx.minimap.append(&tick);
 }
@@ -4777,9 +4907,15 @@ fn pulse_block(ctx: &Rc<Ctx>, idx: usize, ok: bool) {
         return;
     }
     let finished = ctx.finished.borrow();
-    let Some(block) = finished.get(idx) else { return };
+    let Some(block) = finished.get(idx) else {
+        return;
+    };
     let widget = block.widget.clone();
-    let class = if ok { "block-pulse-ok" } else { "block-pulse-bad" };
+    let class = if ok {
+        "block-pulse-ok"
+    } else {
+        "block-pulse-bad"
+    };
     widget.add_css_class(class);
     glib::timeout_add_local_once(Duration::from_millis(700), move || {
         widget.remove_css_class(class);
@@ -4793,7 +4929,9 @@ fn scroll_to_first_error(ctx: &Rc<Ctx>, idx: usize) {
     let err_bg = error_highlight_bg(ctx);
     {
         let finished = ctx.finished.borrow();
-        let Some(block) = finished.get(idx) else { return };
+        let Some(block) = finished.get(idx) else {
+            return;
+        };
         if block.error_offsets.is_empty() {
             return;
         }
@@ -4829,8 +4967,14 @@ fn scroll_to_first_error(ctx: &Rc<Ctx>, idx: usize) {
 /// it in their notification centers.
 fn show_toast(_ctx: &Rc<Ctx>, _idx: usize, command: &str, duration: Option<Duration>, ok: bool) {
     use gtk::gio::{self, prelude::*};
-    let Some(app) = gio::Application::default() else { return };
-    let title = if ok { "Command finished" } else { "Command failed" };
+    let Some(app) = gio::Application::default() else {
+        return;
+    };
+    let title = if ok {
+        "Command finished"
+    } else {
+        "Command failed"
+    };
     let dur = duration
         .map(|d| format!("  ·  {}", format_duration(d)))
         .unwrap_or_default();
@@ -4897,7 +5041,12 @@ fn show_cheatsheet(ctx: &Rc<Ctx>) {
 
 fn copy_error_report_by_id(ctx: &Rc<Ctx>, id: u64) {
     if let Some(b) = ctx.finished.borrow().iter().find(|b| b.id == id) {
-        set_clipboard(&build_error_report(&b.command, &b.cwd, b.exit_code, &b.plain_output));
+        set_clipboard(&build_error_report(
+            &b.command,
+            &b.cwd,
+            b.exit_code,
+            &b.plain_output,
+        ));
     }
 }
 
@@ -4907,7 +5056,11 @@ fn build_error_report(command: &str, cwd: &str, exit_code: i32, output: &str) ->
     const TAIL: usize = 80;
     let lines: Vec<&str> = output.lines().collect();
     let start = lines.len().saturating_sub(TAIL);
-    let elision = if start > 0 { "…(earlier output omitted)…\n" } else { "" };
+    let elision = if start > 0 {
+        "…(earlier output omitted)…\n"
+    } else {
+        ""
+    };
     let tail = lines[start..].join("\n");
     format!("$ {command}\n# cwd: {cwd}\n# exit code: {exit_code}\n\n{elision}{tail}")
 }
@@ -5040,7 +5193,9 @@ fn install_block_css(config: &Config) {
         (config.font_desc.clone(), 14)
     };
     let font_family = font_family.replace('\\', "\\\\").replace('"', "\\\"");
-    let scaled_size = (base_size as f64 * config.default_font_scale).round().max(1.0) as i32;
+    let scaled_size = (base_size as f64 * config.default_font_scale)
+        .round()
+        .max(1.0) as i32;
     let font_size = format!("{}pt", scaled_size);
 
     // Failed blocks get a full-block red tint (Warp tints failed blocks ~10%).
@@ -5055,8 +5210,16 @@ fn install_block_css(config: &Config) {
     let active_pad_v = if compact { "1px" } else { "4px" };
     let hdr_pad = if compact { "1px 8px" } else { "3px 8px" };
     let cmd_pad = if compact { "0 16px" } else { "2px 16px 0 16px" };
-    let out_pad = if compact { "0 16px 2px 16px" } else { "0 16px 4px 16px" };
-    let prompt_pad = if compact { "1px 16px 0 16px" } else { "2px 16px 0 16px" };
+    let out_pad = if compact {
+        "0 16px 2px 16px"
+    } else {
+        "0 16px 4px 16px"
+    };
+    let prompt_pad = if compact {
+        "1px 16px 0 16px"
+    } else {
+        "2px 16px 0 16px"
+    };
 
     let css = format!(
         r#"

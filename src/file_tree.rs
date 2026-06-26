@@ -105,12 +105,18 @@ pub(crate) fn on_expand(store: &TreeStore, iter: &TreeIter) {
     let Some(first_child) = store.iter_children(Some(iter)) else {
         return;
     };
-    let child_path: String = store.get_value(&first_child, COL_PATH as i32).get().unwrap_or_default();
+    let child_path: String = store
+        .get_value(&first_child, COL_PATH as i32)
+        .get()
+        .unwrap_or_default();
     if !child_path.is_empty() {
         return; // already populated
     }
     store.remove(&first_child);
-    let dir_path: String = store.get_value(iter, COL_PATH as i32).get().unwrap_or_default();
+    let dir_path: String = store
+        .get_value(iter, COL_PATH as i32)
+        .get()
+        .unwrap_or_default();
     if !dir_path.is_empty() {
         populate_dir(store, Some(iter), Path::new(&dir_path));
     }

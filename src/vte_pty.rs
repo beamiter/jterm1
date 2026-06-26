@@ -210,14 +210,17 @@ impl VtePty {
             // is acceptable here.
             let local = self.local.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
-                let raw = match local.lock().ok().and_then(|g| g.as_ref().map(|f| f.as_raw_fd())) {
+                let raw = match local
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|f| f.as_raw_fd()))
+                {
                     Some(fd) => fd,
                     None => return glib::ControlFlow::Break,
                 };
                 let mut buf = [0u8; 4096];
-                let n = unsafe {
-                    libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                };
+                let n =
+                    unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                 if n > 0 {
                     let n = n as usize;
                     callback(buf[..n].to_vec());

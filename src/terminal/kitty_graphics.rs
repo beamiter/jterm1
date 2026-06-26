@@ -297,14 +297,16 @@ fn rgba_to_texture(width: u32, height: u32, data: &[u8], has_alpha: bool) -> Opt
         (width as usize * 4, out)
     };
     let gbytes = glib::Bytes::from(&bytes);
-    Some(gdk::MemoryTexture::new(
-        width as i32,
-        height as i32,
-        gdk::MemoryFormat::R8g8b8a8,
-        &gbytes,
-        stride,
+    Some(
+        gdk::MemoryTexture::new(
+            width as i32,
+            height as i32,
+            gdk::MemoryFormat::R8g8b8a8,
+            &gbytes,
+            stride,
+        )
+        .upcast(),
     )
-    .upcast())
 }
 
 #[cfg(test)]
@@ -359,7 +361,10 @@ mod tests {
     #[test]
     fn file_transport_is_skipped() {
         let mut a = Assembler::new();
-        assert!(matches!(a.feed(b"Ga=T,t=f;L3RtcC9hLnBuZw=="), Outcome::Skipped));
+        assert!(matches!(
+            a.feed(b"Ga=T,t=f;L3RtcC9hLnBuZw=="),
+            Outcome::Skipped
+        ));
     }
 
     #[test]

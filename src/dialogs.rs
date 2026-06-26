@@ -4,13 +4,13 @@
 //! User choices are dispatched back to `AppModel` as `AppMsg` via the component
 //! sender (the relm4 way), rather than mutating model state from GTK closures.
 
-use relm4::adw;
-use relm4::gtk;
-use relm4::ComponentSender;
 use adw::prelude::*;
 use gtk::gdk::Key;
 use gtk::gdk::ModifierType;
 use gtk::pango::FontDescription;
+use relm4::adw;
+use relm4::gtk;
+use relm4::ComponentSender;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -29,7 +29,15 @@ pub(crate) fn toggle_command_palette(
     dialog_ref: &Rc<RefCell<Option<adw::Dialog>>>,
     sender: &ComponentSender<AppModel>,
 ) {
-    toggle_palette(window, kbmap, None, workflows, dialog_ref, sender, PaletteMode::Commands);
+    toggle_palette(
+        window,
+        kbmap,
+        None,
+        workflows,
+        dialog_ref,
+        sender,
+        PaletteMode::Commands,
+    );
 }
 
 /// Fuzzy palette over actions, shell history, and workflows. `default_mode`
@@ -167,7 +175,9 @@ pub(crate) fn toggle_palette(
         let dialog = dialog.clone();
         let accepts = accepts.clone();
         Rc::new(move |idx: i32| {
-            if idx < 0 { return; }
+            if idx < 0 {
+                return;
+            }
             let accept = match accepts.borrow().get(idx as usize) {
                 Some(a) => a.clone(),
                 None => return,
@@ -353,7 +363,9 @@ pub(crate) fn toggle_history_popover(
         let accepts = accepts.clone();
         let popover_ref = popover_ref.clone();
         Rc::new(move |idx: i32| {
-            if idx < 0 { return; }
+            if idx < 0 {
+                return;
+            }
             let accept = match accepts.borrow().get(idx as usize) {
                 Some(a) => a.clone(),
                 None => return,
@@ -471,10 +483,7 @@ pub(crate) fn show_workflow_param_dialog(
     // Preview the command template so users can see what the placeholders
     // affect before filling them in.
     let preview = gtk::Label::new(None);
-    preview.set_markup(&format!(
-        "<tt>{}</tt>",
-        glib_escape(&workflow.command)
-    ));
+    preview.set_markup(&format!("<tt>{}</tt>", glib_escape(&workflow.command)));
     preview.set_halign(gtk::Align::Start);
     preview.set_wrap(true);
     preview.set_selectable(true);
@@ -868,7 +877,10 @@ pub(crate) fn toggle_settings(
         .title("Font")
         .model(&font_model)
         .build();
-    let current_font_idx = mono_fonts.iter().position(|f| f == &current_family).unwrap_or(0);
+    let current_font_idx = mono_fonts
+        .iter()
+        .position(|f| f == &current_family)
+        .unwrap_or(0);
     font_row.set_selected(current_font_idx as u32);
     group.add(&font_row);
 

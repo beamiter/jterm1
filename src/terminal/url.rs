@@ -5,10 +5,10 @@
 //! [`super::ansi`]. Hovering a URL underlines it and shows the pointer cursor.
 //! Ported from jterm4's `block_view/url.rs`.
 
+use gtk::prelude::*;
 use gtk4::gio;
 use gtk4::TextBuffer;
 use relm4::gtk;
-use gtk::prelude::*;
 
 use super::select::get_semantic_bounds_at_position;
 

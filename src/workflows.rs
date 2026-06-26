@@ -105,7 +105,10 @@ pub(crate) fn user_workflow_dir() -> PathBuf {
 /// Substitute `{{name}}` occurrences with values from `values`. Returns an
 /// error listing any unresolved placeholders so the UI can surface them
 /// instead of silently emitting a half-rendered command.
-pub(crate) fn render(workflow: &Workflow, values: &HashMap<String, String>) -> Result<String, String> {
+pub(crate) fn render(
+    workflow: &Workflow,
+    values: &HashMap<String, String>,
+) -> Result<String, String> {
     let mut out = String::with_capacity(workflow.command.len());
     let bytes = workflow.command.as_bytes();
     let mut i = 0;
@@ -190,10 +193,11 @@ mod tests {
 
     #[test]
     fn render_uses_declared_default_when_value_missing() {
-        let w = wf("t", "echo {{greeting}} {{name}}", &[
-            ("greeting", Some("hi")),
-            ("name", Some("world")),
-        ]);
+        let w = wf(
+            "t",
+            "echo {{greeting}} {{name}}",
+            &[("greeting", Some("hi")), ("name", Some("world"))],
+        );
         let v = HashMap::new();
         assert_eq!(render(&w, &v).unwrap(), "echo hi world");
     }

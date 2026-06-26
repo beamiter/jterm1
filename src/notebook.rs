@@ -24,9 +24,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+use adw::prelude::*;
 use relm4::adw;
 use relm4::gtk;
-use adw::prelude::*;
 
 /// Max bytes of captured output retained per cell run before truncation.
 /// Matches the spirit of `block.rs`'s raw-output cap — bounded memory even
@@ -211,9 +211,12 @@ pub(crate) fn open_notebook_dialog(window: &adw::ApplicationWindow, path: &Path)
     let segments = parse_segments(&text);
 
     let dialog = adw::Dialog::builder()
-        .title(&format!("Notebook: {}", path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())))
+        .title(&format!(
+            "Notebook: {}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        ))
         .content_width(880)
         .content_height(680)
         .build();
@@ -298,7 +301,10 @@ fn build_code_cell(
     cwd: &Path,
     handles: &Rc<RefCell<Vec<Rc<CellHandle>>>>,
 ) -> gtk::Frame {
-    let runnable = matches!(lang.to_ascii_lowercase().as_str(), "bash" | "sh" | "shell" | "");
+    let runnable = matches!(
+        lang.to_ascii_lowercase().as_str(),
+        "bash" | "sh" | "shell" | ""
+    );
 
     let frame = gtk::Frame::new(None);
     frame.add_css_class("card");
@@ -498,7 +504,9 @@ fn spawn_cell(
                     match so.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            if chunk_tx_o.send(buf[..n].to_vec()).is_err() { break; }
+                            if chunk_tx_o.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
                         }
                         Err(_) => break,
                     }
@@ -516,7 +524,9 @@ fn spawn_cell(
                     match se.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            if chunk_tx_e.send(buf[..n].to_vec()).is_err() { break; }
+                            if chunk_tx_e.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
                         }
                         Err(_) => break,
                     }
@@ -540,8 +550,12 @@ fn spawn_cell(
 
         // Drain readers before we report done so chunks don't arrive after
         // the exit notification (UI order-sensitive).
-        if let Some(jh) = stdout_thread { let _ = jh.join(); }
-        if let Some(jh) = stderr_thread { let _ = jh.join(); }
+        if let Some(jh) = stdout_thread {
+            let _ = jh.join();
+        }
+        if let Some(jh) = stderr_thread {
+            let _ = jh.join();
+        }
         drop(chunk_tx);
 
         let result = match exit {
@@ -702,6 +716,9 @@ mod tests {
     fn fence_with_leading_spaces_recognised() {
         let md = "  ```bash\necho ok\n  ```\n";
         let segs = parse_segments(md);
-        assert!(matches!(segs.first(), Some(Segment::Code { .. })), "got {segs:?}");
+        assert!(
+            matches!(segs.first(), Some(Segment::Code { .. })),
+            "got {segs:?}"
+        );
     }
 }

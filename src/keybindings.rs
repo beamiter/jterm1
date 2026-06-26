@@ -402,10 +402,17 @@ pub(crate) fn key_combo_to_string(combo: &KeyCombo) -> String {
         Key::Delete => "Delete".to_string(),
         Key::Home => "Home".to_string(),
         Key::End => "End".to_string(),
-        k => k.name().map(|n| {
-            let s = n.to_string();
-            if s.len() == 1 { s.to_uppercase() } else { s }
-        }).unwrap_or_else(|| "?".to_string()),
+        k => k
+            .name()
+            .map(|n| {
+                let s = n.to_string();
+                if s.len() == 1 {
+                    s.to_uppercase()
+                } else {
+                    s
+                }
+            })
+            .unwrap_or_else(|| "?".to_string()),
     };
 
     let mut result = parts.join("+");
@@ -447,7 +454,7 @@ impl KeybindingMap {
         // UI over readline). OpenPalette (all sources) is unbound by default
         // because Ctrl+p would steal readline's previous-history binding;
         // users who want it can set it in config.
-        bind("Ctrl+r",       Action::OpenHistoryPalette);
+        bind("Ctrl+r", Action::OpenHistoryPalette);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
         bind("Ctrl+backslash", Action::ToggleSidebar);
         bind("Ctrl+Shift+L", Action::FilterTabs);
@@ -522,8 +529,12 @@ impl KeybindingMap {
 
             // Parse and add new binding
             match parse_key_combo(key_str) {
-                Ok(combo) => { self.bindings.insert(combo, action); }
-                Err(e) => { log::warn!("Invalid keybinding '{key_str}' for {config_key}: {e}"); }
+                Ok(combo) => {
+                    self.bindings.insert(combo, action);
+                }
+                Err(e) => {
+                    log::warn!("Invalid keybinding '{key_str}' for {config_key}: {e}");
+                }
             }
         }
     }
@@ -533,7 +544,9 @@ impl KeybindingMap {
     }
 
     pub(crate) fn binding_display(&self, action: &Action) -> String {
-        let combos: Vec<_> = self.bindings.iter()
+        let combos: Vec<_> = self
+            .bindings
+            .iter()
             .filter(|(_, a)| *a == action)
             .map(|(k, _)| key_combo_to_string(k))
             .collect();

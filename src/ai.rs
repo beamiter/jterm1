@@ -57,9 +57,17 @@ impl AiClient {
             Some("ollama") => Provider::Ollama,
             // Unknown explicit choice → fall through to auto-detect.
             _ => {
-                if std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()).is_some() {
+                if std::env::var("ANTHROPIC_API_KEY")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .is_some()
+                {
                     Provider::Anthropic
-                } else if std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty()).is_some() {
+                } else if std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .is_some()
+                {
                     Provider::OpenAI
                 } else {
                     Provider::Ollama
@@ -90,7 +98,8 @@ impl AiClient {
             provider,
             api_key,
             model: std::env::var("JTERM1_AI_MODEL").unwrap_or_else(|_| default_model.to_string()),
-            base_url: std::env::var("JTERM1_AI_BASE_URL").unwrap_or_else(|_| default_url.to_string()),
+            base_url: std::env::var("JTERM1_AI_BASE_URL")
+                .unwrap_or_else(|_| default_url.to_string()),
         })
     }
 
@@ -138,8 +147,7 @@ pub(crate) fn ask(
     let slot_thread = slot.clone();
     let slot_main = slot.clone();
     // `on_done` is FnOnce; wrap in Option so the idle closure can take it.
-    let mut on_done_cell: Option<Box<dyn FnOnce(Result<String, String>)>> =
-        Some(Box::new(on_done));
+    let mut on_done_cell: Option<Box<dyn FnOnce(Result<String, String>)>> = Some(Box::new(on_done));
 
     std::thread::spawn(move || {
         let result = run_request(&client, &system, &user);
@@ -213,7 +221,10 @@ fn call_anthropic(client: &AiClient, system: &str, user: &str) -> Result<String,
     } else if let Some(msg) = v["error"]["message"].as_str() {
         Err(msg.to_string())
     } else {
-        Err(format!("unexpected anthropic response: {}", trim_for_log(&text)))
+        Err(format!(
+            "unexpected anthropic response: {}",
+            trim_for_log(&text)
+        ))
     }
 }
 
@@ -227,7 +238,9 @@ fn call_openai(client: &AiClient, system: &str, user: &str) -> Result<String, St
             {"role": "user", "content": user},
         ],
     });
-    let mut req = http_agent().post(&url).set("Content-Type", "application/json");
+    let mut req = http_agent()
+        .post(&url)
+        .set("Content-Type", "application/json");
     if let Some(key) = &client.api_key {
         req = req.set("Authorization", &format!("Bearer {key}"));
     }
@@ -241,7 +254,10 @@ fn call_openai(client: &AiClient, system: &str, user: &str) -> Result<String, St
     } else if let Some(msg) = v["error"]["message"].as_str() {
         Err(msg.to_string())
     } else {
-        Err(format!("unexpected openai response: {}", trim_for_log(&text)))
+        Err(format!(
+            "unexpected openai response: {}",
+            trim_for_log(&text)
+        ))
     }
 }
 
@@ -266,7 +282,10 @@ fn call_ollama(client: &AiClient, system: &str, user: &str) -> Result<String, St
     } else if let Some(msg) = v["error"].as_str() {
         Err(msg.to_string())
     } else {
-        Err(format!("unexpected ollama response: {}", trim_for_log(&text)))
+        Err(format!(
+            "unexpected ollama response: {}",
+            trim_for_log(&text)
+        ))
     }
 }
 
@@ -289,7 +308,10 @@ fn sample_output(output: &str, max_bytes: usize) -> String {
     let half = max_bytes / 2;
     let head = &output[..half];
     let tail = &output[output.len() - half..];
-    format!("{head}\n\n… [{} bytes elided] …\n\n{tail}", output.len() - max_bytes)
+    format!(
+        "{head}\n\n… [{} bytes elided] …\n\n{tail}",
+        output.len() - max_bytes
+    )
 }
 
 /// Build the system+user prompt for "explain why this failed and how to fix it".
@@ -306,9 +328,7 @@ Read the command, its output, and its exit code. Reply with:\n\
 Be terse. No markdown headers. No filler. If the error is ambiguous, say so."
         .to_string();
     let sample = sample_output(output, 8 * 1024);
-    let user = format!(
-        "cwd: {cwd}\nexit: {exit_code}\ncommand:\n{command}\n\noutput:\n{sample}"
-    );
+    let user = format!("cwd: {cwd}\nexit: {exit_code}\ncommand:\n{command}\n\noutput:\n{sample}");
     (system, user)
 }
 
@@ -371,10 +391,7 @@ Assistant: {{\"action\":\"done\",\"message\":\"Port 5432 is free.\"}}\n\
 
 /// Build the system+user prompt for the session panel, optionally seeded
 /// with the most recent block context.
-pub(crate) fn build_session_prompt(
-    question: &str,
-    context: Option<&str>,
-) -> (String, String) {
+pub(crate) fn build_session_prompt(question: &str, context: Option<&str>) -> (String, String) {
     let system = "You are a terminal assistant. Answer the user's question concisely. \
 If shell context is attached, use it. No filler, no markdown headers."
         .to_string();

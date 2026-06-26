@@ -6,11 +6,11 @@
 //! final frame) without a full terminal grid. Ported/condensed from jterm4's
 //! `block_view/ansi.rs`.
 
+use gtk::prelude::*;
 use gtk4::gdk::RGBA;
 use gtk4::glib::translate::IntoGlib;
 use gtk4::TextBuffer;
 use relm4::gtk;
-use gtk::prelude::*;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum UnderlineStyle {
@@ -87,7 +87,10 @@ impl<'a> SgrChunks<'a> {
         if matches!(params.first(), Some(&b'?') | Some(&b'>') | Some(&b'=')) {
             params = &params[1..];
         }
-        SgrChunks { rest: params, done: false }
+        SgrChunks {
+            rest: params,
+            done: false,
+        }
     }
 }
 
@@ -130,7 +133,11 @@ fn bytes_to_u8(bytes: &[u8]) -> Option<u8> {
         return None;
     }
     let v = bytes_to_u32(bytes);
-    if v <= 255 { Some(v as u8) } else { None }
+    if v <= 255 {
+        Some(v as u8)
+    } else {
+        None
+    }
 }
 
 fn parse_colon_color_bytes(sub_parts: &[&[u8]], palette: &[RGBA; 16]) -> Option<RGBA> {
@@ -175,10 +182,7 @@ pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[u8], palette: &[RG
             let base = bytes_to_u32(sub_parts[0]);
             match base {
                 4 => {
-                    let sub = sub_parts
-                        .get(1)
-                        .map(|s| bytes_to_u32(s))
-                        .unwrap_or(1);
+                    let sub = sub_parts.get(1).map(|s| bytes_to_u32(s)).unwrap_or(1);
                     style.underline_style = match sub {
                         0 => UnderlineStyle::None,
                         1 => UnderlineStyle::Single,
@@ -204,7 +208,11 @@ pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[u8], palette: &[RG
             continue;
         }
 
-        let param = if part.is_empty() { 0 } else { bytes_to_u32(part) };
+        let param = if part.is_empty() {
+            0
+        } else {
+            bytes_to_u32(part)
+        };
 
         match param {
             0 => {
@@ -530,8 +538,11 @@ pub fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
                         if let Some(rest) = payload.strip_prefix("8;") {
                             if let Some(semi) = rest.find(';') {
                                 let uri = &rest[semi + 1..];
-                                style.hyperlink =
-                                    if uri.is_empty() { None } else { Some(uri.to_string()) };
+                                style.hyperlink = if uri.is_empty() {
+                                    None
+                                } else {
+                                    Some(uri.to_string())
+                                };
                             }
                         }
                     }

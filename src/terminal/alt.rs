@@ -60,7 +60,10 @@ pub(crate) fn normalize_pager_snapshot(text: &str) -> String {
         .filter(|line| !is_pager_chrome_line(line))
         .collect();
 
-    if lines.iter().any(|line| line.trim().contains("...skipping...")) {
+    if lines
+        .iter()
+        .any(|line| line.trim().contains("...skipping..."))
+    {
         return String::new();
     }
 

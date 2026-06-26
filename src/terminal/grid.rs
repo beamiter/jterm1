@@ -50,12 +50,28 @@ pub fn has_cursor_positioning(bytes: &[u8]) -> bool {
                 if matches!(
                     final_b,
                     b'H' | b'f'
-                        | b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G'
-                        | b'd' | b'`'
-                        | b'J' | b'K'
-                        | b'r' | b's' | b'u'
-                        | b'L' | b'M' | b'S' | b'T'
-                        | b'@' | b'P' | b'X' | b'b'
+                        | b'A'
+                        | b'B'
+                        | b'C'
+                        | b'D'
+                        | b'E'
+                        | b'F'
+                        | b'G'
+                        | b'd'
+                        | b'`'
+                        | b'J'
+                        | b'K'
+                        | b'r'
+                        | b's'
+                        | b'u'
+                        | b'L'
+                        | b'M'
+                        | b'S'
+                        | b'T'
+                        | b'@'
+                        | b'P'
+                        | b'X'
+                        | b'b'
                 ) {
                     return true;
                 }
@@ -148,10 +164,7 @@ pub fn render_to_ansi(
                                 j += 1;
                                 break;
                             }
-                            if bytes[j] == 0x1b
-                                && j + 1 < bytes.len()
-                                && bytes[j + 1] == b'\\'
-                            {
+                            if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
                                 term_end = j;
                                 j += 2;
                                 break;
@@ -220,10 +233,7 @@ pub fn render_to_ansi(
                             if bytes[j] == 0x07 {
                                 break;
                             }
-                            if bytes[j] == 0x1b
-                                && j + 1 < bytes.len()
-                                && bytes[j + 1] == b'\\'
-                            {
+                            if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
                                 break;
                             }
                             j += 1;
@@ -231,7 +241,11 @@ pub fn render_to_ansi(
                         let payload_len = j.saturating_sub(body_start);
                         // Skip past terminator if present.
                         let skip_term = if j < bytes.len() {
-                            if bytes[j] == 0x07 { 1 } else { 2 }
+                            if bytes[j] == 0x07 {
+                                1
+                            } else {
+                                2
+                            }
                         } else {
                             0
                         };
@@ -239,11 +253,7 @@ pub fn render_to_ansi(
                         // payloads (DCS and APC). PM/SOS are rare and usually
                         // empty; skip silently.
                         if payload_len > 16 && (kind == b'P' || kind == b'_') {
-                            let label = if kind == b'_' {
-                                "[graphic]"
-                            } else {
-                                "[image]"
-                            };
+                            let label = if kind == b'_' { "[graphic]" } else { "[image]" };
                             for c in label.chars() {
                                 grid.put_char(c);
                             }
@@ -489,14 +499,30 @@ fn pack_rgba(c: &gtk4::gdk::RGBA) -> u32 {
 
 fn style_key(s: &super::ansi::AnsiStyleState) -> StyleKey {
     let mut flags: u16 = 0;
-    if s.bold { flags |= 1 << 0; }
-    if s.italic { flags |= 1 << 1; }
-    if s.strikethrough { flags |= 1 << 2; }
-    if s.dim { flags |= 1 << 3; }
-    if s.reverse { flags |= 1 << 4; }
-    if s.hidden { flags |= 1 << 5; }
-    if s.overline { flags |= 1 << 6; }
-    if s.blink { flags |= 1 << 7; }
+    if s.bold {
+        flags |= 1 << 0;
+    }
+    if s.italic {
+        flags |= 1 << 1;
+    }
+    if s.strikethrough {
+        flags |= 1 << 2;
+    }
+    if s.dim {
+        flags |= 1 << 3;
+    }
+    if s.reverse {
+        flags |= 1 << 4;
+    }
+    if s.hidden {
+        flags |= 1 << 5;
+    }
+    if s.overline {
+        flags |= 1 << 6;
+    }
+    if s.blink {
+        flags |= 1 << 7;
+    }
     flags |= (s.underline_style as u16) << 8;
     StyleKey {
         fg: s.foreground.as_ref().map(pack_rgba),
@@ -1002,33 +1028,30 @@ fn emit_bidi_line(
     cur_id: &mut u16,
     cur_link: &mut Option<String>,
 ) {
-    let emit_char = |c: char,
-                     sid: u16,
-                     out: &mut String,
-                     cur_id: &mut u16,
-                     cur_link: &mut Option<String>| {
-        if sid != *cur_id {
-            let style = &style_table[sid as usize];
-            out.push_str(&super::ansi::encode_sgr(style));
-            let new_link = style.hyperlink.as_deref();
-            if new_link != cur_link.as_deref() {
-                match new_link {
-                    Some(uri) => {
-                        out.push_str("\x1b]8;;");
-                        out.push_str(uri);
-                        out.push_str("\x1b\\");
-                        *cur_link = Some(uri.to_string());
-                    }
-                    None => {
-                        out.push_str("\x1b]8;;\x1b\\");
-                        *cur_link = None;
+    let emit_char =
+        |c: char, sid: u16, out: &mut String, cur_id: &mut u16, cur_link: &mut Option<String>| {
+            if sid != *cur_id {
+                let style = &style_table[sid as usize];
+                out.push_str(&super::ansi::encode_sgr(style));
+                let new_link = style.hyperlink.as_deref();
+                if new_link != cur_link.as_deref() {
+                    match new_link {
+                        Some(uri) => {
+                            out.push_str("\x1b]8;;");
+                            out.push_str(uri);
+                            out.push_str("\x1b\\");
+                            *cur_link = Some(uri.to_string());
+                        }
+                        None => {
+                            out.push_str("\x1b]8;;\x1b\\");
+                            *cur_link = None;
+                        }
                     }
                 }
+                *cur_id = sid;
             }
-            *cur_id = sid;
-        }
-        out.push(c);
-    };
+            out.push(c);
+        };
 
     // Fast path for ASCII-only / LTR-only rows — avoids building a String and
     // running the bidi algorithm for every line of a `git log` output.
@@ -1266,7 +1289,10 @@ mod tests {
         assert!(out.contains("link"));
         assert!(out.contains("https://x.example"), "uri missing: {out:?}");
         // Both the opener and the closer were emitted.
-        assert!(out.matches("\x1b]8;;").count() >= 2, "expected open+close: {out:?}");
+        assert!(
+            out.matches("\x1b]8;;").count() >= 2,
+            "expected open+close: {out:?}"
+        );
     }
 
     #[test]
