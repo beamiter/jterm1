@@ -17,6 +17,7 @@ use gtk4::pango::FontDescription;
 use gtk4::Orientation;
 use relm4::gtk;
 use relm4::prelude::*;
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -189,10 +190,19 @@ struct Ctx {
     /// Command text reconstructed from the active VTE's `commit` keystrokes
     /// (cleaner than scraping the autosuggestion-redrawn output stream).
     typed_cmd: RefCell<String>,
+    /// Last line submitted from VTE to the shell, captured from the real MITM
+    /// PTY outgoing byte stream when Enter is sent.
+    last_submitted_command: RefCell<String>,
+    /// Best command text captured exactly at OSC 133;C, before command output
+    /// and the next prompt repaint can pollute the live buffers.
+    command_at_start: RefCell<String>,
     /// Raw prompt bytes buffered between PromptStart and PromptEnd.
     prompt_buf: RefCell<Vec<u8>>,
     /// Last captured prompt (de-styled, last line), kept for Copy/export.
     prompt: RefCell<String>,
+    /// VTE cursor position (col, row) immediately after PromptEnd; CommandStart
+    /// reads text from here to the current cursor to capture the rendered command.
+    prompt_end_pos: Cell<(i64, i64)>,
     out_buf: RefCell<Vec<u8>>,
     exit_code: Cell<i32>,
     cwd: RefCell<String>,
@@ -550,8 +560,11 @@ impl Component for BlockTerminal {
             prev_state: Cell::new(BlockState::Idle),
             cmd_buf: RefCell::new(Vec::new()),
             typed_cmd: RefCell::new(String::new()),
+            last_submitted_command: RefCell::new(String::new()),
+            command_at_start: RefCell::new(String::new()),
             prompt_buf: RefCell::new(Vec::new()),
             prompt: RefCell::new(String::new()),
+            prompt_end_pos: Cell::new((0, 0)),
             out_buf: RefCell::new(Vec::new()),
             exit_code: Cell::new(0),
             cwd: RefCell::new(init.working_directory.clone().unwrap_or_default()),
@@ -604,6 +617,54 @@ impl Component for BlockTerminal {
             pending_images: RefCell::new(Vec::new()),
             kitty_pending_bytes: Cell::new(0),
         });
+
+        // VTE → shell splice. The MITM PTY pair's master side is the channel
+        // VTE writes to (keystrokes + answers to PTY-mediated queries). Forward
+        // bytes verbatim to the real shell PTY; observe Enter as a submit
+        // fallback for the commit-shadow command buffer below.
+        {
+            let shell_pty = pty.clone();
+            let ctx = ctx.clone();
+            vte_pty.start_reader(move |data| {
+                observe_outgoing_input(&ctx, &data);
+                shell_pty.write_bytes(&data);
+            });
+        }
+
+        // Observer-only `commit` hook. VTE still writes the committed bytes to
+        // its PTY; this shadow copy mirrors jterm4's typed-command fallback so
+        // CommandStart/finalize can recover the command even when VTE text-range
+        // capture is empty.
+        {
+            let ctx = ctx.clone();
+            active_vte.connect_commit(move |_term, text, _size| {
+                if ctx.state.get() != BlockState::AwaitingCommand {
+                    return;
+                }
+                if text.as_bytes().contains(&0x1b) {
+                    ctx.typed_unreliable.set(true);
+                    ctx.typed_cmd.borrow_mut().clear();
+                    return;
+                }
+                let mut typed = ctx.typed_cmd.borrow_mut();
+                for ch in text.chars() {
+                    match ch {
+                        '\r' | '\n' => {
+                            let prompt = ctx.prompt.borrow();
+                            let submitted = clean_command_candidate(&typed, &prompt);
+                            if !submitted.is_empty() {
+                                *ctx.last_submitted_command.borrow_mut() = submitted;
+                            }
+                        }
+                        '\u{7f}' | '\u{8}' => {
+                            typed.pop();
+                        }
+                        c if (c as u32) < 0x20 => {}
+                        c => typed.push(c),
+                    }
+                }
+            });
+        }
 
         // `changed` fires during the viewport's size-allocate, after layout, so
         // `upper`/`page_size` here are final for this frame — the right place to
@@ -737,50 +798,6 @@ impl Component for BlockTerminal {
                 });
             }
             block_list.add_controller(drag);
-        }
-
-        // VTE → shell splice. The MITM PTY pair's master side is the channel
-        // VTE writes to (keystrokes + answers to PTY-mediated queries). We
-        // forward every byte verbatim to the shell PTY.
-        {
-            let shell_pty = pty.clone();
-            vte_pty.start_reader(move |data| {
-                shell_pty.write_bytes(&data);
-            });
-        }
-
-        // Observer-only `commit` hook: VTE handles the actual write to its
-        // own PTY now, but we still need to reconstruct the typed command
-        // line for OSC 133-less shells. An escape sequence here (arrow keys,
-        // history recall, accepted autosuggestion) means the typed buffer is
-        // no longer the authoritative source — finalize falls back to
-        // scraping the echoed command line instead.
-        {
-            let ctx = ctx.clone();
-            active_vte.connect_commit(move |_term, text, _size| {
-                if ctx.state.get() == BlockState::AwaitingCommand {
-                    // An escape sequence (arrow keys, history recall, line edits,
-                    // accepted autosuggestion) cannot be reconstructed from commit
-                    // text. Mark the typed buffer unreliable so finalize falls back
-                    // to scraping the echoed command line instead of recording junk.
-                    if text.as_bytes().contains(&0x1b) {
-                        ctx.typed_unreliable.set(true);
-                        ctx.typed_cmd.borrow_mut().clear();
-                        return;
-                    }
-                    let mut typed = ctx.typed_cmd.borrow_mut();
-                    for ch in text.chars() {
-                        match ch {
-                            '\r' | '\n' => {}
-                            '\u{7f}' | '\u{8}' => {
-                                typed.pop();
-                            }
-                            c if (c as u32) < 0x20 => {}
-                            c => typed.push(c),
-                        }
-                    }
-                }
-            });
         }
 
         // Track size changes and resize the PTY accordingly. Both the shell
@@ -1728,6 +1745,30 @@ fn handle_data(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, data: &[u
     schedule_height_update(ctx);
 }
 
+fn observe_outgoing_input(ctx: &Rc<Ctx>, data: &[u8]) {
+    if matches!(
+        ctx.state.get(),
+        BlockState::CollectingOutput | BlockState::PostCommand | BlockState::AltScreen
+    ) {
+        return;
+    }
+    if data.contains(&0x1b) {
+        ctx.typed_unreliable.set(true);
+        ctx.typed_cmd.borrow_mut().clear();
+        return;
+    }
+    let text = String::from_utf8_lossy(data);
+    for ch in text.chars() {
+        if ch == '\r' || ch == '\n' {
+            let prompt = ctx.prompt.borrow();
+            let submitted = clean_command_candidate(&ctx.typed_cmd.borrow(), &prompt);
+            if !submitted.is_empty() {
+                *ctx.last_submitted_command.borrow_mut() = submitted;
+            }
+        }
+    }
+}
+
 /// Mark the active card's height as stale and arm a single frame-clock tick to
 /// re-clamp it (plus the bottom-pin autoscroll). Re-entrant: subsequent calls
 /// in the same frame are no-ops until the tick fires.
@@ -1760,7 +1801,8 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             if ctx.state.get() == BlockState::Idle {
                 ctx.state.set(BlockState::RawFallback);
             }
-            match ctx.state.get() {
+            let state = ctx.state.get();
+            match state {
                 BlockState::CollectingPrompt => {
                     ctx.prompt_buf.borrow_mut().extend_from_slice(&bytes)
                 }
@@ -1812,22 +1854,28 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                 }
                 _ => {}
             }
-            // Splice the shell's stream onto the MITM PTY's master. VTE reads
-            // it from the slave side; it cannot tell the bytes were not
-            // delivered by a kernel PTY. Anything VTE needs to write back
-            // (PTY-mediated query replies, selection paste, mouse / focus /
-            // bracketed-paste reports) flows out the master and into the
-            // `vte_pty` reader, which forwards to the shell PTY.
-            ctx.vte_pty.write_bytes(&bytes);
+            // Match jterm4's live surface model: feed shell output into the
+            // active VTE synchronously. If command output goes through the MITM
+            // PTY queue, PromptStart/finalize can run before VTE has consumed
+            // the tail, so the next PromptEnd cursor anchor inherits stale rows
+            // and later blocks lose their command text.
+            ctx.active_vte.feed(&bytes);
         }
         ParserEvent::PromptStart => {
-            // Finalize the previous command (deferred from its CommandEnd).
-            if ctx.has_command.get() {
+            let state = ctx.state.get();
+            if matches!(state, BlockState::CollectingOutput | BlockState::AltScreen) {
+                return;
+            }
+            // Finalize the previous command (deferred from CommandEnd).
+            if state == BlockState::PostCommand && ctx.has_command.get() {
                 finalize_block(ctx, Some(sender));
             }
             ctx.state.set(BlockState::CollectingPrompt);
         }
         ParserEvent::PromptEnd => {
+            if ctx.state.get() != BlockState::CollectingPrompt {
+                return;
+            }
             // Snapshot the rendered prompt (last non-empty line) for Copy/export.
             let prompt_line = strip_ansi(&ctx.prompt_buf.borrow())
                 .lines()
@@ -1837,6 +1885,7 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
                 .trim()
                 .to_string();
             *ctx.prompt.borrow_mut() = prompt_line;
+            ctx.prompt_end_pos.set(ctx.active_vte.cursor_position());
             // Reset *and* release the peak capacity for the per-command buffers:
             // a long fish/zsh command line can grow `cmd_buf`/`typed_cmd` into
             // tens of KB which `clear()` would retain. Allocating fresh per
@@ -1860,6 +1909,16 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             ctx.state.set(BlockState::AwaitingCommand);
         }
         ParserEvent::CommandStart => {
+            if ctx.state.get() != BlockState::AwaitingCommand {
+                return;
+            }
+            let cmd_from_vte = command_from_vte_range(ctx);
+            let cmd = if !cmd_from_vte.is_empty() {
+                cmd_from_vte
+            } else {
+                current_command_text(ctx)
+            };
+            *ctx.command_at_start.borrow_mut() = cmd;
             ctx.out_buf.borrow_mut().clear();
             ctx.out_tail.borrow_mut().clear();
             ctx.out_total.set(0);
@@ -1881,7 +1940,7 @@ fn handle_event(ctx: &Rc<Ctx>, sender: &ComponentSender<BlockTerminal>, ev: Pars
             // commands we know are TUIs from the user's typed name, hide the
             // finished blocks and resize the PTY now, before the child reads
             // its size.
-            if !ctx.tui_promoted.get() && looks_like_tui(&current_command_text(ctx)) {
+            if !ctx.tui_promoted.get() && looks_like_tui(&ctx.command_at_start.borrow()) {
                 ctx.tui_promoted.set(true);
                 enter_fullscreen(ctx);
                 resize_active_to_fullscreen(ctx);
@@ -2117,6 +2176,114 @@ fn captured_output(ctx: &Rc<Ctx>) -> Vec<u8> {
     }
 }
 
+/// Convert 8-bit C1 terminal controls to their 7-bit ESC-prefixed forms before
+/// lossy UTF-8 decoding. Some shells/prompts can emit CSI as raw `0x9b`; if it
+/// reaches `String::from_utf8_lossy` first, it becomes `U+FFFD` and the
+/// finished-block ANSI renderer shows the remaining `[...m` bytes as text.
+fn normalize_c1_controls(bytes: &[u8]) -> Cow<'_, [u8]> {
+    if !bytes
+        .windows(2)
+        .any(|w| w[0] == 0xc2 && (0x90..=0x9f).contains(&w[1]))
+        && !bytes
+            .iter()
+            .any(|&b| matches!(b, 0x90 | 0x9b | 0x9c | 0x9d | 0x9e | 0x9f))
+    {
+        return Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let c1 = if b == 0xc2 && i + 1 < bytes.len() && (0x90..=0x9f).contains(&bytes[i + 1]) {
+            i += 2;
+            bytes[i - 1]
+        } else {
+            i += 1;
+            b
+        };
+        match c1 {
+            0x90 => out.extend_from_slice(b"\x1bP"),  // DCS
+            0x9b => out.extend_from_slice(b"\x1b["),  // CSI
+            0x9c => out.extend_from_slice(b"\x1b\\"), // ST
+            0x9d => out.extend_from_slice(b"\x1b]"),  // OSC
+            0x9e => out.extend_from_slice(b"\x1b^"),  // PM
+            0x9f => out.extend_from_slice(b"\x1b_"),  // APC
+            _ => out.push(c1),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Repair terminal control introducers that have already become `str` data.
+/// VTE/text extraction can hand us either Unicode C1 controls (`U+009B`) or
+/// lossy `U+FFFD[` for a CSI whose original introducer byte was invalid UTF-8;
+/// converting them back to ESC lets the finished-block ANSI parser consume the
+/// sequence instead of rendering `[...m`.
+fn repair_text_control_prefixes(input: &str) -> Cow<'_, str> {
+    if !input
+        .chars()
+        .any(|ch| matches!(ch, '\u{0090}'..='\u{009f}' | '\u{fffd}'))
+    {
+        return Cow::Borrowed(input);
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut changed = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{0090}' => {
+                out.push_str("\x1bP");
+                changed = true;
+                continue;
+            }
+            '\u{009b}' => {
+                out.push_str("\x1b[");
+                changed = true;
+                continue;
+            }
+            '\u{009c}' => {
+                out.push_str("\x1b\\");
+                changed = true;
+                continue;
+            }
+            '\u{009d}' => {
+                out.push_str("\x1b]");
+                changed = true;
+                continue;
+            }
+            '\u{009e}' => {
+                out.push_str("\x1b^");
+                changed = true;
+                continue;
+            }
+            '\u{009f}' => {
+                out.push_str("\x1b_");
+                changed = true;
+                continue;
+            }
+            '\u{fffd}' => {
+                if matches!(
+                    chars.peek().copied(),
+                    Some('P' | '[' | '\\' | ']' | '^' | '_')
+                ) {
+                    out.push('\x1b');
+                    changed = true;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        out.push(ch);
+    }
+
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(input)
+    }
+}
+
 /// Split form of the captured output: either the full stream, or head and tail
 /// with an omission count. The grid emulator path replays each side
 /// independently so the omission marker doesn't corrupt SGR / cursor state.
@@ -2203,12 +2370,13 @@ fn scrape_command_output(ctx: &Rc<Ctx>) -> Option<String> {
     // displayed via the raw-bytes fallback path the caller already provides.
     const TALL_GRID_CAP: usize = 10_000;
     let render = |bytes: &[u8]| -> String {
+        let bytes = normalize_c1_controls(bytes);
         let newline_count = bytes.iter().filter(|&&b| b == b'\n').count();
         let rows = newline_count
             .saturating_add(viewport_rows)
             .max(viewport_rows)
             .min(TALL_GRID_CAP);
-        super::grid::render_to_ansi(bytes, cols, rows, &palette)
+        super::grid::render_to_ansi(&bytes, cols, rows, &palette)
     };
     Some(match parts {
         CapturedParts::Whole(bytes) => render(&bytes),
@@ -2564,11 +2732,28 @@ fn resize_active_to_fullscreen(ctx: &Rc<Ctx>) {
 /// unreliable. Mirrors the same prefer-typed-then-scrape logic
 /// `finalize_block` uses at the other end of the command lifecycle.
 fn current_command_text(ctx: &Rc<Ctx>) -> String {
-    let typed = ctx.typed_cmd.borrow().trim().to_string();
+    let prompt = ctx.prompt.borrow().clone();
+    let submitted = clean_command_candidate(&ctx.last_submitted_command.borrow(), &prompt);
+    if !submitted.is_empty() {
+        return submitted;
+    }
+    let typed = clean_command_candidate(&ctx.typed_cmd.borrow(), &prompt);
     if !typed.is_empty() && !ctx.typed_unreliable.get() {
         return typed;
     }
-    scrape_cmd_line(ctx)
+    clean_command_candidate(&scrape_cmd_line(ctx), &prompt)
+}
+
+fn command_from_vte_range(ctx: &Rc<Ctx>) -> String {
+    let (start_col, start_row) = ctx.prompt_end_pos.get();
+    let (end_col, end_row) = ctx.active_vte.cursor_position();
+    let text = ctx
+        .active_vte
+        .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
+        .0
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    clean_command_candidate(&text, &ctx.prompt.borrow())
 }
 
 /// Render `cmd_buf` to text, honoring cursor-positioning escapes. Shells with
@@ -2592,12 +2777,50 @@ fn scrape_cmd_line(ctx: &Rc<Ctx>) -> String {
     } else {
         strip_ansi(&cmd_buf)
     };
-    text.lines()
+    let line = text
+        .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
-        .trim()
-        .to_string()
+        .trim();
+    strip_prompt_from_command_line(line, &ctx.prompt.borrow())
+}
+
+fn clean_command_candidate(candidate: &str, prompt: &str) -> String {
+    let plain = strip_ansi(candidate.as_bytes());
+    let command = strip_prompt_from_command_line(&plain, prompt);
+    let command = command.trim();
+    if is_prompt_repaint_line(command, prompt) {
+        return String::new();
+    }
+    if prompt_stem(command).is_empty() {
+        String::new()
+    } else {
+        command.to_string()
+    }
+}
+
+fn strip_prompt_from_command_line(line: &str, prompt: &str) -> String {
+    let line = line.trim();
+    let prompt = prompt.trim();
+    if !prompt.is_empty() {
+        if let Some(rest) = line.strip_prefix(prompt) {
+            let rest = trim_prompt_markers_start(rest);
+            if !rest.is_empty() {
+                return rest.to_string();
+            }
+        }
+        let prompt_stem = prompt_stem(prompt);
+        if !prompt_stem.is_empty() && prompt_stem != prompt {
+            if let Some(rest) = line.strip_prefix(prompt_stem) {
+                let rest = trim_prompt_markers_start(rest);
+                if !rest.is_empty() {
+                    return rest.to_string();
+                }
+            }
+        }
+    }
+    line.to_string()
 }
 
 /// First word of the user's typed command, lowercased. We strip a leading
@@ -2820,15 +3043,20 @@ fn exit_fullscreen(ctx: &Rc<Ctx>) {
 /// output can coincidentally end with the command name (`tools` ends with `ls`,
 /// a `git log` line can mention the command, etc.), and stripping past it
 /// would chop real output. The echo, when present, is always at the very top.
-fn strip_leading_command_echo(output: &str, command: &str) -> String {
+fn strip_leading_command_echo(output: &str, command: &str, prompt: &str) -> String {
     let cmd = command.trim();
     if cmd.is_empty() || output.is_empty() {
         return output.to_string();
     }
     let bytes = output.as_bytes();
     let mut line_start = 0usize;
-    // Tolerate up to a couple of blank leading lines before the candidate.
-    for _ in 0..3 {
+    let mut prompt_repaints = 0usize;
+    let mut skipped_prefix = false;
+    // Tolerate a few blank/prompt-only repaint lines before the command echo.
+    // `sudo` commonly triggers a final prompt repaint just before the echoed
+    // command/password prompt; dropping only that first repaint would leave the
+    // command echo in the output and make the block header look inconsistent.
+    for _ in 0..6 {
         let line_end = match bytes[line_start..].iter().position(|&b| b == b'\n') {
             Some(off) => line_start + off,
             None => return output.to_string(),
@@ -2837,15 +3065,31 @@ fn strip_leading_command_echo(output: &str, command: &str) -> String {
         let trimmed = plain.trim();
         if trimmed.is_empty() {
             line_start = line_end + 1;
+            skipped_prefix = true;
             if line_start >= bytes.len() {
                 return output.to_string();
             }
             continue;
         }
-        if is_command_echo_line(trimmed, cmd) {
+        if is_command_echo_line(trimmed, cmd, prompt) {
             return String::from_utf8_lossy(&bytes[line_end + 1..]).into_owned();
         }
+        if is_prompt_repaint_line(trimmed, prompt) && prompt_repaints < 3 {
+            prompt_repaints += 1;
+            line_start = line_end + 1;
+            skipped_prefix = true;
+            if line_start >= bytes.len() {
+                return String::new();
+            }
+            continue;
+        }
+        if skipped_prefix {
+            return String::from_utf8_lossy(&bytes[line_start..]).into_owned();
+        }
         return output.to_string();
+    }
+    if skipped_prefix && line_start < bytes.len() {
+        return String::from_utf8_lossy(&bytes[line_start..]).into_owned();
     }
     output.to_string()
 }
@@ -2854,9 +3098,16 @@ fn strip_leading_command_echo(output: &str, command: &str) -> String {
 /// prompt followed by the user's command. Accepts either the bare command
 /// (`sudo apt update`) or `<prompt-stuff> <marker> <cmd>` where marker is one
 /// of the conventional prompt-terminator characters.
-fn is_command_echo_line(line: &str, cmd: &str) -> bool {
+fn is_command_echo_line(line: &str, cmd: &str, prompt: &str) -> bool {
     if line == cmd {
         return true;
+    }
+    let prompt = prompt.trim();
+    if !prompt.is_empty() {
+        let without_prompt = strip_prompt_from_command_line(line, prompt);
+        if without_prompt != line && without_prompt.trim() == cmd {
+            return true;
+        }
     }
     if !line.ends_with(cmd) {
         return false;
@@ -2877,22 +3128,89 @@ fn is_command_echo_line(line: &str, cmd: &str) -> bool {
     prefix_trim.chars().any(|c| MARKERS.contains(&c))
 }
 
+fn is_prompt_repaint_line(line: &str, prompt: &str) -> bool {
+    let line = line.trim();
+    let prompt = prompt.trim();
+    if line.is_empty() || prompt.is_empty() {
+        return false;
+    }
+    if line == prompt {
+        return true;
+    }
+    let prompt_base = prompt_stem(prompt);
+    let line_stem = prompt_stem(line);
+    !prompt_base.is_empty() && line_stem == prompt_base
+}
+
+fn prompt_stem(s: &str) -> &str {
+    s.trim()
+        .trim_end_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '>' | '$' | '#' | '%' | '›' | '❯' | '»' | '➜' | '\u{fffd}'
+                )
+        })
+        .trim_end()
+}
+
+fn trim_prompt_markers_start(s: &str) -> &str {
+    s.trim_start_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '>' | '$' | '#' | '%' | '›' | '❯' | '»' | '➜' | '\u{fffd}'
+            )
+    })
+}
+
+fn strip_leading_blank_ansi_lines(output: &str) -> String {
+    let bytes = output.as_bytes();
+    let mut line_start = 0usize;
+    while line_start < bytes.len() {
+        let Some(off) = bytes[line_start..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let line_end = line_start + off;
+        if !strip_ansi(&bytes[line_start..line_end]).trim().is_empty() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+    if line_start == 0 {
+        output.to_string()
+    } else {
+        String::from_utf8_lossy(&bytes[line_start..]).into_owned()
+    }
+}
+
 /// Snapshot the current command + output into a finished block, then reset the
 /// active card for the next command.
 fn finalize_block(ctx: &Rc<Ctx>, sender: Option<&ComponentSender<BlockTerminal>>) {
     // Prefer the keystroke-reconstructed command; fall back to scraping the last
     // line of the echoed output (e.g. for history recall / paste).
-    let typed = ctx.typed_cmd.borrow().trim().to_string();
-    let command = if !typed.is_empty() && !ctx.typed_unreliable.get() {
+    let prompt = ctx.prompt.borrow().clone();
+    let submitted = clean_command_candidate(&ctx.last_submitted_command.borrow(), &prompt);
+    let started = clean_command_candidate(&ctx.command_at_start.borrow(), &prompt);
+    let typed = clean_command_candidate(&ctx.typed_cmd.borrow(), &prompt);
+    if std::env::var_os("JTERM1_DBG").is_some() {
+        eprintln!(
+            "[DBG] command sources submitted={:?} started={:?} typed={:?} scraped={:?}",
+            submitted,
+            started,
+            typed,
+            clean_command_candidate(&scrape_cmd_line(ctx), &prompt),
+        );
+    }
+    let command = if !submitted.is_empty() {
+        submitted
+    } else if !started.is_empty() {
+        started
+    } else if !typed.is_empty() && !ctx.typed_unreliable.get() {
         typed
     } else {
-        scrape_cmd_line(ctx)
+        clean_command_candidate(&scrape_cmd_line(ctx), &prompt)
     };
-    if command.is_empty() {
-        // Nothing meaningful to record; just reset.
-        reset_active(ctx);
-        return;
-    }
     // Prefer scraping the VTE for the command's rendered output region. The raw
     // captured bytes lose cursor positioning when ANSI is stripped — a pager like
     // `less -X` (no alt screen) repaints over the same lines, and stacked stripped
@@ -2904,11 +3222,20 @@ fn finalize_block(ctx: &Rc<Ctx>, sender: Option<&ComponentSender<BlockTerminal>>
         Some(text) => text,
         None => {
             let bytes = captured_output(ctx);
-            String::from_utf8_lossy(&bytes).into_owned()
+            let bytes = normalize_c1_controls(&bytes);
+            let output = String::from_utf8_lossy(&bytes);
+            repair_text_control_prefixes(&output).into_owned()
         }
     };
+    let output = repair_text_control_prefixes(&output).into_owned();
+    let output = strip_leading_blank_ansi_lines(&output);
     // Drop leading prompt+command echo (see `strip_leading_command_echo` doc).
-    let output = strip_leading_command_echo(&output, &command);
+    let output = strip_leading_command_echo(&output, &command, &prompt);
+    if command.is_empty() && output.trim().is_empty() {
+        // Nothing meaningful to record; just reset.
+        reset_active(ctx);
+        return;
+    }
     if std::env::var_os("JTERM1_DBG").is_some() {
         eprintln!(
             "[DBG] finalize cmd={:?} out_len={} out_lines={} first={:?} last={:?}",
@@ -2924,7 +3251,6 @@ fn finalize_block(ctx: &Rc<Ctx>, sender: Option<&ComponentSender<BlockTerminal>>
     }
     let exit_code = ctx.exit_code.get();
     let cwd = ctx.cwd.borrow().clone();
-    let prompt = ctx.prompt.borrow().clone();
     let duration = ctx.duration.get();
     let end_time_ms = ctx.end_time_ms.get();
     let git_branch = git_branch(&cwd);
@@ -3495,21 +3821,17 @@ fn reset_active(ctx: &Rc<Ctx>) {
     // reset() does not reliably round-trip with our cached preference, so the
     // shrink to a compact prompt grid would be skipped if we left it stale.
     ctx.last_size_target.set((0, 0));
+    ctx.prompt_end_pos.set((0, 0));
     if ctx.tui_promoted.replace(false) {
         exit_fullscreen(ctx);
     }
-    // `reset()` clears VTE's grid state immediately, but the just-finished
-    // command's tail bytes are still in the MITM PTY kernel queue (they were
-    // splice-written via `vte_pty.write_bytes` in earlier Bytes events) and
-    // will replay onto the freshly cleared grid, leaving stale rows above the
-    // next prompt. A direct `active_vte.feed(clear)` races with that drain
-    // because feed() injects into VTE's parser without going through the
-    // master fd. Route the clear through the MITM PTY instead so it is
-    // appended after the queued tail and ordered before the next prompt's
-    // bytes (which arrive via the same path).
-    ctx.vte_pty.write_bytes(b"\x1b[H\x1b[2J\x1b[3J");
+    // jterm4 clears the live VTE synchronously after reset. Command output is
+    // also fed synchronously, so there is no MITM display queue to preserve.
+    ctx.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
     ctx.cmd_buf.borrow_mut().clear();
     ctx.typed_cmd.borrow_mut().clear();
+    ctx.last_submitted_command.borrow_mut().clear();
+    ctx.command_at_start.borrow_mut().clear();
     ctx.typed_unreliable.set(false);
     ctx.out_buf.borrow_mut().clear();
     ctx.out_tail.borrow_mut().clear();
@@ -3544,6 +3866,9 @@ fn build_finished_block(
     pinned: bool,
     images: &[gtk::gdk::Texture],
 ) -> FinishedBlock {
+    let command = clean_command_candidate(command, prompt);
+    let command = command.as_str();
+
     let outer = gtk::Box::new(Orientation::Vertical, 0);
     outer.add_css_class("block-finished");
     if exit_code == 0 {
@@ -4576,6 +4901,10 @@ fn apply_cross_block_selection(
 
 /// Strip ANSI escape sequences (CSI/OSC/charset) and CRs, leaving plain text.
 fn strip_ansi(input: &[u8]) -> String {
+    let normalized = normalize_c1_controls(input);
+    let lossy = String::from_utf8_lossy(&normalized);
+    let repaired = repair_text_control_prefixes(&lossy);
+    let input = repaired.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {
@@ -4630,6 +4959,125 @@ fn contains_seq(haystack: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_c1_csi_before_lossy_utf8() {
+        let raw = b"\x9b0;1;38;2;0;210;210muser\x9b0m";
+        let normalized = normalize_c1_controls(raw);
+        assert_eq!(
+            String::from_utf8_lossy(&normalized),
+            "\x1b[0;1;38;2;0;210;210muser\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn repairs_lossy_csi_prefixes() {
+        let repaired = repair_text_control_prefixes("\u{fffd}[0;1;38;2;0;210;210muser\u{fffd}[0m");
+        assert_eq!(repaired, "\x1b[0;1;38;2;0;210;210muser\x1b[0m");
+    }
+
+    #[test]
+    fn repairs_unicode_c1_csi_prefixes() {
+        let repaired = repair_text_control_prefixes("\u{009b}0;1;38;2;0;210;210muser\u{009b}0m");
+        assert_eq!(repaired, "\x1b[0;1;38;2;0;210;210muser\x1b[0m");
+    }
+
+    #[test]
+    fn strips_command_echo_after_repairing_lossy_prompt_sgr() {
+        let output = "\u{fffd}[0;1;38;2;0;210;210myj\u{fffd}[0m \
+            \u{fffd}[0;1;38;2;0;0;0msudo\u{fffd}[0m apt update\nreal output\n";
+        let repaired = repair_text_control_prefixes(output);
+        assert_eq!(
+            strip_leading_command_echo(&repaired, "sudo apt update", "yj"),
+            "real output\n"
+        );
+    }
+
+    #[test]
+    fn strips_command_echo_after_repairing_unicode_c1_prompt_sgr() {
+        let output = "\u{009b}0;1;38;2;0;210;210myj\u{009b}0m \
+            \u{009b}0;1;38;2;0;0;0msudo\u{009b}0m apt update\nreal output\n";
+        let repaired = repair_text_control_prefixes(output);
+        assert_eq!(
+            strip_leading_command_echo(&repaired, "sudo apt update", "yj"),
+            "real output\n"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_consumes_utf8_encoded_c1_csi() {
+        let input = "\u{009b}0;1;38;2;0;210;210myj\u{009b}0m";
+        assert_eq!(strip_ansi(input.as_bytes()), "yj");
+    }
+
+    #[test]
+    fn strips_prompt_prefix_from_scraped_command_line() {
+        let line = "\u{009b}0;1;38;2;0;210;210myj\u{009b}0m \
+            \u{009b}0;1;38;2;80;255;120m~/jterm1\u{009b}0m \
+            \u{009b}0;38;2;0;0;0m(master)\u{009b}0m \
+            \u{009b}0;1;38;2;0;0;0msudo\u{009b}0m apt update";
+        let plain = strip_ansi(line.as_bytes());
+        assert_eq!(
+            strip_prompt_from_command_line(&plain, "yj ~/jterm1 (master)"),
+            "sudo apt update"
+        );
+    }
+
+    #[test]
+    fn strips_prompt_only_repaint_line_with_replacement_marker() {
+        let output = "yj ~/jterm1 (master) \u{fffd}\n[sudo] password for yj:\n";
+        assert_eq!(
+            strip_leading_command_echo(output, "sudo apt update", "yj ~/jterm1 (master) ›"),
+            "[sudo] password for yj:\n"
+        );
+    }
+
+    #[test]
+    fn skips_prompt_repaint_before_command_echo() {
+        let output = "yj ~/jterm1 (master) \u{fffd}\nyj ~/jterm1 (master) \u{fffd} sudo apt update\nHit:1 https://example.invalid stable InRelease\n";
+        assert_eq!(
+            strip_leading_command_echo(output, "sudo apt update", "yj ~/jterm1 (master) ›"),
+            "Hit:1 https://example.invalid stable InRelease\n"
+        );
+    }
+
+    #[test]
+    fn strips_leading_blank_ansi_lines_before_output() {
+        let output = "\x1b[0m\n\x1b[38;2;255;193;7m \x1b[0m\nHit:1 http://security.ubuntu.com/ubuntu noble-security\n";
+        assert_eq!(
+            strip_leading_blank_ansi_lines(output),
+            "Hit:1 http://security.ubuntu.com/ubuntu noble-security\n"
+        );
+    }
+
+    #[test]
+    fn command_candidate_rejects_prompt_marker_fragment() {
+        assert_eq!(
+            clean_command_candidate("\u{fffd}", "yj ~/jterm1 (master) ›"),
+            ""
+        );
+        assert_eq!(clean_command_candidate("›", "yj ~/jterm1 (master) ›"), "");
+        assert_eq!(
+            clean_command_candidate("yj ~/jterm1 (master) \u{fffd}", "yj ~/jterm1 (master) ›"),
+            ""
+        );
+    }
+
+    #[test]
+    fn command_candidate_strips_prompt_prefix() {
+        assert_eq!(
+            clean_command_candidate(
+                "yj ~/jterm1 (master) \u{fffd} sudo apt update",
+                "yj ~/jterm1 (master) ›"
+            ),
+            "sudo apt update"
+        );
+    }
 }
 
 /// Current wall-clock time in milliseconds since the Unix epoch.

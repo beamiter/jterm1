@@ -3012,7 +3012,7 @@ impl SimpleComponent for AppModel {
                     key: normalize_key(keyval),
                 };
                 let lookup = kb.borrow().lookup(&combo);
-                eprintln!("[jterm1] key combo={:?} -> {:?}", combo, lookup);
+                // eprintln!("[jterm1] key combo={:?} -> {:?}", combo, lookup);
                 if let Some(action) = lookup {
                     ksender.input(AppMsg::Action(action));
                     return glib::Propagation::Stop;
