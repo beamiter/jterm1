@@ -3341,7 +3341,14 @@ impl SimpleComponent for AppModel {
 
 fn main() {
     init_input_method_env();
-    let app = RelmApp::new("app.jterm1");
+    // NON_UNIQUE: each launch is its own process with its own window, instead of
+    // the second invocation activating the first instance and then exiting.
+    let app = RelmApp::from_app(
+        adw::Application::builder()
+            .application_id("app.jterm1")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build(),
+    );
     app.run::<AppModel>(());
 }
 
