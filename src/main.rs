@@ -2,11 +2,14 @@
 
 mod agent;
 mod ai;
+mod block_view;
 mod config;
 mod dialogs;
 mod file_tree;
+mod git_meta;
 mod keybindings;
 mod notebook;
+mod notify;
 mod palette;
 mod parser;
 mod process;

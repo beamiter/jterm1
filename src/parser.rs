@@ -71,6 +71,9 @@ pub enum ParserEvent {
     ClipboardQuery,
     /// APC sequence (ESC _) — Kitty graphics protocol or similar.
     ApcSequence(Vec<u8>),
+    /// CSI ? <mode> h / l — DEC private mode change. Emitted in addition to
+    /// pass-through so block_view can track reporting modes.
+    DecsetMode { mode: u32, set: bool },
     /// OSC 10/11/12/4 with a `?` — app is asking the terminal what color it uses.
     /// The caller must write a `\e]<n>;rgb:RRRR/GGGG/BBBB\e\\` reply to the PTY.
     ColorQuery(ColorKind),
@@ -141,6 +144,7 @@ pub enum MouseEncoding {
 pub struct Parser {
     state: State,
     passthrough: Vec<u8>,
+    config: ParserConfig,
     /// `?2004` — shell asked for paste content to be bracketed with `\e[200~`
     /// / `\e[201~`. The caller wraps its own `Paste` write when this is on.
     bracketed_paste: bool,
@@ -151,6 +155,21 @@ pub struct Parser {
     mouse_encoding: MouseEncoding,
     /// `?1004` — shell asked for `\e[I` / `\e[O` on focus enter/leave.
     focus_events: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct ParserConfig {
+    pub mouse_reporting: bool,
+    pub focus_reporting: bool,
+}
+
+impl Default for ParserConfig {
+    fn default() -> Self {
+        Self {
+            mouse_reporting: true,
+            focus_reporting: true,
+        }
+    }
 }
 
 fn is_alt_screen_mode(params: &[u8]) -> bool {
@@ -165,9 +184,14 @@ impl Default for Parser {
 
 impl Parser {
     pub fn new() -> Self {
+        Self::with_config(ParserConfig::default())
+    }
+
+    pub fn with_config(config: ParserConfig) -> Self {
         Parser {
             state: State::default(),
             passthrough: Vec::with_capacity(4096),
+            config,
             bracketed_paste: false,
             mouse_mode: MouseMode::None,
             mouse_encoding: MouseEncoding::Default,
@@ -200,7 +224,8 @@ impl Parser {
     /// Apply each `?N` token from a `CSI ? Pm h/l` to the snooped state.
     /// `enable` = true for `h`, false for `l`. Unknown modes are ignored —
     /// they still pass through to the VTE.
-    fn update_dec_private_modes(&mut self, params: &[u8], enable: bool) {
+    fn update_dec_private_modes(&mut self, params: &[u8], enable: bool) -> Vec<u32> {
+        let mut modes = Vec::new();
         for token in params.split(|&c| c == b';') {
             // Each token may itself start with `?` if the shell sent
             // `CSI ?1;?2 h`; tolerate that.
@@ -209,6 +234,7 @@ impl Parser {
                 Some(n) => n,
                 None => continue,
             };
+            modes.push(n);
             match n {
                 2004 => self.bracketed_paste = enable,
                 9 => {
@@ -264,6 +290,7 @@ impl Parser {
                 _ => {}
             }
         }
+        modes
     }
 
     pub fn feed(&mut self, data: &[u8], events: &mut Vec<ParserEvent>) {
@@ -353,7 +380,12 @@ impl Parser {
                             // CSI through verbatim so the VTE updates its own
                             // mirror state.
                             if (b == b'h' || b == b'l') && params.first() == Some(&b'?') {
-                                self.update_dec_private_modes(&params[1..], b == b'h');
+                                for mode in self.update_dec_private_modes(&params[1..], b == b'h') {
+                                    events.push(ParserEvent::DecsetMode {
+                                        mode,
+                                        set: b == b'h',
+                                    });
+                                }
                             }
                             // Detect terminal-capability handshakes whose response
                             // the active VTE would write back through its own PTY

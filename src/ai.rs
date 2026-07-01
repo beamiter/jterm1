@@ -39,6 +39,30 @@ pub(crate) struct AiClient {
     pub base_url: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct BlockContext {
+    pub cmd: String,
+    pub output: String,
+    pub cwd: Option<String>,
+    pub exit_code: i32,
+}
+
+pub(crate) fn truncate_for_context(output: &str, max_lines_per_side: usize) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() <= max_lines_per_side * 2 + 1 {
+        return output.to_string();
+    }
+    let head = &lines[..max_lines_per_side];
+    let tail = &lines[lines.len() - max_lines_per_side..];
+    let elided = lines.len() - max_lines_per_side * 2;
+    format!(
+        "{}\n... [{} lines elided] ...\n{}",
+        head.join("\n"),
+        elided,
+        tail.join("\n")
+    )
+}
+
 impl AiClient {
     /// Inspect the environment and return a configured client when at least
     /// one provider looks usable. Returns None when there's no API key AND

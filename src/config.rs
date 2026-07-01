@@ -178,6 +178,8 @@ pub struct Config {
     pub(crate) output_batch_max_ms: u32,
     pub(crate) lazy_load_threshold: u32,
     pub(crate) truncation_threshold_lines: u32,
+    pub(crate) finished_block_viewport_rows: u32,
+    pub(crate) finished_block_max_expanded_rows: u32,
     pub(crate) max_collapsed_output_lines: u32,
     pub(crate) virtual_scroll_margin: u32,
     pub(crate) block_history_path: Option<String>,
@@ -190,6 +192,10 @@ pub struct Config {
     /// remote process can otherwise silently replace the user's clipboard
     /// (OWASP-style concern). Most users enable this only on trusted hosts.
     pub(crate) allow_remote_clipboard_write: bool,
+    pub(crate) mouse_reporting_enabled: bool,
+    pub(crate) focus_reporting_enabled: bool,
+    pub(crate) scroll_reporting_enabled: bool,
+    pub(crate) preserve_live_scrollback: bool,
     /// Show jterm1-side AI surfaces (per-block error explain button, the
     /// session AI panel, and the `?` palette prefix). Default on; flip to
     /// `false` to hide all AI UI even when API keys are present. The actual
@@ -205,6 +211,9 @@ pub struct Config {
     /// session is sealed and the user must start a new one — this is a
     /// runaway-loop safety net, not a usability lever.
     pub(crate) agent_max_turns: u32,
+    pub(crate) notify_long_blocks: bool,
+    pub(crate) notify_long_block_threshold_ms: u64,
+    pub(crate) show_repo_strip: bool,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
 }
@@ -391,6 +400,8 @@ struct FileConfig {
     output_batch_max_ms: Option<u32>,
     lazy_load_threshold: Option<u32>,
     truncation_threshold_lines: Option<u32>,
+    finished_block_viewport_rows: Option<u32>,
+    finished_block_max_expanded_rows: Option<u32>,
     max_collapsed_output_lines: Option<u32>,
     virtual_scroll_margin: Option<u32>,
     block_history_path: Option<String>,
@@ -401,6 +412,13 @@ struct FileConfig {
     ai_enabled: Option<bool>,
     agent_enabled: Option<bool>,
     agent_max_turns: Option<u32>,
+    mouse_reporting_enabled: Option<bool>,
+    focus_reporting_enabled: Option<bool>,
+    scroll_reporting_enabled: Option<bool>,
+    preserve_live_scrollback: Option<bool>,
+    notify_long_blocks: Option<bool>,
+    notify_long_block_threshold_ms: Option<u64>,
+    show_repo_strip: Option<bool>,
     remote_hosts: Vec<RemoteHost>,
 }
 
@@ -503,6 +521,14 @@ fn load_file_config() -> FileConfig {
             .get("truncation_threshold_lines")
             .and_then(|v| v.as_integer())
             .map(|v| v as u32),
+        finished_block_viewport_rows: table
+            .get("finished_block_viewport_rows")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u32),
+        finished_block_max_expanded_rows: table
+            .get("finished_block_max_expanded_rows")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u32),
         max_collapsed_output_lines: table
             .get("max_collapsed_output_lines")
             .and_then(|v| v.as_integer())
@@ -523,12 +549,30 @@ fn load_file_config() -> FileConfig {
         allow_remote_clipboard_write: table
             .get("allow_remote_clipboard_write")
             .and_then(|v| v.as_bool()),
+        mouse_reporting_enabled: table
+            .get("mouse_reporting_enabled")
+            .and_then(|v| v.as_bool()),
+        focus_reporting_enabled: table
+            .get("focus_reporting_enabled")
+            .and_then(|v| v.as_bool()),
+        scroll_reporting_enabled: table
+            .get("scroll_reporting_enabled")
+            .and_then(|v| v.as_bool()),
+        preserve_live_scrollback: table
+            .get("preserve_live_scrollback")
+            .and_then(|v| v.as_bool()),
         ai_enabled: table.get("ai_enabled").and_then(|v| v.as_bool()),
         agent_enabled: table.get("agent_enabled").and_then(|v| v.as_bool()),
         agent_max_turns: table
             .get("agent_max_turns")
             .and_then(|v| v.as_integer())
             .map(|v| v as u32),
+        notify_long_blocks: table.get("notify_long_blocks").and_then(|v| v.as_bool()),
+        notify_long_block_threshold_ms: table
+            .get("notify_long_block_threshold_ms")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u64),
+        show_repo_strip: table.get("show_repo_strip").and_then(|v| v.as_bool()),
         remote_hosts,
     }
 }
@@ -691,6 +735,14 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let truncation_threshold_lines = env_u32("JTERM1_TRUNCATION_LINES")
         .or(fc.truncation_threshold_lines)
         .unwrap_or(50000);
+    let finished_block_viewport_rows = env_u32("JTERM1_FINISHED_VIEWPORT_ROWS")
+        .or(fc.finished_block_viewport_rows)
+        .unwrap_or(24)
+        .max(3);
+    let finished_block_max_expanded_rows = env_u32("JTERM1_FINISHED_MAX_EXPANDED_ROWS")
+        .or(fc.finished_block_max_expanded_rows)
+        .unwrap_or(5000)
+        .clamp(finished_block_viewport_rows, 5000);
     let max_collapsed_output_lines = env_u32("JTERM1_MAX_COLLAPSED_LINES")
         .or(fc.max_collapsed_output_lines)
         .unwrap_or(25);
@@ -750,6 +802,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         output_batch_max_ms,
         lazy_load_threshold,
         truncation_threshold_lines,
+        finished_block_viewport_rows,
+        finished_block_max_expanded_rows,
         max_collapsed_output_lines,
         virtual_scroll_margin,
         block_history_path,
@@ -757,9 +811,16 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         block_compact,
         editor_input: fc.editor_input.unwrap_or(true),
         allow_remote_clipboard_write: fc.allow_remote_clipboard_write.unwrap_or(false),
+        mouse_reporting_enabled: fc.mouse_reporting_enabled.unwrap_or(true),
+        focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
+        scroll_reporting_enabled: fc.scroll_reporting_enabled.unwrap_or(true),
+        preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
         ai_enabled: fc.ai_enabled.unwrap_or(true),
         agent_enabled: fc.agent_enabled.unwrap_or(true),
         agent_max_turns: fc.agent_max_turns.unwrap_or(20).max(1),
+        notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
+        notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
+        show_repo_strip: fc.show_repo_strip.unwrap_or(true),
         remote_hosts: fc.remote_hosts,
     };
 
