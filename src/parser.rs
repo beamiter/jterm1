@@ -1,7 +1,8 @@
 //! OSC/CSI stream parser. Splits a raw PTY byte stream into semantic
 //! `ParserEvent`s — passing through display bytes while extracting the OSC 133
-//! shell-integration marks, OSC 7 cwd, OSC 52 clipboard, alt-screen toggles and
-//! APC sequences that drive the block view. Ported from jterm4.
+//! shell-integration marks, OSC 52 clipboard, alt-screen toggles and APC
+//! sequences that drive the block view. OSC 7/title sequences pass through to
+//! VTE so its native cwd/title signals stay authoritative.
 
 /// Which color slot an OSC 10/11/12/4 query asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,8 +54,6 @@ pub enum ParserEvent {
     CommandStart,
     /// OSC 133 ;D;<code> — command finished with exit code.
     CommandEnd(i32),
-    /// OSC 7 — shell reported new CWD.
-    CwdUpdate(String),
     /// OSC 7770 — rsh-specific: the remote shell announces its session ID at
     /// startup. jterm1 stores it on the tab's RemoteConn so subsequent
     /// reconnects pass `--session <id>` and rsh restores cwd/env/aliases.
@@ -107,6 +106,8 @@ enum State {
     DcsEsc { payload: Vec<u8> },
     /// Inside PM (ESC ^) — consume until ST and discard.
     Ignore,
+    /// Saw ESC while in PM — consume the ST final byte too.
+    IgnoreEsc,
 }
 
 /// Which mouse-tracking mode the shell asked for. The active VTE in block-view
@@ -174,6 +175,25 @@ impl Default for ParserConfig {
 
 fn is_alt_screen_mode(params: &[u8]) -> bool {
     matches!(params, b"?47" | b"?1047" | b"?1049")
+}
+
+fn is_mouse_reporting_mode(params: &[u8]) -> bool {
+    matches!(
+        params,
+        b"?9"
+            | b"?1000"
+            | b"?1001"
+            | b"?1002"
+            | b"?1003"
+            | b"?1005"
+            | b"?1006"
+            | b"?1015"
+            | b"?1016"
+    )
+}
+
+fn is_focus_reporting_mode(params: &[u8]) -> bool {
+    matches!(params, b"?1004")
 }
 
 impl Default for Parser {
@@ -365,6 +385,17 @@ impl Parser {
                         // Final byte of CSI sequence
                         let params = std::mem::take(buf);
                         self.state = State::Ground;
+                        if (b == b'h' || b == b'l')
+                            && params.first() == Some(&b'?')
+                            && !is_alt_screen_mode(&params)
+                        {
+                            for mode in self.update_dec_private_modes(&params[1..], b == b'h') {
+                                events.push(ParserEvent::DecsetMode {
+                                    mode,
+                                    set: b == b'h',
+                                });
+                            }
+                        }
                         if b == b'h' && is_alt_screen_mode(&params) {
                             // Recognized alt-screen enter: drop the sequence bytes
                             // (never passed through) and emit the semantic event.
@@ -373,20 +404,17 @@ impl Parser {
                         } else if b == b'l' && is_alt_screen_mode(&params) {
                             flush!();
                             events.push(ParserEvent::AltScreenLeave);
+                        } else if !self.config.mouse_reporting
+                            && (b == b'h' || b == b'l')
+                            && is_mouse_reporting_mode(&params)
+                        {
+                            // Drop: keep VTE out of mouse reporting mode.
+                        } else if !self.config.focus_reporting
+                            && (b == b'h' || b == b'l')
+                            && is_focus_reporting_mode(&params)
+                        {
+                            // Drop: keep VTE out of focus reporting mode.
                         } else {
-                            // Snoop DEC private mode set/reset for the modes the
-                            // active VTE in block view cannot service for us
-                            // (bracketed paste, mouse, focus). Still pass the
-                            // CSI through verbatim so the VTE updates its own
-                            // mirror state.
-                            if (b == b'h' || b == b'l') && params.first() == Some(&b'?') {
-                                for mode in self.update_dec_private_modes(&params[1..], b == b'h') {
-                                    events.push(ParserEvent::DecsetMode {
-                                        mode,
-                                        set: b == b'h',
-                                    });
-                                }
-                            }
                             // Detect terminal-capability handshakes whose response
                             // the active VTE would write back through its own PTY
                             // (which is not connected). The caller synthesizes a
@@ -552,7 +580,15 @@ impl Parser {
                 }
 
                 State::Ignore => {
-                    if b == 0x07 || b == 0x1b {
+                    if b == 0x07 {
+                        self.state = State::Ground;
+                    } else if b == 0x1b {
+                        self.state = State::IgnoreEsc;
+                    }
+                }
+
+                State::IgnoreEsc => {
+                    if b != 0x1b {
                         self.state = State::Ground;
                     }
                 }
@@ -609,21 +645,17 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
-    // OSC 7 ; file://host/path — CWD update (path is percent-encoded per RFC 3986).
-    if let Some(rest) = s.strip_prefix("7;") {
-        let raw = if let Some(uri) = rest.strip_prefix("file://") {
-            if let Some(idx) = uri.find('/') {
-                &uri[idx..]
-            } else {
-                uri
-            }
-        } else {
-            rest
-        };
-        let path = percent_decode(raw);
-        if !path.is_empty() {
-            events.push(ParserEvent::CwdUpdate(path));
-        }
+    // OSC 7 (cwd), OSC 0 / 1 / 2 (title/icon), and everything else: pass through
+    // unchanged. VTE consumes them natively and fires
+    // current-directory-uri-notify / window-title-changed signals, which the
+    // block_view subscribes to instead of re-parsing here.
+    if s.starts_with("7;") {
+        let mut bytes = Vec::with_capacity(payload.len() + 4);
+        bytes.push(0x1b);
+        bytes.push(b']');
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(b"\x1b\\");
+        events.push(ParserEvent::Bytes(bytes));
         return;
     }
 
@@ -672,34 +704,13 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
-    // All other OSC sequences: reconstruct and pass through
+    // All other OSC sequences: reconstruct and pass through.
     let mut bytes = Vec::with_capacity(payload.len() + 4);
     bytes.push(0x1b);
     bytes.push(b']');
     bytes.extend_from_slice(payload);
     bytes.push(0x07);
     events.push(ParserEvent::Bytes(bytes));
-}
-
-/// Percent-decode an OSC 7 path (e.g. "/home/me/My%20Docs" → "/home/me/My Docs").
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
 }
 
 fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
@@ -814,6 +825,14 @@ mod tests {
     }
 
     #[test]
+    fn pm_st_does_not_leak_backslash() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"before\x1b^ignored\x1b\\after", &mut events);
+        assert_eq!(collect_bytes(&events), b"beforeafter");
+    }
+
+    #[test]
     fn osc_color_queries_emit_events() {
         let mut p = Parser::new();
         let mut events = Vec::new();
@@ -900,6 +919,35 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["A", "C", "D"]);
+    }
+
+    #[test]
+    fn osc7_cwd_passes_through_to_vte() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b]7;file://host/home/me/dir\x07", &mut events);
+        assert_eq!(
+            collect_bytes(&events),
+            b"\x1b]7;file://host/home/me/dir\x1b\\"
+        );
+    }
+
+    #[test]
+    fn mouse_reporting_dropped_when_disabled_but_event_emitted() {
+        let mut p = Parser::with_config(ParserConfig {
+            mouse_reporting: false,
+            focus_reporting: true,
+        });
+        let mut events = Vec::new();
+        p.feed(b"\x1b[?1000h", &mut events);
+        assert!(collect_bytes(&events).is_empty());
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ParserEvent::DecsetMode {
+                mode: 1000,
+                set: true
+            }
+        )));
     }
 
     #[test]

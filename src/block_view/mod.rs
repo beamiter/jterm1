@@ -298,7 +298,6 @@ struct ReaderCtx {
     prompt_display_rc: Rc<RefCell<String>>,
     block_list_rc: gtk4::Box,
     block_scroll_rc: ScrolledWindow,
-    cwd_cbs: StrCallbacks,
     remote_session_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
     activity_cbs: VoidCallbacks,
@@ -398,7 +397,6 @@ impl ReaderCtx {
             prompt_display_rc,
             block_list_rc,
             block_scroll_rc,
-            cwd_cbs,
             remote_session_cbs,
             exited_cbs,
             activity_cbs,
@@ -444,13 +442,6 @@ impl ReaderCtx {
                 for event in events.iter() {
                     let state = bstate_rc.get();
                     match event {
-                        ParserEvent::CwdUpdate(path) => {
-                            *current_cwd_for_cb.borrow_mut() = path.clone();
-                            refresh_repo_strip(&repo_strip, path);
-                            for cb in cwd_cbs.borrow().iter() {
-                                cb(path);
-                            }
-                        }
                         ParserEvent::RemoteSessionId(id) => {
                             for cb in remote_session_cbs.borrow().iter() {
                                 cb(id);
@@ -1849,7 +1840,6 @@ impl TermView {
                 prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
-                cwd_cbs: cwd_callbacks.clone(),
                 remote_session_cbs: remote_session_callbacks.clone(),
                 exited_cbs,
                 activity_cbs,
