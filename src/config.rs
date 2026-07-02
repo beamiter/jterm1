@@ -439,7 +439,14 @@ fn load_file_config() -> FileConfig {
     };
 
     let colors = table.get("colors").and_then(|v| v.as_table());
-    let remote_hosts = parse_remote_hosts(&table);
+    // Fall back to built-in defaults when the section is entirely absent (e.g. a
+    // config file first created to persist some other setting). An explicit,
+    // possibly empty, [[remote_hosts]] array is respected as-is.
+    let remote_hosts = if table.contains_key("remote_hosts") {
+        parse_remote_hosts(&table)
+    } else {
+        default_remote_hosts()
+    };
 
     FileConfig {
         opacity: table.get("opacity").and_then(|v| v.as_float()),
@@ -630,6 +637,35 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
             })
         })
         .collect()
+}
+
+/// Serialize a `RemoteHost` back into a TOML table that `parse_remote_hosts`
+/// round-trips. Optional fields are only emitted when present.
+fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
+    let mut t = toml::Table::new();
+    t.insert("name".into(), toml::Value::String(h.name.clone()));
+    t.insert("host".into(), toml::Value::String(h.host.clone()));
+    if let Some(user) = &h.user {
+        t.insert("user".into(), toml::Value::String(user.clone()));
+    }
+    t.insert(
+        "remote_shell".into(),
+        toml::Value::String(h.remote_shell.clone()),
+    );
+    if let Some(session) = &h.session {
+        t.insert("session".into(), toml::Value::String(session.clone()));
+    }
+    if !h.ssh_args.is_empty() {
+        let args: Vec<toml::Value> = h
+            .ssh_args
+            .iter()
+            .map(|a| toml::Value::String(a.clone()))
+            .collect();
+        t.insert("ssh_args".into(), toml::Value::Array(args));
+    }
+    t.insert("login_shell".into(), toml::Value::Boolean(h.login_shell));
+    t.insert("multiplex".into(), toml::Value::Boolean(h.multiplex));
+    toml::Value::Table(t)
 }
 
 /// Built-in remote hosts used when no config file exists yet, so a fresh
@@ -916,6 +952,20 @@ pub(crate) fn save_config(config: &Config) {
     );
     table.insert("colors".into(), toml::Value::Table(colors));
 
+    // Seed the built-in default hosts on the FIRST save (when the file has no
+    // [[remote_hosts]] yet), so writing any other setting doesn't create a config
+    // that silently drops the context-menu remote-connect items. remote_hosts has
+    // no in-app editor, so once the section exists it is user-authored: never
+    // overwrite it here, or hand-edited hosts get clobbered on the next save.
+    if !table.contains_key("remote_hosts") && !config.remote_hosts.is_empty() {
+        let hosts: Vec<toml::Value> = config
+            .remote_hosts
+            .iter()
+            .map(remote_host_to_toml)
+            .collect();
+        table.insert("remote_hosts".into(), toml::Value::Array(hosts));
+    }
+
     let content = table.to_string();
     let tmp_path = path.with_extension("toml.tmp");
     if let Err(err) = fs::write(&tmp_path, &content) {
@@ -979,4 +1029,134 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 
     // Last resort: POSIX sh
     vec!["sh".to_string()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host() -> RemoteHost {
+        RemoteHost {
+            name: "h".into(),
+            host: "1.2.3.4".into(),
+            user: Some("yj".into()),
+            remote_shell: "/home/yj/.cargo/bin/rsh".into(),
+            session: Some("cloud-test".into()),
+            ssh_args: Vec::new(),
+            login_shell: true,
+            // Off by default in tests so exact-argv assertions stay deterministic
+            // (multiplex injects an env-dependent ControlPath).
+            multiplex: false,
+        }
+    }
+
+    #[test]
+    fn login_shell_wraps_in_bash_lc() {
+        let argv = build_remote_argv(&host());
+        assert_eq!(
+            argv,
+            vec![
+                "ssh",
+                "-t",
+                "yj@1.2.3.4",
+                "bash -lc 'exec /home/yj/.cargo/bin/rsh --session cloud-test'",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_login_shell_passes_command_bare() {
+        let mut h = host();
+        h.login_shell = false;
+        let argv = build_remote_argv(&h);
+        assert_eq!(
+            argv.last().unwrap(),
+            "/home/yj/.cargo/bin/rsh --session cloud-test"
+        );
+    }
+
+    #[test]
+    fn single_quotes_in_payload_are_escaped() {
+        let mut h = host();
+        h.session = Some("it's".into());
+        let argv = build_remote_argv(&h);
+        assert_eq!(
+            argv.last().unwrap(),
+            r#"bash -lc 'exec /home/yj/.cargo/bin/rsh --session it'\''s'"#
+        );
+    }
+
+    #[test]
+    fn multiplex_injects_controlmaster_flags() {
+        let mut h = host();
+        h.multiplex = true;
+        std::env::set_var("XDG_RUNTIME_DIR", std::env::temp_dir());
+        let argv = build_remote_argv(&h);
+        assert!(
+            argv.iter().any(|a| a == "ControlMaster=auto"),
+            "argv: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "ControlPersist=120"),
+            "argv: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a.starts_with("ControlPath=")),
+            "argv: {argv:?}"
+        );
+        // ControlMaster flags must precede the target.
+        let target_idx = argv.iter().position(|a| a == "yj@1.2.3.4").unwrap();
+        let cm_idx = argv.iter().position(|a| a == "ControlMaster=auto").unwrap();
+        assert!(cm_idx < target_idx);
+    }
+
+    #[test]
+    fn no_multiplex_omits_controlmaster_flags() {
+        let argv = build_remote_argv(&host());
+        assert!(
+            !argv.iter().any(|a| a.contains("ControlMaster")),
+            "argv: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn missing_remote_hosts_section_uses_defaults() {
+        let table = "font = 'monospace 12'".parse::<toml::Table>().unwrap();
+        let remote_hosts = if table.contains_key("remote_hosts") {
+            parse_remote_hosts(&table)
+        } else {
+            default_remote_hosts()
+        };
+        assert!(!remote_hosts.is_empty());
+    }
+
+    #[test]
+    fn explicit_empty_remote_hosts_stays_empty() {
+        let table = "remote_hosts = []".parse::<toml::Table>().unwrap();
+        let remote_hosts = if table.contains_key("remote_hosts") {
+            parse_remote_hosts(&table)
+        } else {
+            default_remote_hosts()
+        };
+        assert!(remote_hosts.is_empty());
+    }
+
+    #[test]
+    fn remote_host_toml_round_trips() {
+        let original = host();
+        let mut table = toml::Table::new();
+        table.insert(
+            "remote_hosts".into(),
+            toml::Value::Array(vec![remote_host_to_toml(&original)]),
+        );
+        let parsed = parse_remote_hosts(&table);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, original.name);
+        assert_eq!(parsed[0].host, original.host);
+        assert_eq!(parsed[0].user, original.user);
+        assert_eq!(parsed[0].remote_shell, original.remote_shell);
+        assert_eq!(parsed[0].session, original.session);
+        assert_eq!(parsed[0].login_shell, original.login_shell);
+        assert_eq!(parsed[0].multiplex, original.multiplex);
+    }
 }
